@@ -1,0 +1,220 @@
+"""Workspace artifact scan — converts files on disk into a typed snapshot."""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from hyperloom_common.jsonio import read_json
+
+
+STRICT_VALIDATION_ENV = "HYPERLOOM_QUANT_STRICT_VALIDATION"
+
+# MUST-have file globs for the quantized model directory.
+_WEIGHT_GLOBS = ("*.safetensors", "*.bin")
+_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "vocab.json",
+)
+
+_BLOCKED = "blocked.md"
+_LAST_PHASE = "last_phase.txt"
+_EVAL_REPORT = "eval_report.json"
+_EVAL_SKIPPED = "eval_skipped.txt"
+#: The per-attempt markers ``collect_artifacts`` reads: where the attempt stopped and how it ended. Every attempt of
+#: one run shares the run directory, so the retry loop archives these before each attempt.
+ATTEMPT_MARKER_FILES = (_BLOCKED, _LAST_PHASE, _EVAL_REPORT, _EVAL_SKIPPED)
+
+
+@dataclass(frozen=True)
+class ValidationSteps:
+    """Per-step status parsed from ``validation_report.md``."""
+
+    auxiliary: str | None = None
+    md5: str | None = None
+    config: str | None = None
+    fuzzy: str | None = None
+
+
+@dataclass(frozen=True)
+class CollectedArtifacts:
+    workspace: Path
+    strict_validation: bool
+
+    # Manifest + resolution
+    manifest_present: bool
+    manifest_parse_error: str | None
+    quantized_model_dir: Path | None
+
+    # SHOULD-have planning artifacts
+    model_analysis_present: bool
+    quant_plan_present: bool
+
+    # MUST-have on quantized_model_dir
+    quantized_dir_exists: bool
+    has_config_json: bool
+    has_weights: bool
+    has_tokenizer: bool  # any tokenizer file present
+
+    # Validator
+    validation_report_present: bool
+    validation_steps: ValidationSteps
+
+    # Eval
+    eval_report_present: bool
+    eval_report_data: dict | None  # parsed eval_report.json (or None)
+    eval_skipped_reason: str | None  # contents of eval_skipped.txt if present
+
+    # SKILL.md control-plane files
+    last_phase: str | None  # contents of last_phase.txt
+    blocked_reason: str | None  # contents of blocked.md
+
+
+# parsing helpers
+
+# Matches a step line; the validator emits one of ok / FAIL / skipped.
+_STEP_LINE_RE = re.compile(
+    r"^\*\*Step\s+(?P<num>[1-4])\b[^*]*\*\*\s*:\s*(?P<status>ok|FAIL|skipped)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _parse_validation_report(text: str) -> ValidationSteps:
+    """Parse the validator's Markdown report into per-step statuses."""
+    by_num: dict[str, str] = {}
+    for m in _STEP_LINE_RE.finditer(text):
+        # Normalize to lower-case for downstream compares.
+        status = m.group("status").lower()
+        if status == "fail":
+            status = "FAIL"  # keep FAIL upper-case to match the spec text
+        by_num[m.group("num")] = status
+    return ValidationSteps(
+        auxiliary=by_num.get("1"),
+        md5=by_num.get("2"),
+        config=by_num.get("3"),
+        fuzzy=by_num.get("4"),
+    )
+
+
+def _read_text(path: Path) -> str | None:
+    """Read a UTF-8 text file, returning ``None`` if it cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _resolve_quantized_dir(workspace: Path) -> tuple[Path | None, bool, str | None]:
+    """Read ``run_manifest.yaml`` and pull ``outputs.quantized_model_dir``."""
+
+    manifest = workspace / "run_manifest.yaml"
+    if not manifest.is_file():
+        return None, False, None
+
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        return None, True, "pyyaml_missing"
+
+    try:
+        data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return None, True, f"io_error: {exc}"
+    except yaml.YAMLError as exc:
+        return None, True, f"yaml_error: {exc}"
+
+    if not isinstance(data, dict):
+        return None, True, "manifest_not_mapping"
+
+    outputs = data.get("outputs") or {}
+    raw_path = outputs.get("quantized_model_dir") if isinstance(outputs, dict) else None
+    if not raw_path:
+        return None, True, "missing_outputs_quantized_model_dir"
+
+    try:
+        ws = workspace.resolve()
+        path = Path(str(raw_path))
+        path = path.resolve() if path.is_absolute() else (ws / path).resolve()
+    except (OSError, RuntimeError) as exc:
+        return None, True, f"quantized_model_dir_unresolvable:{exc}"
+    try:
+        path.relative_to(ws)
+    except ValueError:
+        return None, True, "quantized_model_dir_outside_workspace"
+    return path, True, None
+
+
+def _has_any(directory: Path, names: Iterable[str]) -> bool:
+    """Return whether any of the named files exists in ``directory``."""
+    for name in names:
+        if (directory / name).is_file():
+            return True
+    return False
+
+
+def _has_glob(directory: Path, patterns: Iterable[str]) -> bool:
+    """Return whether any glob pattern matches a regular file in ``directory``."""
+    for pat in patterns:
+        for match in directory.glob(pat):
+            if match.is_file():
+                return True
+    return False
+
+
+def _strict_validation_enabled() -> bool:
+    """Return whether strict validation mode is enabled."""
+    raw = os.environ.get(STRICT_VALIDATION_ENV, "1")
+    return raw.strip().lower() not in ("0", "false", "no", "")
+
+
+# public entry
+
+
+def collect_artifacts(workspace: Path) -> CollectedArtifacts:
+    """Scan a run workspace and summarize the on-disk artifacts."""
+    workspace = Path(workspace)
+
+    qdir, manifest_present, manifest_err = _resolve_quantized_dir(workspace)
+
+    quantized_dir_exists = bool(qdir and qdir.is_dir())
+    has_config = bool(quantized_dir_exists and (qdir / "config.json").is_file())  # type: ignore[union-attr]
+    has_weights = bool(quantized_dir_exists and _has_glob(qdir, _WEIGHT_GLOBS))  # type: ignore[arg-type]
+    has_tokenizer = bool(quantized_dir_exists and _has_any(qdir, _TOKENIZER_FILES))  # type: ignore[arg-type]
+
+    validation_text = _read_text(workspace / "validation_report.md")
+    validation_present = validation_text is not None
+    validation_steps = _parse_validation_report(validation_text) if validation_text else ValidationSteps()
+
+    return CollectedArtifacts(
+        workspace=workspace,
+        strict_validation=_strict_validation_enabled(),
+        manifest_present=manifest_present,
+        manifest_parse_error=manifest_err,
+        quantized_model_dir=qdir,
+        model_analysis_present=(workspace / "model_analysis.json").is_file(),
+        quant_plan_present=(workspace / "quant_plan.json").is_file(),
+        quantized_dir_exists=quantized_dir_exists,
+        has_config_json=has_config,
+        has_weights=has_weights,
+        has_tokenizer=has_tokenizer,
+        validation_report_present=validation_present,
+        validation_steps=validation_steps,
+        eval_report_present=(workspace / _EVAL_REPORT).is_file(),
+        eval_report_data=read_json(workspace / _EVAL_REPORT, default=None),
+        eval_skipped_reason=_read_text(workspace / _EVAL_SKIPPED),
+        last_phase=(_read_text(workspace / _LAST_PHASE) or "").strip() or None,
+        blocked_reason=_read_text(workspace / _BLOCKED),
+    )
+
+
+__all__ = [
+    "CollectedArtifacts",
+    "ValidationSteps",
+    "STRICT_VALIDATION_ENV",
+    "collect_artifacts",
+]

@@ -1,0 +1,4432 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the small helpers inside ``kernel.request_handlers``."""
+
+from __future__ import annotations
+
+import importlib.util
+import asyncio
+import json
+import logging
+import shutil
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from hyperloom_common.llm import llm_config
+from hyperloom.common.codex_session import (
+    CODEX_SANDBOX_MODE_ENV,
+    DEFAULT_CODEX_SANDBOX_MODE,
+)
+from hyperloom_common.env import is_truthy
+from hyperloom.orchestrator.actions.executors import _kernel_agent_tool as tool
+from hyperloom.orchestrator.actions.executors import trace_analyze as ta
+from hyperloom.orchestrator.trace_analysis.analysis_route import AnalysisRoute
+from hyperloom.inference_optimizer.framework_paths import resolve_known_source_prefixes
+from hyperloom.orchestrator.kernel import request_handlers as krh
+from hyperloom.orchestrator.kernel import lane_budget
+from hyperloom_common.llm.llm_config import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+)
+from hyperloom.orchestrator.state.shared_state import SharedState
+from hyperloom.orchestrator.kernel import _aiter_tuner_support as aiter_tuner_support
+from hyperloom.orchestrator.kernel import _forge_fusion_run as forge_fusion_run
+from hyperloom.orchestrator.kernel import _forge_gemm_probe as forge_gemm_probe
+from hyperloom.orchestrator.kernel import _forge_gemm_tuning as forge_gemm_tuning
+from hyperloom.orchestrator.kernel import _forge_lane_budget as forge_lane_budget
+from hyperloom.orchestrator.kernel import _forge_shapes as forge_shapes
+from hyperloom.orchestrator.kernel import serving_log_evidence as serving_log_evidence
+from hyperloom.orchestrator.kernel import _shape_capture as shape_capture
+from hyperloom.orchestrator.kernel import _untuned_gemm_csv as untuned_gemm_csv
+from hyperloom.orchestrator.actions.executors._workload_envs import LaunchLayer
+
+
+_FUSION_PROVIDER_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CLAUDE_MODEL",
+    "CODEX_MODEL",
+    "FORGE_CLAUDE_MODEL",
+    "FORGE_CODEX_MODEL",
+    CODEX_SANDBOX_MODE_ENV,
+)
+_OPENAI_ONLY_ENV = {
+    "OPENAI_BASE_URL": "https://gateway.invalid/Unified/v1",
+    "OPENAI_API_KEY": "openai-side-key",
+}
+_ANTHROPIC_ONLY_ENV = {
+    "ANTHROPIC_BASE_URL": "https://gateway.invalid/Anthropic",
+    "ANTHROPIC_API_KEY": "anthropic-side-key",
+}
+
+
+def _pin_fusion_provider_env(monkeypatch, shape):
+    """Set one exact provider shape without inheriting the developer's gateway."""
+    for key in _FUSION_PROVIDER_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in shape.items():
+        monkeypatch.setenv(key, value)
+
+
+#: Each payload the GEMM lane handed the forge command builder in the running test.
+_FORGE_GEMM_PAYLOADS: list[dict] = []
+
+
+@pytest.fixture(autouse=True)
+def _record_forge_gemm_payloads(monkeypatch):
+    _FORGE_GEMM_PAYLOADS.clear()
+    build = forge_gemm_tuning.forge_gemm_tuning.build_command
+
+    def _recording_build(args):
+        _FORGE_GEMM_PAYLOADS.append(dict(args))
+        return build(args)
+
+    monkeypatch.setattr(forge_gemm_tuning.forge_gemm_tuning, "build_command", _recording_build)
+
+
+def _fresh_profile(state: SharedState) -> SharedState:
+    """A state whose recorded profile matches the active workload, so its shape artifacts are read."""
+    state.profile_trace_matches_workload = lambda *_args, **_kwargs: True
+    return state
+
+
+def _stub_tracelens_analysis(monkeypatch, ensure_checkout):
+    """Serve a stand-in ``tracelens_analysis`` to the self-heal's lazy import.
+
+    ``from package import module`` reads the package attribute before ``sys.modules``, so both are replaced.
+    """
+    from hyperloom.orchestrator import trace_analysis
+
+    stub = types.ModuleType(f"{trace_analysis.__name__}.tracelens_analysis")
+    stub._ensure_tracelens_checkout = ensure_checkout  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    monkeypatch.setattr(trace_analysis, "tracelens_analysis", stub, raising=False)
+
+
+#: A candidate server.log must now carry an aiter dispatch line; these tests
+#: are about priority order, so every candidate gets one.
+_AITER_LINE = (
+    "shape is M:128, N:512, K:4096 dtype='torch.bfloat16' otype='torch.bfloat16' "
+    "bias=False, scaleAB=False, bpreshuffle=False found padded_M: 128, N:512, "
+    "K:4096 is tuned on cu_num = 256 in /tmp/aiter_configs/bf16_tuned_gemm.csv, "
+    "libtype is opus, kernel name is opus_gemm\n"
+)
+
+
+class TestForgeGemmHelperCoverage:
+    def test_parse_forge_gemm_sentinel(self):
+        payload = {"status": "ok", "micro_decision": "candidate"}
+        text = "noise\nFORGE_GEMM_TUNE_RESULT_BEGIN\n" + json.dumps(payload) + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        assert forge_gemm_probe._parse_forge_gemm_sentinel(text) == payload
+        assert forge_gemm_probe._parse_forge_gemm_sentinel("no sentinel") is None
+        assert (
+            forge_gemm_probe._parse_forge_gemm_sentinel(
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\nnot-json\nFORGE_GEMM_TUNE_RESULT_END"
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_truthy_env_value_true(self, value):
+        assert is_truthy(value) is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "off", None])
+    def test_truthy_env_value_false(self, value):
+        assert is_truthy(value) is False
+
+    def test_resolve_forge_server_log_priority(self, tmp_path):
+        state = SharedState()
+        baseline = tmp_path / "baseline"
+        current = tmp_path / "current"
+        baseline.mkdir()
+        current.mkdir()
+        (baseline / "server.log").write_text("baseline\n" + _AITER_LINE, encoding="utf-8")
+        (current / "server.log").write_text("current\n" + _AITER_LINE, encoding="utf-8")
+        state.last_baseline = {"workspace": str(baseline)}
+        state.current_best = {"workspace": str(current)}
+
+        assert serving_log_evidence.resolve_forge_server_log(state, tmp_path) == str(current / "server.log")
+
+    def test_resolve_forge_server_log_bounded_runs_fallback(self, tmp_path):
+        state = SharedState()
+        log = tmp_path / "runs" / "explore" / "abc" / "server.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(_AITER_LINE, encoding="utf-8")
+
+        assert serving_log_evidence.resolve_forge_server_log(state, tmp_path) == str(log)
+
+    def test_resolve_forge_precision_from_runtime_fp4(self):
+        state = SharedState(precision="bf16")
+        state.current_best = {"extra_server_args": "--quantization fp4", "extra_envs": {}}
+
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("fp4", "fp4")
+
+    def test_resolve_forge_precision_per_token_from_reference_env(self):
+        state = SharedState(precision="bf16")
+        state.current_best = {"extra_server_args": "--quantization fp8", "extra_envs": {}}
+        state.reference_envs = {"SGLANG_USE_AITER_FP8_PER_TOKEN": "true"}
+
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("fp8", "per_token")
+
+    @staticmethod
+    def _write_cfg(model_dir: Path, cfg: dict) -> str:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        return str(model_dir)
+
+    def test_resolve_fp8_quant_type(self, tmp_path):
+        block = self._write_cfg(
+            tmp_path / "block",
+            {"hidden_size": 7168, "quantization_config": {"weight_block_size": [128, 128]}},
+        )
+        method_block = self._write_cfg(
+            tmp_path / "mblock",
+            {"quantization_config": {"quant_method": "fp8_block"}},
+        )
+        plain = self._write_cfg(tmp_path / "plain", {"hidden_size": 2048})
+        assert untuned_gemm_csv._resolve_fp8_quant_type(block) == "blockscale"
+        assert untuned_gemm_csv._resolve_fp8_quant_type(method_block) == "blockscale"
+        assert untuned_gemm_csv._resolve_fp8_quant_type(plain) == "per_token"
+        # Multimodal: quantization_config nested under text_config is detected.
+        nested_block = self._write_cfg(
+            tmp_path / "nblock",
+            {"text_config": {"quantization_config": {"weight_block_size": [128, 128]}}},
+        )
+        assert untuned_gemm_csv._resolve_fp8_quant_type(nested_block) == "blockscale"
+        # Unreadable / missing config -> auto.
+        assert untuned_gemm_csv._resolve_fp8_quant_type(str(tmp_path / "missing")) == "auto"
+        assert untuned_gemm_csv._resolve_fp8_quant_type("") == "auto"
+
+    def test_resolve_fp8_quant_type_logs_malformed_config(self, tmp_path, caplog):
+        model_dir = tmp_path / "broken"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            assert untuned_gemm_csv._resolve_fp8_quant_type(str(model_dir)) == "auto"
+        assert "model_config_invalid_json" in caplog.text
+
+    def test_resolve_forge_precision_fp8_plain_model_routes_per_token(self, tmp_path):
+        model = self._write_cfg(tmp_path / "plain", {"hidden_size": 2048})
+        state = SharedState(precision="bf16", model_path=model)
+        state.current_best = {"extra_server_args": "--quantization fp8", "extra_envs": {}}
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("fp8", "per_token")
+
+    def test_resolve_forge_precision_fp8_block_model_routes_blockscale(self, tmp_path):
+        model = self._write_cfg(
+            tmp_path / "block",
+            {"hidden_size": 7168, "quantization_config": {"weight_block_size": [128, 128]}},
+        )
+        state = SharedState(precision="bf16", model_path=model)
+        state.current_best = {"extra_server_args": "--quantization fp8", "extra_envs": {}}
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("fp8", "blockscale")
+
+    def test_resolve_forge_precision_fp8_unreadable_config_keeps_auto(self):
+        # No readable config: do not force a tuner; let forge sniff the log.
+        state = SharedState(precision="bf16", model_path="/models/does-not-exist")
+        state.current_best = {"extra_server_args": "--quantization fp8", "extra_envs": {}}
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("fp8", "auto")
+
+    _QUARK_MXFP4 = {
+        "quant_method": "quark",
+        "global_quant_config": {"weight": {"dtype": "fp4", "group_size": 32}},
+        "layer_quant_config": {"*self_attn*": {"weight": {"dtype": "fp8_e4m3", "group_size": 128}}},
+    }
+    _COMPRESSED_TENSORS_FP8 = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"targets": ["Linear"], "weights": {"num_bits": 8, "type": "float"}}},
+    }
+
+    @pytest.mark.parametrize(
+        ("quant_cfg", "session_precision"),
+        [(_QUARK_MXFP4, "fp4"), (_COMPRESSED_TENSORS_FP8, "fp8")],
+    )
+    def test_resolve_forge_precision_leaves_a_nested_format_to_forge(self, tmp_path, quant_cfg, session_precision):
+        # Handed on, the label would hold for every lane, and an fp8 one would also be pinned to per_token.
+        model = self._write_cfg(tmp_path / "m", {"hidden_size": 6144, "quantization_config": quant_cfg})
+        state = SharedState(precision=session_precision, model_path=model)
+        state.current_best = {"extra_server_args": "", "extra_envs": {}}
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("auto", "auto")
+
+    def test_resolve_forge_precision_keeps_an_operator_precision_the_checkpoint_does_not_nest(self, tmp_path):
+        model = self._write_cfg(tmp_path / "m", {"hidden_size": 6144, "quantization_config": self._QUARK_MXFP4})
+        state = SharedState(precision="bf16", model_path=model)
+        state.current_best = {"extra_server_args": "", "extra_envs": {}}
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("bf16", "auto")
+
+    def test_resolve_aiter_root_from_editable_source_layout(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("AITER_ROOT_DIR", raising=False)
+        root = tmp_path / "sgl-workspace" / "aiter"
+        package = root / "aiter"
+        package.mkdir(parents=True)
+        (root / "csrc").mkdir()
+        origin = package / "__init__.py"
+        origin.write_text("", encoding="utf-8")
+
+        def _find_spec(name):
+            if name == "aiter_meta":
+                return None
+            assert name == "aiter"
+            return types.SimpleNamespace(
+                origin=str(origin),
+                submodule_search_locations=[str(package)],
+            )
+
+        monkeypatch.setattr(importlib.util, "find_spec", _find_spec)
+
+        assert forge_gemm_probe._resolve_aiter_root_for_forge() == str(root)
+
+    def test_forge_gemm_tune_available_probes_the_command_it_will_run(self, monkeypatch):
+        # The probe must be the same invocation the tool makes, in the same interpreter.
+        seen: list[list[str]] = []
+
+        def _fake_run(cmd, **_kwargs):
+            seen.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "usage: ...", "")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert forge_gemm_probe._forge_gemm_tune_available() is True
+        assert seen == [forge_gemm_probe.forge_gemm_tuning.gemm_tune_argv("--help")]
+        assert seen[0][0] == sys.executable
+
+    def test_forge_gemm_tune_available_false_when_subcommand_missing(self, monkeypatch):
+        # A tree whose kernelforge imports fine but never registered the gemm-tune group; click exits 2 on an unknown
+        # command.
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **_k: subprocess.CompletedProcess(cmd, 2, "", "Error: No such command 'gemm-tune'."),
+        )
+        assert forge_gemm_probe._forge_gemm_tune_available() is False
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_reports_missing_cli(self, tmp_path, monkeypatch):
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path="/models/qwen",
+            gpu_type="mi300x",
+            tp=1,
+            conc=256,
+        )
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: False)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["status"] == "failed"
+        assert result["error_class"] == "forge_gemm_tune_not_found"
+        assert result["backend"] == "forge"
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            OSError("no interpreter"),
+            subprocess.SubprocessError("bad subprocess"),
+        ],
+    )
+    def test_forge_gemm_tune_available_swallows_probe_failures(self, monkeypatch, exc):
+        def _boom(_cmd, **_kwargs):
+            raise exc
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert forge_gemm_probe._forge_gemm_tune_available() is False
+
+    def test_forge_gemm_tune_available_logs_probe_timeout(self, monkeypatch, caplog):
+        def _boom(_cmd, **_kwargs):
+            raise subprocess.TimeoutExpired(
+                cmd="probe",
+                timeout=forge_gemm_probe._FORGE_GEMM_PREFLIGHT_TIMEOUT_SEC,
+            )
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        with caplog.at_level("WARNING"):
+            assert forge_gemm_probe._forge_gemm_tune_available() is False
+
+        assert "preflight timed out" in caplog.text
+        assert str(forge_gemm_probe._FORGE_GEMM_PREFLIGHT_TIMEOUT_SEC) in caplog.text
+
+    def test_resolve_forge_precision_falls_back_to_bf16(self):
+        # Empty session precision + no fp8/fp4 quantization -> bf16/auto default.
+        state = SharedState(precision="")
+        state.current_best = {"extra_server_args": "", "extra_envs": {}}
+        assert forge_gemm_probe._resolve_forge_precision_and_quant(state) == ("bf16", "auto")
+
+    def test_resolve_forge_server_log_uses_baseline_when_no_current_best(self, tmp_path):
+        state = SharedState()
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        (baseline / "server.log").write_text("baseline\n" + _AITER_LINE, encoding="utf-8")
+        state.last_baseline = {"workspace": str(baseline)}
+
+        assert serving_log_evidence.resolve_forge_server_log(state, tmp_path) == str(baseline / "server.log")
+
+    def test_resolve_forge_shapes_reads_artifact_paths_dict(self, tmp_path):
+        state = SharedState()
+        shapes = tmp_path / "gemm_shapes.json"
+        shapes.write_text(json.dumps({"shapes": [{"m": 1, "n": 2, "k": 3}]}), encoding="utf-8")
+        state.last_trace_analyze = {"artifact_paths": {"gemm_shapes_json": str(shapes)}}
+
+        assert forge_shapes._resolve_forge_shapes(_fresh_profile(state)) == str(shapes)
+
+    def test_resolve_forge_shapes_skips_incompatible_candidate(self, tmp_path):
+        state = SharedState()
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps([{"only": "noMNK"}]), encoding="utf-8")
+        state.last_trace_analyze = {"shapes_json": str(bad)}
+
+        assert forge_shapes._resolve_forge_shapes(_fresh_profile(state)) == ""
+
+    def test_is_forge_compatible_shapes_json_rejects_non_dict_sample(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps([123, 456]), encoding="utf-8")
+        assert forge_shapes._is_forge_compatible_shapes_json(bad) is False
+
+    @staticmethod
+    def _write_aiter_csv(session_dir: Path, hash_id: str, fname: str, rows: str) -> Path:
+        cfg = session_dir / "runs" / "specialist" / hash_id / "worktree" / "aiter" / "configs"
+        cfg.mkdir(parents=True, exist_ok=True)
+        path = cfg / fname
+        path.write_text(rows, encoding="utf-8")
+        return path
+
+    def test_resolve_forge_untuned_csv_fp8_blockscale(self, tmp_path):
+        expected = self._write_aiter_csv(tmp_path, "abc", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n16,1536,7168\n")
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "auto") == str(expected)
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale") == str(expected)
+
+    def test_resolve_forge_untuned_csv_per_token(self, tmp_path):
+        expected = self._write_aiter_csv(
+            tmp_path, "abc", "a8w8_untuned_gemm.csv", "M,N,K,q_dtype_w\n16,1536,7168,fp8\n"
+        )
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "per_token") == str(expected)
+
+    def test_resolve_forge_untuned_csv_skips_header_only(self, tmp_path):
+        # Header-only / empty files are not a valid shape source.
+        self._write_aiter_csv(tmp_path, "abc", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n")
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale") == ""
+
+    def test_resolve_forge_untuned_csv_picks_newest_nonempty(self, tmp_path):
+        old = self._write_aiter_csv(tmp_path, "old", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n1,2,3\n")
+        new = self._write_aiter_csv(tmp_path, "new", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n4,5,6\n")
+        import os
+
+        os.utime(old, (1, 1))
+        os.utime(new, (10_000_000, 10_000_000))
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale") == str(new)
+
+    def test_resolve_forge_untuned_csv_bf16_returns_empty(self, tmp_path):
+        # bf16 dense derives shapes from config.json; no CSV needed.
+        self._write_aiter_csv(tmp_path, "abc", "bf16_untuned_gemm.csv", "M,N,K\n1,2,3\n")
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "bf16", "none") == ""
+
+    def test_resolve_forge_untuned_csv_no_specialist_dir(self, tmp_path):
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale") == ""
+
+    @staticmethod
+    def _write_model_config(model_dir: Path, hidden_size: int) -> str:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text(json.dumps({"hidden_size": hidden_size}), encoding="utf-8")
+        return str(model_dir)
+
+    def test_resolve_forge_untuned_csv_rejects_model_mismatch(self, tmp_path):
+        # CSV carries K=7168 shapes but the model has hidden_size=2048: reject it so forge derives per-model shapes
+        # from config.json.
+        self._write_aiter_csv(tmp_path, "abc", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n16,1536,7168\n")
+        model_path = self._write_model_config(tmp_path / "model", hidden_size=2048)
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale", model_path) == ""
+
+    def test_resolve_forge_untuned_csv_accepts_model_match(self, tmp_path):
+        # A CSV whose K column includes the model hidden_size is accepted.
+        expected = self._write_aiter_csv(
+            tmp_path,
+            "abc",
+            "a8w8_blockscale_untuned_gemm.csv",
+            "M,N,K\n16,6144,2048\n16,2048,8192\n",
+        )
+        model_path = self._write_model_config(tmp_path / "model", hidden_size=2048)
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale", model_path) == str(expected)
+
+    def test_resolve_forge_untuned_csv_no_model_path_keeps_legacy(self, tmp_path):
+        # Without a model_path the resolver cannot validate; returns newest non-empty CSV.
+        expected = self._write_aiter_csv(tmp_path, "abc", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n16,1536,7168\n")
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(tmp_path, "fp8", "blockscale") == str(expected)
+
+    def test_resolve_forge_untuned_csv_unreadable_config_keeps_csv(self, tmp_path):
+        # Missing/unreadable config.json: cannot validate, so keep the CSV.
+        expected = self._write_aiter_csv(tmp_path, "abc", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n16,1536,7168\n")
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(
+            tmp_path, "fp8", "blockscale", str(tmp_path / "no_such_model")
+        ) == str(expected)
+
+    def test_csv_matches_model_helpers(self, tmp_path):
+        csv_mismatch = self._write_aiter_csv(
+            tmp_path, "h1", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n16,1536,7168\n"
+        )
+        csv_match = self._write_aiter_csv(tmp_path, "h2", "a8w8_blockscale_untuned_gemm.csv", "M,N,K\n16,6144,2048\n")
+        model_path = self._write_model_config(tmp_path / "m", hidden_size=2048)
+        assert untuned_gemm_csv._model_hidden_size(model_path) == 2048
+        assert untuned_gemm_csv._csv_k_values(csv_mismatch) == {7168}
+        assert untuned_gemm_csv._csv_k_values(csv_match) == {2048}
+        assert untuned_gemm_csv._csv_matches_model(csv_mismatch, model_path) is False
+        assert untuned_gemm_csv._csv_matches_model(csv_match, model_path) is True
+        # No model_path / unreadable config -> cannot validate -> accept.
+        assert untuned_gemm_csv._csv_matches_model(csv_mismatch, "") is True
+
+    def test_read_forge_result_json(self, tmp_path):
+        (tmp_path / "result.json").write_text(
+            json.dumps({"status": "skipped", "tuners_skipped": [{"tuner": "a8w8"}]}),
+            encoding="utf-8",
+        )
+        out = forge_gemm_probe._read_forge_result_json(tmp_path)
+        assert out["status"] == "skipped"
+        assert forge_gemm_probe._read_forge_result_json(tmp_path / "missing") == {}
+
+    def test_derive_gemm_skip_reason(self):
+        skipped = [
+            {"tuner": "a8w8_blockscale", "skip_reason": "needs csv"},
+            {"tuner": "fmoe_ck", "skip_reason": ""},
+            {"tuner": "x"},
+        ]
+        assert forge_gemm_probe._derive_gemm_skip_reason(skipped) == "a8w8_blockscale: needs csv"
+        assert forge_gemm_probe._derive_gemm_skip_reason(None) == ""
+        assert forge_gemm_probe._derive_gemm_skip_reason([]) == ""
+
+    def test_resolve_forge_shapes_returns_empty_for_non_dict_trace(self):
+        state = SharedState()
+        state.last_trace_analyze = ["not", "a", "dict"]
+        assert forge_shapes._resolve_forge_shapes(_fresh_profile(state)) == ""
+
+    def test_resolve_forge_shapes_finds_file_beside_candidates(self, tmp_path):
+        state = SharedState()
+        candidates = tmp_path / "candidates.json"
+        candidates.write_text("[]", encoding="utf-8")
+        shapes = tmp_path / "shapes.json"
+        shapes.write_text(json.dumps([{"M": 1, "N": 2, "K": 3}]), encoding="utf-8")
+        state.last_trace_analyze = {"candidates_path": str(candidates)}
+
+        assert forge_shapes._resolve_forge_shapes(_fresh_profile(state)) == str(shapes)
+
+    def test_forge_fusion_skip_guard_ignores_warm_replay_fusion_flags(self):
+        state = SharedState(
+            current_best={
+                "action": "warm_replay",
+                "engine": "",
+                "extra_envs": {
+                    "SGLANG_USE_AITER": "1",
+                    "ZAYA_FUSED_QK": "1",
+                    "ZAYA_FUSED_RESIDUAL": "1",
+                },
+            },
+        )
+
+        assert forge_fusion_run._active_forge_fusion_env_flags(state) == {}
+
+    def test_resolve_fusion_decode_trace_reads_the_file_a_profile_records(self, tmp_path):
+        """A merged or AgentX profile records a single file; it is used verbatim."""
+        state = SharedState()
+        state_trace = tmp_path / "prelude.trace.json.gz"
+        state_trace.write_text("state", encoding="utf-8")
+        state.last_profile_trace = str(state_trace)
+
+        assert forge_fusion_run._resolve_fusion_decode_trace(state) == str(state_trace)
+
+    def test_resolve_fusion_decode_trace_reads_the_capture_dir_a_profile_records(self, tmp_path):
+        """Non-AgentX profiles record the capture directory (``trace_dir_preferred``)."""
+        state = SharedState()
+        trace_dir = tmp_path / "benchmark_vllm_20260501_001122"
+        trace_dir.mkdir()
+        older = trace_dir / "rank1.177.pt.trace.json.gz"
+        newest = trace_dir / "rank0.177.pt.trace.json.gz"
+        older.write_text("old", encoding="utf-8")
+        newest.write_text("new", encoding="utf-8")
+        import os
+
+        os.utime(older, (1, 1))
+        os.utime(newest, (10, 10))
+        state.last_profile_trace = str(trace_dir)
+
+        assert forge_fusion_run._resolve_fusion_decode_trace(state) == str(newest)
+
+    def test_resolve_fusion_decode_trace_reports_no_trace_when_the_run_has_none(self, tmp_path):
+        """Nothing is substituted for a missing trace: discovery is attributed to what it read."""
+        state = SharedState()
+        assert forge_fusion_run._resolve_fusion_decode_trace(state) == ""
+        state.last_profile_trace = str(tmp_path / "deleted.trace.json")
+        assert forge_fusion_run._resolve_fusion_decode_trace(state) == ""
+        empty_dir = tmp_path / "no_captures"
+        empty_dir.mkdir()
+        state.last_profile_trace = str(empty_dir)
+        assert forge_fusion_run._resolve_fusion_decode_trace(state) == ""
+
+    def test_forge_fusion_available_probes_the_fusion_subpackage(self, monkeypatch):
+        probed: list[str] = []
+
+        def spec(name):
+            probed.append(name)
+            return object()
+
+        monkeypatch.setattr(importlib.util, "find_spec", spec)
+        assert forge_fusion_run._forge_fusion_available() is True
+        # Probing kernelforge alone would pass on a KernelForge predating the fusion absorption and only fail once the
+        # subprocess rejected forge-fuse.
+        assert probed == ["kernelforge.workflows.forge_fusion"]
+
+        monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+        assert forge_fusion_run._forge_fusion_available() is False
+
+    def test_forge_fusion_available_survives_an_unimportable_parent(self, monkeypatch):
+        def boom(_name):
+            raise ModuleNotFoundError("kernelforge")
+
+        monkeypatch.setattr(importlib.util, "find_spec", boom)
+        assert forge_fusion_run._forge_fusion_available() is False
+
+    def test_materialize_unified_patch_snapshot(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "model.py").write_text("old = 1\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "model.py"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        patch = tmp_path / "fusion.patch"
+        patch.write_text(
+            "diff --git a/model.py b/model.py\n"
+            "index 5626abf..f6e7663 100644\n"
+            "--- a/model.py\n"
+            "+++ b/model.py\n"
+            "@@ -1 +1 @@\n"
+            "-old = 1\n"
+            "+new = 2\n",
+            encoding="utf-8",
+        )
+
+        snapshot = Path(
+            tool.materialize_unified_patch_snapshot(
+                patch_path=patch,
+                repo_root=repo,
+            )
+        )
+
+        assert (snapshot / "model.py").read_text(encoding="utf-8") == "new = 2\n"
+
+    def test_materialize_unified_patch_snapshot_nongit_repo(self, tmp_path):
+        """Repro: fusion patch against a NON-git repo_root (e.g. vLLM installed under site-packages/dist-packages)."""
+        repo = tmp_path / "site-packages"
+        (repo / "vllm" / "model_executor" / "models").mkdir(parents=True)
+        target = repo / "vllm" / "model_executor" / "models" / "qwen3.py"
+        target.write_text("old = 1\n", encoding="utf-8")
+        # NOTE: deliberately NOT a git repo (no git init) -- mirrors dist-packages.
+
+        patch = tmp_path / "fusion.patch"
+        patch.write_text(
+            "diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py\n"
+            "--- a/vllm/model_executor/models/qwen3.py\n"
+            "+++ b/vllm/model_executor/models/qwen3.py\n"
+            "@@ -1 +1 @@\n"
+            "-old = 1\n"
+            "+new = 2\n",
+            encoding="utf-8",
+        )
+
+        snapshot = Path(
+            tool.materialize_unified_patch_snapshot(
+                patch_path=patch,
+                repo_root=repo,
+            )
+        )
+
+        assert (snapshot / "vllm" / "model_executor" / "models" / "qwen3.py").read_text(encoding="utf-8") == "new = 2\n"
+
+    def test_materialize_unified_patch_snapshot_accepts_missing_final_newline(
+        self,
+        tmp_path,
+    ):
+        """Legacy KB patches may omit the final newline but remain valid diffs."""
+        repo = tmp_path / "site-packages"
+        (repo / "vllm").mkdir(parents=True)
+        target = repo / "vllm" / "model.py"
+        target.write_text("old = 1\n", encoding="utf-8")
+        patch = tmp_path / "legacy.patch"
+        patch.write_text(
+            "diff --git a/vllm/model.py b/vllm/model.py\n"
+            "--- a/vllm/model.py\n"
+            "+++ b/vllm/model.py\n"
+            "@@ -1 +1 @@\n"
+            "-old = 1\n"
+            "+new = 2",
+            encoding="utf-8",
+        )
+
+        snapshot = Path(
+            tool.materialize_unified_patch_snapshot(
+                patch_path=patch,
+                repo_root=repo,
+            )
+        )
+
+        assert (snapshot / "vllm" / "model.py").read_text(encoding="utf-8") == "new = 2\n"
+
+    def test_materialize_unified_patch_snapshot_nongit_new_file_timestamped(self, tmp_path):
+        """A created file whose ``+++`` line carries a tab-suffixed timestamp must still be recognized as a create on a NON-git root."""
+        repo = tmp_path / "site-packages"
+        (repo / "vllm").mkdir(parents=True)
+        (repo / "vllm" / "existing.py").write_text("old = 1\n", encoding="utf-8")
+        # NOTE: deliberately NOT a git repo -- mirrors dist-packages.
+
+        patch = tmp_path / "fusion.patch"
+        patch.write_text(
+            "diff --git a/vllm/existing.py b/vllm/existing.py\n"
+            "--- a/vllm/existing.py\n"
+            "+++ b/vllm/existing.py\n"
+            "@@ -1 +1 @@\n"
+            "-old = 1\n"
+            "+new = 2\n"
+            "diff --git a/vllm/fused_new.py b/vllm/fused_new.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/vllm/fused_new.py\t2026-07-31 17:00:00.000000000 +0800\n"
+            "@@ -0,0 +1 @@\n"
+            "+created = 3\n",
+            encoding="utf-8",
+        )
+
+        snapshot = Path(
+            tool.materialize_unified_patch_snapshot(
+                patch_path=patch,
+                repo_root=repo,
+            )
+        )
+
+        assert (snapshot / "vllm" / "existing.py").read_text(encoding="utf-8") == "new = 2\n"
+        assert (snapshot / "vllm" / "fused_new.py").read_text(encoding="utf-8") == "created = 3\n"
+
+    def test_materialize_unified_patch_snapshot_nongit_new_file_quoted(self, tmp_path):
+        """A created file whose header path is C-quoted (git quotes paths with spaces) must be recognized as a create via the shared ``parse_patch_manifest`` normalization, not pre-seeded, and produced by ``git apply``."""
+        repo = tmp_path / "site-packages"
+        (repo / "vllm").mkdir(parents=True)
+        # NOTE: deliberately NOT a git repo -- mirrors dist-packages.
+
+        patch = tmp_path / "fusion.patch"
+        patch.write_text(
+            'diff --git "a/vllm/fused new.py" "b/vllm/fused new.py"\n'
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            '+++ "b/vllm/fused new.py"\n'
+            "@@ -0,0 +1 @@\n"
+            "+created = 1\n",
+            encoding="utf-8",
+        )
+
+        snapshot = Path(
+            tool.materialize_unified_patch_snapshot(
+                patch_path=patch,
+                repo_root=repo,
+            )
+        )
+
+        assert (snapshot / "vllm" / "fused new.py").read_text(encoding="utf-8") == "created = 1\n"
+
+    def test_materialize_unified_patch_snapshot_modify_base_missing_raises(self, tmp_path):
+        """A modify whose base is neither in git HEAD nor on disk must fail with a precise error instead of the opaque ``git apply`` "No such file or directory"."""
+        repo = tmp_path / "site-packages"
+        repo.mkdir(parents=True)
+        # NOTE: NOT a git repo, and the target file does not exist on disk.
+
+        patch = tmp_path / "fusion.patch"
+        patch.write_text(
+            "diff --git a/vllm/missing.py b/vllm/missing.py\n"
+            "--- a/vllm/missing.py\n"
+            "+++ b/vllm/missing.py\n"
+            "@@ -1 +1 @@\n"
+            "-old = 1\n"
+            "+new = 2\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(FileNotFoundError, match="patch base missing"):
+            tool.materialize_unified_patch_snapshot(patch_path=patch, repo_root=repo)
+
+    def test_materialize_unified_patch_snapshot_rejects_bad_inputs(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patch = tmp_path / "empty.patch"
+        patch.write_text("", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="empty patch|no file operations"):
+            tool.materialize_unified_patch_snapshot(patch_path=patch, repo_root=repo)
+
+        with pytest.raises(FileNotFoundError):
+            tool.materialize_unified_patch_snapshot(
+                patch_path=tmp_path / "missing.patch",
+                repo_root=repo,
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_skips_when_current_best_is_forge_fusion(self, tmp_path, monkeypatch):
+        state = SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            current_best={
+                "action": "fusion",
+                "engine": "forge_fusion",
+                "extra_envs": {
+                    "ZAYA_FUSED_CCA_NORMALIZE_QK": "1",
+                    "ZAYA_FUSED_CCA_GROUPED_QK_MEANS": "1",
+                },
+            },
+        )
+        state.save(tmp_path)
+
+        def _should_not_check_available():
+            raise AssertionError("forge-fusion availability should not be checked")
+
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", _should_not_check_available)
+        result = await forge_fusion_run.run_fusion_handler({}, session_dir=tmp_path)
+
+        assert result["status"] == "complete"
+        assert result["backend"] == "forge"
+        assert result["engine"] == "forge_fusion"
+        assert result["micro_decision"] == "already_active"
+        assert result["kept"] is False
+        assert result["requires_e2e_validation"] is False
+        assert result["active_env_flags"] == {
+            "ZAYA_FUSED_CCA_NORMALIZE_QK": "1",
+            "ZAYA_FUSED_CCA_GROUPED_QK_MEANS": "1",
+        }
+
+    @pytest.mark.parametrize(
+        ("shape", "expected_backend", "expected_model"),
+        [
+            (
+                {**_OPENAI_ONLY_ENV, "CODEX_MODEL": "gpt-fusion"},
+                "codex",
+                "gpt-fusion",
+            ),
+            (
+                {**_ANTHROPIC_ONLY_ENV, "CLAUDE_MODEL": "claude-fusion"},
+                "claude",
+                "claude-fusion",
+            ),
+            (
+                {
+                    **_OPENAI_ONLY_ENV,
+                    **_ANTHROPIC_ONLY_ENV,
+                    "CODEX_MODEL": "gpt-fusion",
+                    "CLAUDE_MODEL": "claude-fusion",
+                },
+                "claude",
+                "claude-fusion",
+            ),
+        ],
+    )
+    def test_resolve_forge_agent_follows_provider_shape(
+        self,
+        monkeypatch,
+        shape,
+        expected_backend,
+        expected_model,
+    ):
+        """Provider shape selects one matching backend and its model variable."""
+        _pin_fusion_provider_env(monkeypatch, shape)
+
+        assert forge_fusion_run._resolve_forge_agent() == (
+            expected_backend,
+            expected_model,
+        )
+
+    @pytest.mark.parametrize(
+        ("shape", "expected"),
+        [
+            (_OPENAI_ONLY_ENV, ("codex", DEFAULT_CODEX_MODEL)),
+            (_ANTHROPIC_ONLY_ENV, ("claude", DEFAULT_CLAUDE_MODEL)),
+        ],
+    )
+    def test_resolve_forge_agent_uses_established_model_defaults(
+        self,
+        monkeypatch,
+        shape,
+        expected,
+    ):
+        _pin_fusion_provider_env(monkeypatch, shape)
+
+        assert forge_fusion_run._resolve_forge_agent() == expected
+
+    def test_resolve_forge_agent_ignores_the_removed_forge_claude_model(self, monkeypatch):
+        """The Forge-private spelling is gone; CLAUDE_MODEL is what runs."""
+        _pin_fusion_provider_env(
+            monkeypatch,
+            {
+                **_ANTHROPIC_ONLY_ENV,
+                "CLAUDE_MODEL": "claude-orchestration",
+                "FORGE_CLAUDE_MODEL": "claude-forge-only",
+            },
+        )
+
+        assert forge_fusion_run._resolve_forge_agent() == (
+            "claude",
+            "claude-orchestration",
+        )
+
+    def test_resolve_forge_agent_ignores_the_removed_forge_codex_model(self, monkeypatch):
+        """Same on the Codex side: CODEX_MODEL is the only model variable."""
+        _pin_fusion_provider_env(
+            monkeypatch,
+            {
+                **_OPENAI_ONLY_ENV,
+                "CODEX_MODEL": "gpt-orchestration",
+                "FORGE_CODEX_MODEL": "gpt-forge-only",
+            },
+        )
+
+        assert forge_fusion_run._resolve_forge_agent() == (
+            "codex",
+            "gpt-orchestration",
+        )
+
+    def test_resolve_forge_agent_ignores_the_other_provider_model(self, monkeypatch):
+        """A Codex-side id must not leak onto the Claude forge path."""
+        _pin_fusion_provider_env(
+            monkeypatch,
+            {
+                **_ANTHROPIC_ONLY_ENV,
+                "CLAUDE_MODEL": "claude-orchestration",
+                "CODEX_MODEL": "gpt-orchestration",
+            },
+        )
+
+        assert forge_fusion_run._resolve_forge_agent() == (
+            "claude",
+            "claude-orchestration",
+        )
+
+    def test_resolve_forge_agent_rejects_an_unknown_configured_backend(self, monkeypatch):
+        _pin_fusion_provider_env(
+            monkeypatch,
+            {**_OPENAI_ONLY_ENV, **_ANTHROPIC_ONLY_ENV},
+        )
+
+        monkeypatch.setenv(llm_config.AGENT_BACKEND_ENV, "anthropic")
+
+        with pytest.raises(ValueError, match=llm_config.AGENT_BACKEND_ENV):
+            forge_fusion_run._resolve_forge_agent()
+
+    def test_resolve_forge_agent_defaults_an_unconfigured_provider_to_claude(self, monkeypatch):
+        """A runtime logged in by other means carries no credential this can read."""
+        _pin_fusion_provider_env(monkeypatch, {})
+        monkeypatch.setattr(llm_config, "claude_agent_sdk_installed", lambda: True)
+        monkeypatch.setattr(llm_config, "codex_agent_sdk_installed", lambda: True)
+
+        assert forge_fusion_run._resolve_forge_agent() == ("claude", DEFAULT_CLAUDE_MODEL)
+
+    def test_resolve_forge_fusion_codex_sandbox_defaults_to_workspace_write(self, monkeypatch):
+        _pin_fusion_provider_env(monkeypatch, _OPENAI_ONLY_ENV)
+
+        assert (
+            forge_fusion_run._resolve_forge_fusion_sandbox_mode(
+                agent_backend="codex",
+            )
+            == DEFAULT_CODEX_SANDBOX_MODE
+        )
+
+    def test_resolve_forge_fusion_codex_sandbox_accepts_bypass(self, monkeypatch):
+        _pin_fusion_provider_env(monkeypatch, _OPENAI_ONLY_ENV)
+        monkeypatch.setenv(CODEX_SANDBOX_MODE_ENV, "bypass")
+
+        assert (
+            forge_fusion_run._resolve_forge_fusion_sandbox_mode(
+                agent_backend="codex",
+            )
+            == "bypass"
+        )
+
+    def test_resolve_forge_fusion_ignores_retired_external_sandbox_env(self, monkeypatch):
+        _pin_fusion_provider_env(monkeypatch, _OPENAI_ONLY_ENV)
+        monkeypatch.setenv("HYPERLOOM_CODEX_EXTERNAL_SANDBOX", "1")
+
+        assert (
+            forge_fusion_run._resolve_forge_fusion_sandbox_mode(
+                agent_backend="codex",
+            )
+            == DEFAULT_CODEX_SANDBOX_MODE
+        )
+
+    def test_resolve_forge_fusion_claude_sandbox_uses_audit_default(self, monkeypatch):
+        _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+        # Claude's audit default is stable even if the Codex operator default is narrower.
+        monkeypatch.setenv(CODEX_SANDBOX_MODE_ENV, "read-only")
+
+        assert (
+            forge_fusion_run._resolve_forge_fusion_sandbox_mode(
+                agent_backend="claude",
+            )
+            == DEFAULT_CODEX_SANDBOX_MODE
+        )
+
+    def test_resolve_forge_fusion_sandbox_rejects_invalid_mode(self, monkeypatch):
+        _pin_fusion_provider_env(monkeypatch, _OPENAI_ONLY_ENV)
+        monkeypatch.setenv(CODEX_SANDBOX_MODE_ENV, "unconfined")
+
+        with pytest.raises(RuntimeError, match="unknown Codex sandbox mode"):
+            forge_fusion_run._resolve_forge_fusion_sandbox_mode(agent_backend="codex")
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_openai_only_writes_codex_input(self, tmp_path, monkeypatch):
+        trace_dir = tmp_path / "trace"
+        trace_dir.mkdir()
+        trace_file = trace_dir / "decode.trace.json.gz"
+        trace_file.write_text("{}", encoding="utf-8")
+        state = SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            # The shape a non-AgentX profile records: the capture directory, not a file.
+            last_profile_trace=str(trace_dir),
+        )
+        state.save(tmp_path)
+        _pin_fusion_provider_env(
+            monkeypatch,
+            {**_OPENAI_ONLY_ENV, "CODEX_MODEL": "gpt-fusion"},
+        )
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+        calls: list[dict] = []
+
+        async def _fake_run_forge_fusion(args):
+            calls.append(args)
+            return {
+                "status": "ok",
+                "decision": "KEEP",
+                "kept": True,
+                "env_flags": {"ZAYA_FUSED_CCA_NORMALIZE_QK": "1"},
+            }
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "run_forge_fusion", _fake_run_forge_fusion)
+        monkeypatch.setenv("FORGE_FUSION_MAX_TURNS", "7")
+        monkeypatch.setenv("FORGE_FUSION_TIMEOUT", "123")
+
+        result = await forge_fusion_run.run_fusion_handler({"task_id": "fusion_task"}, session_dir=tmp_path)
+
+        assert result["status"] == "ok"
+        assert result["backend"] == "forge"
+        assert result["engine"] == "forge_fusion"
+        assert result["workspace"] == str(tmp_path / "runs" / "fusion" / "fusion_task")
+        input_payload = calls[0]
+        assert input_payload["trace_path"] == str(trace_file)
+        assert input_payload["model_path"] == "/models/zaya"
+        assert input_payload["max_turns"] == 7
+        assert input_payload["timeout"] == 123
+        assert input_payload["agent_backend"] == "codex"
+        assert input_payload["llm_model"] == "gpt-fusion"
+        assert input_payload["agent_sandbox_mode"] == DEFAULT_CODEX_SANDBOX_MODE
+
+    def test_forge_fusion_timeout_invalid_env_falls_back(self, monkeypatch):
+        monkeypatch.setenv("FORGE_FUSION_TIMEOUT", "not-an-int")
+
+        assert forge_lane_budget._forge_fusion_timeout_sec() == 7200
+
+    async def _fusion_input_payload(self, tmp_path, monkeypatch, *, max_minutes):
+        """Run the fusion lane against a faked forge runner and return the payload it was handed."""
+        trace_dir = tmp_path / "trace"
+        trace_dir.mkdir()
+        (trace_dir / "decode.trace.json.gz").write_text("{}", encoding="utf-8")
+        state = SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            last_profile_trace=str(trace_dir),
+            max_minutes=max_minutes,
+        )
+        state.save(tmp_path)
+        _pin_fusion_provider_env(monkeypatch, {**_OPENAI_ONLY_ENV, "CODEX_MODEL": "gpt-fusion"})
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+        calls: list[dict] = []
+
+        async def _fake_run_forge_fusion(args):
+            calls.append(args)
+            return {"status": "ok", "decision": "REVERT", "kept": False}
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "run_forge_fusion", _fake_run_forge_fusion)
+        await forge_fusion_run.run_fusion_handler({"task_id": "fusion_task"}, session_dir=tmp_path)
+        return calls[-1]
+
+    async def test_fusion_recipe_ceiling_comes_from_the_lane_share(self, tmp_path, monkeypatch):
+        """A bounded session funds the lane, so its target count is handed down."""
+        payload = await self._fusion_input_payload(tmp_path, monkeypatch, max_minutes=120)
+
+        assert payload["max_recipes"] == lane_budget.FUSION_MAX_TARGETS
+
+    async def test_an_unbounded_session_sends_no_recipe_ceiling(self, tmp_path, monkeypatch):
+        """No share can be derived, and a zero ceiling would silence the lane."""
+        payload = await self._fusion_input_payload(tmp_path, monkeypatch, max_minutes=0)
+
+        assert "max_recipes" not in payload
+        assert payload["timeout"] == forge_lane_budget._forge_fusion_timeout_sec()
+
+    def test_forge_fusion_timeout_infinite_env_falls_back(self, monkeypatch):
+        monkeypatch.setenv("FORGE_FUSION_TIMEOUT", "inf")
+
+        assert forge_lane_budget._forge_fusion_timeout_sec() == 7200
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_invalid_timeout_env_uses_default(self, tmp_path, monkeypatch):
+        trace = tmp_path / "decode.trace.json.gz"
+        trace.write_text("{}", encoding="utf-8")
+        SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            last_profile_trace=str(trace),
+        ).save(tmp_path)
+        _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+        monkeypatch.setenv("FORGE_FUSION_TIMEOUT", "not-an-int")
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+        calls: list[dict] = []
+
+        async def _fake_run_forge_fusion(args):
+            calls.append(args)
+            return {"status": "complete", "decision": "REVERT", "kept": False}
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "run_forge_fusion", _fake_run_forge_fusion)
+
+        result = await forge_fusion_run.run_fusion_handler({"task_id": "fusion_task"}, session_dir=tmp_path)
+
+        assert result["status"] == "complete"
+        input_payload = calls[0]
+        assert input_payload["timeout"] == 7200
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_takes_the_lane_share_of_a_bounded_phase(self, tmp_path, monkeypatch):
+        """600 min less the 5 min reserve = 35700s; fusion's 30% is 10710s."""
+        trace = tmp_path / "decode.trace.json.gz"
+        trace.write_text("{}", encoding="utf-8")
+        SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            last_profile_trace=str(trace),
+        ).save(tmp_path)
+        _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+        monkeypatch.delenv("FORGE_FUSION_TIMEOUT", raising=False)
+        # Pinned: a live clock would tick between the split and the assertion.
+        monkeypatch.setattr(SharedState, "remaining_minutes", lambda _self, **_kw: 600.0)
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+        calls: list[dict] = []
+
+        async def _fake_run_forge_fusion(args):
+            calls.append(args)
+            return {"status": "complete", "decision": "REVERT", "kept": False}
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "run_forge_fusion", _fake_run_forge_fusion)
+
+        await forge_fusion_run.run_fusion_handler({"task_id": "fusion_task"}, session_dir=tmp_path)
+
+        input_payload = calls[0]
+        assert input_payload["timeout"] == 10710
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_failure_branches(self, tmp_path, monkeypatch):
+        state = SharedState(framework="sglang", model_path="/models/zaya")
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: False)
+        not_found = await forge_fusion_run.run_fusion_handler({}, session_dir=tmp_path)
+        assert not_found["error_class"] == "forge_fusion_not_found"
+
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+        state.model_path = ""
+        state.save(tmp_path)
+        monkeypatch.delenv("MODEL_PATH", raising=False)
+        missing_model = await forge_fusion_run.run_fusion_handler({}, session_dir=tmp_path)
+        assert missing_model["error_class"] == "model_path_missing"
+
+        state.model_path = "/models/zaya"
+        state.last_profile_trace = ""
+        state.save(tmp_path)
+        missing_trace = await forge_fusion_run.run_fusion_handler({}, session_dir=tmp_path)
+        assert missing_trace["error_class"] == "decode_trace_missing"
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_timeout_is_shaped(self, tmp_path, monkeypatch):
+        trace = tmp_path / "trace.json.gz"
+        trace.write_text("{}", encoding="utf-8")
+        SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            last_profile_trace=str(trace),
+        ).save(tmp_path)
+        _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+
+        async def _timeout(cmd, *, timeout_sec, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd, timeout_sec)
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "_run_subprocess", _timeout)
+
+        result = await forge_fusion_run.run_fusion_handler({}, session_dir=tmp_path)
+
+        assert result["status"] == "failed"
+        assert result["error_class"] == "subprocess_timeout"
+        assert result["backend"] == "forge"
+        assert result["kept"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_passes_session_serve_args(self, tmp_path, monkeypatch):
+        model = tmp_path / "MiniMax-M3-MXFP4"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps({"sparse_attention_config": {"sparse_block_size": 128}}),
+            encoding="utf-8",
+        )
+        trace = tmp_path / "trace.json.gz"
+        trace.write_text("{}", encoding="utf-8")
+        SharedState(
+            framework="vllm",
+            model_path=str(model),
+            last_profile_trace=str(trace),
+            tp=8,
+            max_model_len=13312,
+        ).save(tmp_path)
+        _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+        calls: list[dict] = []
+
+        async def _fake_run_forge_fusion(args):
+            calls.append(args)
+            return {"status": "complete", "decision": "REVERT", "kept": False}
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "run_forge_fusion", _fake_run_forge_fusion)
+
+        await forge_fusion_run.run_fusion_handler({"task_id": "fusion_task"}, session_dir=tmp_path)
+        input_payload = calls[0]
+        assert input_payload["tp"] == 8
+        assert input_payload["block_size"] == 128
+        assert input_payload["max_model_len"] == 13312
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_timeout_salvages_keep(self, tmp_path, monkeypatch):
+        trace = tmp_path / "trace.json.gz"
+        trace.write_text("{}", encoding="utf-8")
+        SharedState(
+            framework="sglang",
+            model_path="/models/zaya",
+            last_profile_trace=str(trace),
+        ).save(tmp_path)
+        _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+        monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+
+        async def _timeout(cmd, *, timeout_sec, **_kwargs):
+            workspace = tmp_path / "runs" / "fusion" / "kernel_entry_fusion"
+            (workspace / "fusion_llm_qwen.patch").write_text("diff --git a/model.py b/model.py\n", encoding="utf-8")
+            (workspace / "forge_loop_llm_qwen.json").write_text(
+                json.dumps({"improved": True, "total_speedup": 2.69}), encoding="utf-8"
+            )
+            (workspace / "driver_llm_qwen.py").write_text("ENV_FLAGS = ('QWEN_FUSED',)\n", encoding="utf-8")
+            raise subprocess.TimeoutExpired(cmd, timeout_sec)
+
+        monkeypatch.setattr(forge_fusion_run.forge_fusion, "_run_subprocess", _timeout)
+
+        result = await forge_fusion_run.run_fusion_handler({}, session_dir=tmp_path)
+
+        assert result["kept"] is True
+        assert result["decision"] == "KEEP"
+        assert result["requires_e2e_validation"] is True
+        assert result["salvaged"] is True
+        assert result["error_class"] == "subprocess_timeout"
+        assert result["kernel_speedup"] == 2.69
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_requires_model_path(self, tmp_path, monkeypatch):
+        state = SharedState(precision="bf16", framework="sglang")
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.delenv("MODEL_PATH", raising=False)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["status"] == "failed"
+        assert result["error_class"] == "model_path_missing"
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_resolves_hf_repo_for_subprocess(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hyperloom.common import model_paths
+
+        snapshot = tmp_path / "models--amd--DeepSeek-V4-Pro-MXFP4" / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v3"}),
+            encoding="utf-8",
+        )
+        state = SharedState(
+            precision="mxfp4",
+            framework="vllm",
+            model_path="amd/DeepSeek-V4-Pro-MXFP4",
+            gpu_type="mi355x",
+            tp=8,
+            conc=64,
+        )
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(
+            model_paths,
+            "resolve_local_model_dir",
+            lambda _model_path: snapshot,
+        )
+        monkeypatch.setattr(forge_gemm_tuning, "_resolve_aiter_root_for_forge", lambda: "/opt/aiter")
+        durable = {}
+
+        def _capture_durable_envs(extra_envs, *, model_path, session_dir):
+            durable["model_path"] = model_path
+            return extra_envs, ""
+
+        monkeypatch.setattr(
+            forge_gemm_tuning,
+            "_persist_forge_gemm_csv_durably",
+            _capture_durable_envs,
+        )
+
+        subprocess_cmd = []
+
+        async def _fake_subprocess(_cmd, *, timeout_sec, **_kwargs):
+            subprocess_cmd.extend(_cmd)
+            sentinel = (
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "candidate",
+                        "recommended_env": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE": "/tmp/tuned.csv"},
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+            )
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+        payload = {"task_id": "deepseek-gemm"}
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning(payload, session_dir=tmp_path)
+
+        workspace = forge_lane_budget._gemm_tuning_workspace(payload["task_id"], session_dir=tmp_path)
+        written = _FORGE_GEMM_PAYLOADS[-1]
+        assert written["model_path"] == str(snapshot)
+        assert subprocess_cmd[:2] == ["env", "AITER_ROOT_DIR=/opt/aiter"]
+        assert subprocess_cmd[2] == sys.executable
+        assert result["model_path"] == "amd/DeepSeek-V4-Pro-MXFP4"
+        assert durable["model_path"] == "amd/DeepSeek-V4-Pro-MXFP4"
+
+    async def _gemm_input_payload(self, tmp_path, monkeypatch, *, max_minutes):
+        """Run the gemm lane against a faked subprocess and return its input JSON."""
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
+        state = SharedState(
+            precision="fp8",
+            framework="sglang",
+            model_path=str(model),
+            gpu_type="mi300x",
+            tp=1,
+            conc=64,
+            max_minutes=max_minutes,
+        )
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_resolve_aiter_root_for_forge", lambda: "")
+        monkeypatch.setattr(forge_gemm_tuning, "_persist_forge_gemm_csv_durably", lambda envs, **_k: (envs, ""))
+
+        async def _fake_subprocess(_cmd, *, timeout_sec, **_kwargs):
+            body = json.dumps({"status": "ok", "micro_decision": "no_improvement"})
+            return 0, f"FORGE_GEMM_TUNE_RESULT_BEGIN\n{body}\nFORGE_GEMM_TUNE_RESULT_END\n", ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+        request = {"task_id": "gemm_ceiling"}
+        await forge_gemm_tuning._run_forge_gemm_tuning(request, session_dir=tmp_path)
+        workspace = forge_lane_budget._gemm_tuning_workspace(request["task_id"], session_dir=tmp_path)
+        return _FORGE_GEMM_PAYLOADS[-1]
+
+    @pytest.mark.asyncio
+    async def test_gemm_tuner_ceiling_comes_from_the_lane_share(self, tmp_path, monkeypatch):
+        """A bounded session funds the lane, so its target count is handed down."""
+        payload = await self._gemm_input_payload(tmp_path, monkeypatch, max_minutes=600)
+
+        assert payload["max_tuners"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_an_unbounded_session_sends_no_gemm_tuner_ceiling(self, tmp_path, monkeypatch):
+        """No share can be derived, and a zero ceiling would silence the lane."""
+        payload = await self._gemm_input_payload(tmp_path, monkeypatch, max_minutes=0)
+
+        assert "max_tuners" not in payload
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_rejects_uncached_hf_repo(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hyperloom.common import model_paths
+
+        SharedState(
+            precision="mxfp4",
+            framework="vllm",
+            model_path="amd/Unavailable-Model",
+            gpu_type="mi355x",
+        ).save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(
+            model_paths,
+            "resolve_local_model_dir",
+            lambda _model_path: None,
+        )
+        subprocess_called = False
+
+        async def _unexpected_subprocess(_cmd, *, timeout_sec, **_kwargs):
+            nonlocal subprocess_called
+            subprocess_called = True
+            return 1, "", ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _unexpected_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        # Skipped, not failed: forge never started, so it has no verdict.
+        assert result["status"] == "skipped"
+        assert result["error_class"] == "model_path_unavailable"
+        assert result["skip_reason"]
+        assert subprocess_called is False
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_rejects_missing_absolute_model_path(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        missing_model_dir = tmp_path / "missing-model"
+        SharedState(
+            precision="mxfp4",
+            framework="vllm",
+            model_path=str(missing_model_dir),
+            gpu_type="mi355x",
+        ).save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        subprocess_called = False
+
+        async def _unexpected_subprocess(_cmd, *, timeout_sec, **_kwargs):
+            nonlocal subprocess_called
+            subprocess_called = True
+            return 1, "", ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _unexpected_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert missing_model_dir.is_absolute()
+        assert result["status"] == "skipped"
+        assert result["error_class"] == "model_path_unavailable"
+        assert subprocess_called is False
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_maps_failed_micro_decision(self, tmp_path, monkeypatch):
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi300x",
+            tp=1,
+            conc=64,
+        )
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"micro_decision": "failed"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 1, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["decision"] == "REVERT"
+        assert result["status"] == "failed"
+        assert result["backend"] == "forge"
+
+    # ---- forge wording -> coordinator decision ------------------------------ forge reports seven micro_decision
+    # wordings; the bridge handled four, and the three it missed read in the breakdown like a genuine no_improvement.
+
+    @pytest.mark.asyncio
+    async def test_a_partial_wording_is_reverted_and_named(self, tmp_path, monkeypatch):
+        """A barren ``partial_failure`` is a REVERT that still names itself."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"status": "ok", "micro_decision": "partial_failure"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["decision"] == "REVERT"
+        assert result["error_class"] == "forge_partial_failure"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_run_is_reverted_and_says_so(self, tmp_path, monkeypatch):
+        """Writing zero rows is not the same outcome as finding nothing."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"status": "ok", "micro_decision": "empty_output"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["decision"] == "REVERT"
+        assert result["error_class"], "an empty run must name itself"
+        assert "empty" in result["error_class"]
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_no_improvement_stays_unadorned(self, tmp_path, monkeypatch):
+        """The distinction only works if the ordinary case stays ordinary."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"status": "ok", "micro_decision": "no_improvement"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["decision"] == "REVERT"
+        assert not result.get("error_class")
+
+    @pytest.mark.asyncio
+    async def test_a_tuner_error_class_reaches_the_envelope(self, tmp_path, monkeypatch):
+        """A crash a tuner named must be visible where the breakdown reads."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps(
+                {
+                    "status": "failed",
+                    "micro_decision": "failed",
+                    "tuners_run": [
+                        {
+                            "tuner": "fmoe_ck",
+                            "status": "failed",
+                            "error_class": "codegen_unsupported_dtype",
+                            "error": "Unsupported data type combination",
+                        }
+                    ],
+                }
+            )
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 1, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["error_class"] == "codegen_unsupported_dtype"
+        assert "Unsupported data type" in str(result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_keeps_both_the_env_and_a_sibling_crash(self, tmp_path, monkeypatch):
+        """One tuner crashed, another delivered: forge reports ``candidate``, so the env is measured and the crash is still named."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_persist_forge_gemm_csv_durably", lambda envs, **_kw: (dict(envs), ""))
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps(
+                {
+                    "status": "ok",
+                    "micro_decision": "candidate",
+                    "recommended_env": {"AITER_CONFIG_FMOE": "/ws/tuned_fmoe.csv"},
+                    "tuners_run": [
+                        {"tuner": "a8w8", "status": "failed", "error_class": "codegen_crash"},
+                        {"tuner": "fmoe_ck", "status": "ok"},
+                    ],
+                }
+            )
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["decision"] == "KEEP"
+        assert result["requires_e2e_validation"] is True
+        assert result["error_class"] == "codegen_crash"
+        # status decides promotability; a named crash must not demote the run.
+        assert result["status"] != "failed"
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_tuners_run_does_not_break_the_run(self, tmp_path, monkeypatch):
+        """``tuners_run`` is forge's JSON and may be any shape; lifting a reason out of it must not turn a run that happened into a reported crash."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+
+        for malformed in (5, "not-a-list", {"tuner": "fmoe_ck"}, [None, 7]):
+            sentinel = (
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "no_improvement",
+                        "tuners_run": malformed,
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+            )
+
+            async def _fake_subprocess(cmd, *, timeout_sec, _s=sentinel, **_kwargs):
+                return 0, _s, ""
+
+            monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+            result = await forge_gemm_tuning._run_forge_gemm_tuning(
+                {"task_id": f"malformed-{type(malformed).__name__}"},
+                session_dir=tmp_path,
+            )
+
+            # The verdict still lands, and no exception class leaks in as a cause.
+            assert result["decision"] == "REVERT", malformed
+            assert result.get("error_class") != "TypeError", malformed
+
+    @pytest.mark.asyncio
+    async def test_an_absent_micro_decision_is_left_alone(self, tmp_path, monkeypatch):
+        """No wording at all is not a verdict; the bridge must not invent one."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        sentinel = "FORGE_GEMM_TUNE_RESULT_BEGIN\n" + json.dumps({"status": "ok"}) + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert "decision" not in result
+
+    # ---- MoE runtime key: log -> CSV -> payload -> forge argv --------------- Both ends were covered (the CSV
+    # writer, and KernelForge's preference for a caller-supplied CSV); the handoff between them was not, and deleting
+    # any link in it left the suite green.
+
+    #: A real dispatch line, gfx field included. Fixtures that dropped the gfx
+    #: field once let a regex that could never match production pass its tests.
+    _REAL_MOE_DISPATCH = (
+        "(Worker_TP0 pid=1) [aiter] [fused_moe] using 2stage default for "
+        "('gfx950', 256, 256, 4096, 512, 256, 6, 'ActivationType.Silu', "
+        "'torch.bfloat16', 'torch.float8_e4m3fn', 'torch.float4_e2m1fn_x2', "
+        "'QuantType.per_1x32', True, False)"
+    )
+
+    @staticmethod
+    def _moe_state(tmp_path):
+        model_dir = tmp_path / "moe-model"
+        model_dir.mkdir(exist_ok=True)
+        SharedState(
+            precision="fp8",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi355x",
+            tp=1,
+            conc=64,
+        ).save(tmp_path)
+        return model_dir
+
+    @staticmethod
+    def _sentinel() -> str:
+        return (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"status": "ok", "micro_decision": "skipped"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+    async def _run_on_moe_log(self, tmp_path, monkeypatch, task_id: str) -> dict:
+        """Run the gemm lane on a serving log that dispatched one MoE GEMM and return its input JSON."""
+        self._moe_state(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        log = tmp_path / "server.log"
+        log.write_text(self._REAL_MOE_DISPATCH + "\n", encoding="utf-8")
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, self._sentinel(), ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+        monkeypatch.setattr(forge_gemm_tuning, "resolve_forge_server_log", lambda *_a: str(log))
+        await forge_gemm_tuning._run_forge_gemm_tuning({"task_id": task_id}, session_dir=tmp_path)
+        return _FORGE_GEMM_PAYLOADS[-1]
+
+    @pytest.mark.asyncio
+    async def test_moe_key_travels_from_the_log_into_the_forge_payload(self, tmp_path, monkeypatch):
+        """The values must come from the log, not from the config: a config-derived key is what aiter would never look up."""
+        written = await self._run_on_moe_log(tmp_path, monkeypatch, "moe-key")
+        csv_path = Path(written["moe_untuned_csv"])
+        assert csv_path.is_file(), "the payload must name a CSV that exists"
+
+        rows = csv_path.read_text(encoding="utf-8").strip().splitlines()
+        header = rows[0].split(",")
+        values = dict(zip(header, rows[1].split(",")))
+        # Straight off the log line, not inferred from the model config.
+        assert values["inter_dim"] == "512"
+        assert values["model_dim"] == "4096"
+        assert values["expert"] == "256"
+        assert values["topk"] == "6"
+        assert values["q_dtype_a"] == "torch.float8_e4m3fn"
+        assert values["q_dtype_w"] == "torch.float4_e2m1fn_x2"
+        assert values["q_type"] == "QuantType.per_1x32"
+
+    def test_the_token_column_comes_from_the_workload(self, tmp_path):
+        """``tokens`` arrives as forge's comma-separated string, not a list."""
+        log = tmp_path / "server.log"
+        log.write_text(self._REAL_MOE_DISPATCH + "\n", encoding="utf-8")
+
+        for tokens, expected in (
+            ("1,32,64", ["1", "32", "64"]),
+            ("64", ["64"]),
+            ([1, 32, 64], ["1", "32", "64"]),
+            ("", ["1"]),
+            ("  16 , 16 ,bad,-8, 0 ", ["16"]),
+        ):
+            csv_path, _report = aiter_tuner_support._write_fmoe_untuned_csv_from_log(
+                str(log), tokens, tmp_path / f"ws_{str(tokens)[:12].strip()}"
+            )
+            assert csv_path, f"no CSV for tokens={tokens!r}"
+            rows = Path(csv_path).read_text(encoding="utf-8").strip().splitlines()
+            got = [r.split(",")[0] for r in rows[1:]]
+            assert got == expected, f"tokens={tokens!r} -> {got}"
+
+    @pytest.mark.asyncio
+    async def test_the_moe_csv_reaches_the_forge_argv(self, tmp_path, monkeypatch):
+        """Deriving the CSV is useless if the option never reaches forge."""
+        written = await self._run_on_moe_log(tmp_path, monkeypatch, "moe-argv")
+        # The handler hands the tool an input JSON; the tool builds forge's argv from it.
+        workspace = forge_lane_budget._gemm_tuning_workspace("moe-argv", session_dir=tmp_path)
+        assert written["moe_untuned_csv"].endswith("untuned_fmoe_from_runtime.csv")
+        assert str(workspace) in written["moe_untuned_csv"]
+
+    @pytest.mark.asyncio
+    async def test_vllm_block_fp8_prefers_traced_shapes_over_profile_capture(self, tmp_path, monkeypatch):
+        """vLLM block-FP8 must tune the device-side traced shapes."""
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale_ck",
+                            "input_shapes": [
+                                {"call_num": 1440, "shape": "(64,3072) fp8"},
+                                {"call_num": 1440, "shape": "(10240,3072) fp8"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"quantization_config": {"weight_block_size": [128, 128]}}), encoding="utf-8"
+        )
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path=str(model_dir),
+            gpu_type="mi355x",
+            tp=1,
+            conc=64,
+            last_trace_analyze={"candidates_path": str(candidates)},
+            current_best={"extra_server_args": "--quantization fp8", "extra_envs": {}},
+        )
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(SharedState, "profile_trace_matches_workload", lambda _self: True)
+
+        captured = {"ran": False}
+
+        async def _record_capture(**_kwargs):
+            captured["ran"] = True
+            return {"status": "failed"}
+
+        monkeypatch.setattr(forge_gemm_tuning, "_capture_vllm_tunableop_shapes", _record_capture)
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 1, "", ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        # task_id keeps the workspace deterministic (it otherwise falls back to a wall-clock suffix, which the
+        # assertion below could not re-derive).
+        payload = {"task_id": "gemm-1"}
+        await forge_gemm_tuning._run_forge_gemm_tuning(payload, session_dir=tmp_path)
+
+        assert captured["ran"] is False, "profile capture ran despite traced shapes"
+        workspace = forge_lane_budget._gemm_tuning_workspace(payload["task_id"], session_dir=tmp_path)
+        written = _FORGE_GEMM_PAYLOADS[-1]
+        shapes = json.loads(Path(written["shapes_json"]).read_text(encoding="utf-8"))
+        # Traced shapes are re-keyed onto aiter's power-of-two lookup ladder.
+        assert {(row["N"], row["K"]) for row in shapes} == {(10240, 3072)}
+        assert {row["M"] for row in shapes} == {16, 32, 64}
+
+    @pytest.mark.asyncio
+    async def test_run_forge_gemm_tuning_tags_engine_forge(self, tmp_path, monkeypatch):
+        """Forge runs must carry ``engine='forge'`` so the breakdown attributes them correctly."""
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi300x",
+            tp=1,
+            conc=64,
+        )
+        state.save(tmp_path)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+
+        sentinel = (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"status": "ok", "micro_decision": "skipped"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, sentinel, ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        result = await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        assert result["engine"] == "forge"
+
+    @pytest.mark.parametrize(
+        "quant_type",
+        [
+            "blockscale_bpreshuffle",
+            "a8w8_blockscale_bpreshuffle",
+            "blockscale+bpreshuffle",
+        ],
+    )
+    def test_resolve_forge_untuned_csv_blockscale_bpreshuffle(
+        self,
+        tmp_path,
+        quant_type,
+    ):
+        expected = self._write_aiter_csv(
+            tmp_path,
+            "abc",
+            "a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
+            "M,N,K\n16,1536,7168\n",
+        )
+        assert untuned_gemm_csv._resolve_forge_untuned_csv(
+            tmp_path,
+            "fp8",
+            quant_type,
+        ) == str(expected)
+
+    def test_resolve_forge_untuned_csv_rejects_unknown_fp8_quant(self, tmp_path):
+        self._write_aiter_csv(
+            tmp_path,
+            "abc",
+            "a8w8_blockscale_untuned_gemm.csv",
+            "M,N,K\n16,1536,7168\n",
+        )
+
+        assert (
+            untuned_gemm_csv._resolve_forge_untuned_csv(
+                tmp_path,
+                "fp8",
+                "misspelled_quant_type",
+            )
+            == ""
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "source",
+        ["fresh_profile", "stale_profile"],
+    )
+    async def test_sglang_shape_source_priority(
+        self,
+        tmp_path,
+        monkeypatch,
+        source,
+    ):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                    "quantization_config": {"weight_block_size": [128, 128]},
+                }
+            )
+        )
+        profile_shapes = tmp_path / "profile_shapes.json"
+        profile_shapes.write_text(json.dumps([{"M": 1024, "N": 34816, "K": 5120}]))
+        specialist_csv = tmp_path / "a8w8_blockscale_untuned_gemm.csv"
+        specialist_csv.write_text("M,N,K\n4096,34816,5120\n")
+        state = SharedState(
+            precision="fp8",
+            framework="sglang",
+            model_path=str(model),
+            gpu_type="mi300x",
+            tp=1,
+            conc=64,
+            last_profile_status="succeeded",
+            last_trace_analyze={"shapes_json": str(profile_shapes)},
+        )
+        state.last_profile_workload = state.profile_workload_context()
+        if source == "stale_profile":
+            state.last_profile_workload["conc"] = 32
+        state.save(tmp_path)
+        captured: dict = {}
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(
+            forge_gemm_tuning,
+            "_resolve_forge_untuned_csv",
+            lambda *args, **kwargs: str(specialist_csv),
+        )
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            captured.update(_FORGE_GEMM_PAYLOADS[-1])
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps({"status": "ok", "micro_decision": "skipped"})
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+        await forge_gemm_tuning._run_forge_gemm_tuning({}, session_dir=tmp_path)
+
+        if source == "stale_profile":
+            assert captured["untuned_csv"] == str(specialist_csv)
+            assert captured["shapes_json"] == ""
+        else:
+            assert captured["untuned_csv"] == ""
+            # The fresh profile wins over the specialist CSV; the path handed to forge is that profile re-keyed onto
+            # aiter's lookup ladder.
+            assert captured["shapes_json"].endswith("forge_shapes.aiter_aligned.json")
+            assert json.loads(Path(captured["shapes_json"]).read_text(encoding="utf-8"))
+
+
+def _ensure_torch_module(monkeypatch):
+    try:
+        import torch
+    except ModuleNotFoundError:
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(device_count=lambda: 0),
+        )
+        monkeypatch.setitem(sys.modules, "torch", torch)
+    return torch
+
+
+class TestCoerceRuntimeValue:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("42", 42),
+            ("  17  ", 17),
+            ("3.14", pytest.approx(3.14)),
+            ("not-a-number", "not-a-number"),
+            ("3.14.invalid", "3.14.invalid"),
+            (5, 5),
+            (3.5, 3.5),
+            (None, None),
+        ],
+    )
+    def test_roundtrips(self, value, expected):
+        assert ta._coerce_runtime_value(value) == expected
+
+
+class TestCandidateEnvAllowed:
+    @pytest.mark.parametrize("name", ["AWS_SECRET_ACCESS_KEY", "ANTHROPIC_API_KEY"])
+    def test_sensitive_env_blocked(self, name):
+        assert ta._candidate_env_allowed(name) is False
+
+    def test_known_prefix_allowed(self):
+        prefixes = ta._CANDIDATE_ENV_PREFIXES
+        assert prefixes  # registry not empty
+        sample = next(iter(prefixes))
+        assert ta._candidate_env_allowed(sample + "FOO") is True
+
+    def test_explicit_allowlisted_key(self):
+        keys = ta._CANDIDATE_ENV_KEYS
+        if not keys:
+            pytest.skip("no explicit allowlist entries in build")
+        sample = next(iter(keys))
+        assert ta._candidate_env_allowed(sample) is True
+
+
+class TestSplitServerArgs:
+    def test_empty_returns_empty(self):
+        assert ta._split_server_args("") == []
+
+    def test_split_uses_shlex(self):
+        argv = ta._split_server_args("--foo 1 --bar 'x y'")
+        assert argv == ["--foo", "1", "--bar", "x y"]
+
+    def test_unterminated_quote_returns_empty(self):
+        # shlex.split raises ValueError on bad input; helper returns [].
+        argv = ta._split_server_args('--foo "unterminated')
+        assert argv == []
+
+
+class TestLoadMaterializedWorkloadMetadata:
+    def test_empty_when_no_path(self):
+        assert ta._load_materialized_workload_metadata("") == {}
+
+    def test_empty_when_path_missing(self, tmp_path):
+        assert ta._load_materialized_workload_metadata(str(tmp_path / "no.yaml")) == {}
+
+    def test_parses_sglang_metadata(self, tmp_path):
+        cfg = tmp_path / "magpie.yaml"
+        cfg.write_text(
+            "benchmark:\n"
+            "  framework: sglang\n"
+            "  model: /weights/m\n"
+            "  precision: bf16\n"
+            "  envs:\n"
+            "    TP: 1\n"
+            "    CONC: 16\n"
+            "    ISL: 1024\n"
+            "    OSL: 512\n"
+            "    EXTRA_SGLANG_ARGS: '--foo 1'\n"
+        )
+        out = ta._load_materialized_workload_metadata(str(cfg))
+        runtime = out["runtime_args"]
+        assert runtime["framework"] == "sglang"
+        assert runtime["server_args"] == "--foo 1"
+        assert runtime["server_args_argv"] == ["--foo", "1"]
+        workload = runtime["workload"]
+        assert workload["tp"] == 1
+        assert workload["conc"] == 16
+        assert "TP" in out["env_vars"]
+
+    @pytest.mark.parametrize(
+        "framework,env_name,expected_args",
+        [
+            ("sglang", "EXTRA_SGLANG_ARGS", "--mem-fraction-static=0.8"),
+            ("vllm", "EXTRA_VLLM_ARGS", "--gpu-memory-utilization 0.9"),
+            ("atom", "EXTRA_ATOM_ARGS", "--trust-remote-code --level 2 --enable-expert-parallel"),
+        ],
+    )
+    def test_server_args_read_from_per_framework_env_key(
+        self,
+        tmp_path,
+        framework,
+        env_name,
+        expected_args,
+    ):
+        """The handler reads the per-framework ``EXTRA_<FRAMEWORK>_ARGS`` slot."""
+        cfg = tmp_path / f"magpie_{framework}.yaml"
+        cfg.write_text(
+            "benchmark:\n"
+            f"  framework: {framework}\n"
+            "  model: /weights/m\n"
+            "  precision: bf16\n"
+            "  envs:\n"
+            "    TP: 4\n"
+            "    CONC: 32\n"
+            "    ISL: 1024\n"
+            "    OSL: 1024\n"
+            f"    {env_name}: '{expected_args}'\n"
+        )
+        out = ta._load_materialized_workload_metadata(str(cfg))
+        runtime = out["runtime_args"]
+        assert runtime["framework"] == framework
+        assert runtime["server_args"] == expected_args, (
+            f"framework={framework!r} expected server_args={expected_args!r}; got {runtime['server_args']!r}."
+        )
+
+    def test_atom_server_args_ignore_stray_sglang_env(self, tmp_path):
+        """When an atom YAML carries both EXTRA_ATOM_ARGS and a stray EXTRA_SGLANG_ARGS, the atom slot wins."""
+        cfg = tmp_path / "magpie_atom_mixed.yaml"
+        cfg.write_text(
+            "benchmark:\n"
+            "  framework: atom\n"
+            "  model: /weights/m\n"
+            "  precision: fp8\n"
+            "  envs:\n"
+            "    TP: 4\n"
+            "    CONC: 32\n"
+            "    ISL: 1024\n"
+            "    OSL: 1024\n"
+            "    EXTRA_SGLANG_ARGS: '--should-be-ignored'\n"
+            "    EXTRA_ATOM_ARGS: '--trust-remote-code --level 2'\n"
+        )
+        out = ta._load_materialized_workload_metadata(str(cfg))
+        runtime = out["runtime_args"]
+        assert runtime["framework"] == "atom"
+        assert runtime["server_args"] == "--trust-remote-code --level 2"
+        assert "--should-be-ignored" not in runtime["server_args"]
+
+
+class TestEnrichCandidate:
+    def test_enrich_candidate_runtime_metadata_setdefault_semantics(self):
+        candidates = [{"kernel_id": "k", "env_vars": {"TP": "8"}}]
+        metadata = {"env_vars": {"TP": "1", "CONC": "16"}, "runtime_args": {"framework": "sglang"}}
+        ta._enrich_candidate_runtime_metadata(candidates, metadata)
+        assert candidates[0]["env_vars"] == {"TP": "8", "CONC": "16"}
+        assert candidates[0]["runtime_args"]["framework"] == "sglang"
+
+    def test_enrich_candidate_runtime_metadata_ignores_non_dict_items(self):
+        candidates = ["not a dict", {"kernel_id": "x"}]
+        ta._enrich_candidate_runtime_metadata(candidates, {"env_vars": {"A": "B"}})
+        assert candidates[1].get("env_vars") == {"A": "B"}
+
+    def test_enrich_candidate_trace_report_skips_blank_path(self):
+        candidates = [{"kernel_id": "k"}]
+        ta._enrich_candidate_trace_report(candidates, "")
+        assert "trace_report_path" not in candidates[0]
+
+    def test_enrich_candidates_artifact_noop_when_missing_path(self):
+        ta._enrich_candidates_artifact("", {"env_vars": {}}, trace_report_path="")
+
+
+class TestReusableSourceRootsAtom:
+    """atom layout prefixes participate in cross-task kernel reuse alongside aiter/sglang/vllm."""
+
+    def test_includes_atom_editable_path(self):
+        # The matcher lowercases its source-file input, so the stored prefix is lowercase ``/app/atom/atom/``.
+        assert any("/app/atom/atom/" in r.lower() for r in resolve_known_source_prefixes())
+
+    def test_includes_atom_site_packages_python_3_10(self):
+        assert any("/opt/venv/lib/python3.10/site-packages/atom/" in r for r in resolve_known_source_prefixes())
+
+    def test_includes_atom_site_packages_python_3_12(self):
+        assert any("/opt/venv/lib/python3.12/site-packages/atom/" in r for r in resolve_known_source_prefixes())
+
+
+class TestRunGemmTuningHandler:
+    def test_resolves_split_aiter_meta_root_for_forge(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        package_dir = tmp_path / "site-packages" / "aiter_meta"
+        (package_dir / "csrc").mkdir(parents=True)
+        spec = SimpleNamespace(submodule_search_locations=[str(package_dir)])
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name: spec if name == "aiter_meta" else None,
+        )
+
+        assert forge_gemm_probe._resolve_aiter_root_for_forge() == str(package_dir)
+
+    def test_vllm_shape_capture_merges_per_device_native_rows(self, tmp_path, monkeypatch):
+        from hyperloom.orchestrator.actions.executors import baseline as baseline_module
+
+        baseline_config = tmp_path / "baseline.yaml"
+        baseline_config.write_text("benchmark:\n  framework: vllm\n")
+        state = SharedState(
+            framework="vllm",
+            model_path="/models/qwen",
+            gpu_type="mi300x",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=512,
+            max_model_len=4096,
+            baseline_config_path=str(baseline_config),
+            baseline_eager_fallback=True,
+            current_best={
+                "extra_server_args": "--enforce-eager --port 8888",
+                "extra_envs": {
+                    "CONC": "128",
+                    "KEEP_ME": "1",
+                    "PYTORCH_TUNABLEOP_TUNING": "1",
+                    "HL_TUNABLEOP_MODE": "candidate",
+                },
+                "unset_envs": ["PYTORCH_TUNABLEOP_ENABLED", "DROP_ME"],
+            },
+        )
+        captured: dict = {}
+
+        class FakeBaselineExecutor:
+            def __init__(self, **kwargs):
+                captured["init"] = kwargs
+
+            async def __call__(self, ctx):
+                captured["task"] = ctx.task
+                envs = ctx.task.params["extra_envs"]
+                base = Path(envs["PYTORCH_TUNABLEOP_UNTUNED_FILENAME"])
+                base.with_name(f"{base.stem}0{base.suffix}").write_text(
+                    "GemmTunableOp_BFloat16_NT,nt_5120_4149_17408_ld_5120_17408_5120\nnot-a-native-row\n"
+                )
+                base.with_name(f"{base.stem}1{base.suffix}").write_text(
+                    "GemmTunableOp_BFloat16_NT,nt_5120_4149_17408_ld_5120_17408_5120\n"
+                    "GemmTunableOp_BFloat16_NN,nn_17408_1083_5120_ld_17408_5120_17408\n"
+                    "ScaledGemmTunableOp_Float8_e4m3fnuz_NN,"
+                    "nn_5120_4149_17408_ld_5120_17408_5120_rw_0_bias_None,"
+                    "BLAS_PARAMS,algo_1\n"
+                )
+                return {"status": "succeeded"}
+
+        monkeypatch.setattr(baseline_module, "BaselineExecutor", FakeBaselineExecutor)
+        monkeypatch.setattr(shape_capture, "_pick_shape_capture_port", lambda: 19001)
+
+        result = asyncio.run(
+            shape_capture._capture_vllm_tunableop_shapes(
+                state=state,
+                session_dir=tmp_path,
+                workspace=tmp_path / "runs" / "gemm_tuning" / "capture",
+            )
+        )
+
+        assert result["status"] == "ok"
+        assert result["shape_count"] == 3
+        merged = Path(result["tunableop_input"])
+        assert len(merged.read_text().splitlines()) == 3
+        task = captured["task"]
+        assert task.kind == "gemm_shape_capture"
+        assert task.params["baseline_double_run"] is False
+        assert task.params["extra_envs"]["RUN_EVAL"] == "false"
+        assert task.params["extra_server_args"] == "--enforce-eager --port 8888"
+        assert "--port" in task.params["remove_args"]
+        assert task.params["extra_envs"]["KEEP_ME"] == "1"
+        assert task.params["extra_envs"]["PYTORCH_TUNABLEOP_ENABLED"] == "1"
+        assert task.params["extra_envs"]["PYTORCH_TUNABLEOP_TUNING"] == "0"
+        assert task.params["extra_envs"]["PYTORCH_TUNABLEOP_RECORD_UNTUNED"] == "1"
+        assert task.params["extra_envs"]["HL_TUNABLEOP_MODE"] == ""
+        assert task.params["extra_envs"]["PORT"] == "19001"
+        assert task.params["extra_envs"]["TP"] == "1"
+        assert task.params["extra_envs"]["CONC"] == "128"
+        assert task.params["extra_envs"]["ISL"] == "1024"
+        assert task.params["extra_envs"]["OSL"] == "512"
+        assert task.params["extra_envs"]["MAX_MODEL_LEN"] == "4096"
+        assert "HL_TUNABLEOP_MODE" in task.params["unset_envs"]
+        assert "DROP_ME" in task.params["unset_envs"]
+        assert not [name for name in task.params["unset_envs"] if name.startswith("PYTORCH_TUNABLEOP_")]
+        assert captured["init"]["shared_state"] is not state
+        assert captured["init"]["shared_state"].baseline_eager_fallback is False
+        assert state.baseline_eager_fallback is True
+
+        import yaml
+
+        from hyperloom.orchestrator.actions.executors._workload_envs import materialize_config_with_envs
+
+        monkeypatch.setenv("INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP", "1")
+        monkeypatch.setenv("HYPERLOOM_ENABLE_PATCH", "0")
+        base = tmp_path / "base.yaml"
+        base.write_text(yaml.safe_dump({"benchmark": {"framework": "vllm", "model": "/models/m", "envs": {}}}))
+        materialized = materialize_config_with_envs(
+            base,
+            tmp_path / "materialized",
+            launch=LaunchLayer(extra_envs=task.params["extra_envs"], unset_envs=task.params["unset_envs"]),
+        )
+        envs = yaml.safe_load(materialized.read_text())["benchmark"]["envs"]
+        assert envs["PYTORCH_TUNABLEOP_ENABLED"] == "1"
+        assert envs["PYTORCH_TUNABLEOP_RECORD_UNTUNED"] == "1"
+        assert (
+            envs["PYTORCH_TUNABLEOP_UNTUNED_FILENAME"]
+            == task.params["extra_envs"]["PYTORCH_TUNABLEOP_UNTUNED_FILENAME"]
+        )
+        assert "HL_TUNABLEOP_MODE" not in envs
+
+    def test_vllm_block_fp8_profile_capture_extracts_runtime_shapes(self, tmp_path, monkeypatch):
+        import gzip
+
+        from hyperloom.orchestrator.actions.executors import roofline as roofline_module
+
+        state = SharedState(
+            framework="vllm",
+            model_path="/models/qwen",
+            gpu_type="mi325x",
+            tp=1,
+            conc=2,
+            isl=128,
+            osl=16,
+            max_model_len=512,
+            current_best={
+                "extra_envs": {
+                    "VLLM_ROCM_USE_AITER": "1",
+                    "VLLM_ROCM_USE_AITER_LINEAR": "1",
+                    "PYTORCH_TUNABLEOP_ENABLED": "1",
+                }
+            },
+        )
+        captured: dict = {}
+
+        class FakeRooflineExecutor:
+            def __init__(self, *, shared_state):
+                captured["init"] = {
+                    "shared_state": shared_state,
+                }
+
+            async def __call__(self, ctx):
+                captured["task"] = ctx.task
+                trace_dir = Path(ctx.task.params["output_dir"]) / "tracelens"
+                trace_dir.mkdir(parents=True)
+                trace = {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {
+                                "Input Dims": [
+                                    [4149, 5120],
+                                    [34816, 5120],
+                                    [33, 40],
+                                    [272, 40],
+                                ]
+                            },
+                        },
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[1083, 17408], [5120, 17408]]},
+                        },
+                    ]
+                }
+                steady_trace = trace_dir / "mixed_steady_state.trace.json.gz"
+                with gzip.open(steady_trace, "wt", encoding="utf-8") as stream:
+                    json.dump(trace, stream)
+                return {
+                    "status": "succeeded",
+                    "steady_state_trace": str(steady_trace),
+                }
+
+        monkeypatch.setattr(roofline_module, "RooflineExecutor", FakeRooflineExecutor)
+
+        result = asyncio.run(
+            shape_capture._capture_vllm_tunableop_shapes(
+                state=state,
+                session_dir=tmp_path,
+                capture_mode=shape_capture.BLOCK_FP8_PROFILE_CAPTURE,
+                workspace=tmp_path / "runs" / "gemm_tuning" / "capture",
+            )
+        )
+
+        assert result["status"] == "ok"
+        assert result["capture_mode"] == "block_fp8_profile"
+        assert result["shape_count"] == 2
+        assert json.loads(Path(result["shapes_json"]).read_text()) == [
+            {"K": 17408, "M": 1083, "N": 5120},
+            {"K": 5120, "M": 4149, "N": 34816},
+        ]
+        task = captured["task"]
+        assert "profiler-config.delay_iterations" not in task.params["extra_server_args"]
+        assert "profiler-config.max_iterations" not in task.params["extra_server_args"]
+        assert "analysis_route" not in task.params
+        assert "steady_state_mode" not in task.params
+        assert task.params["extra_envs"]["VLLM_ROCM_USE_AITER"] == "1"
+        assert task.params["extra_envs"]["VLLM_ROCM_USE_AITER_LINEAR"] == "1"
+        assert task.params["extra_envs"]["PYTORCH_TUNABLEOP_ENABLED"] == "1"
+        assert "PYTORCH_TUNABLEOP_ENABLED" not in task.params["unset_envs"]
+        assert captured["init"]["shared_state"] is state
+
+    @pytest.mark.parametrize("roofline_status", ["succeeded", "recovered"])
+    def test_vllm_block_fp8_profile_capture_uses_standard_roofline(self, tmp_path, monkeypatch, roofline_status):
+        import gzip
+
+        from hyperloom.orchestrator.actions.executors import baseline as baseline_module
+        from hyperloom.orchestrator.actions.executors import roofline as roofline_module
+
+        steady_trace = tmp_path / "mixed_steady_state.trace.json.gz"
+        with gzip.open(steady_trace, "wt", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[4149, 5120], [34816, 5120]]},
+                        }
+                    ]
+                },
+                stream,
+            )
+        state = SharedState(
+            framework="vllm",
+            precision="fp8",
+            model_path="/models/qwen",
+            current_best={
+                "extra_envs": {
+                    "VLLM_ROCM_USE_AITER_LINEAR": "1",
+                    "PYTORCH_TUNABLEOP_ENABLED": "1",
+                },
+            },
+            baseline_benchmark_script="vllm_custom.sh",
+        )
+        captured: dict = {}
+
+        class FailBaselineExecutor:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __call__(self, ctx):
+                raise AssertionError("block-FP8 profile capture must use RooflineExecutor")
+
+        class FakeRooflineExecutor:
+            def __init__(self, *, shared_state):
+                captured["shared_state"] = shared_state
+
+            async def __call__(self, ctx):
+                captured["task"] = ctx.task
+                return {
+                    "status": roofline_status,
+                    "steady_state_trace": str(steady_trace),
+                }
+
+        monkeypatch.setattr(baseline_module, "BaselineExecutor", FailBaselineExecutor)
+        monkeypatch.setattr(roofline_module, "RooflineExecutor", FakeRooflineExecutor)
+
+        result = asyncio.run(
+            shape_capture._capture_vllm_tunableop_shapes(
+                state=state,
+                session_dir=tmp_path,
+                capture_mode=shape_capture.BLOCK_FP8_PROFILE_CAPTURE,
+                workspace=tmp_path / "runs" / "gemm_tuning" / "capture",
+            )
+        )
+
+        assert result["status"] == "ok"
+        assert result["capture_mode"] == "block_fp8_profile"
+        assert result["shape_count"] == 1
+        assert result["source_profile_trace"] == str(steady_trace)
+        assert captured["shared_state"] is state
+        task = captured["task"]
+        assert "config_path" not in task.params
+        assert "timeout_sec" not in task.params
+        assert "analysis_route" not in task.params
+        assert "steady_state_mode" not in task.params
+        assert "reason" not in task.params
+        assert task.params["benchmark_script"] == "vllm_custom.sh"
+        assert task.params["extra_envs"]["VLLM_ROCM_USE_AITER_LINEAR"] == "1"
+        assert "VLLM_ROCM_USE_AITER" not in task.params["extra_envs"]
+        assert task.params["extra_envs"]["PYTORCH_TUNABLEOP_ENABLED"] == "1"
+        assert "PYTORCH_TUNABLEOP_ENABLED" not in task.params["unset_envs"]
+        assert "profiler-config.delay_iterations" not in task.params["extra_server_args"]
+        assert "profiler-config.max_iterations" not in task.params["extra_server_args"]
+
+    def test_vllm_block_fp8_profile_excludes_capture_sidecars(self, tmp_path):
+        import gzip
+
+        trace_root = tmp_path / "profile"
+        main_trace = trace_root / "torch_trace" / "main.trace.json.gz"
+        capture_trace = trace_root / "capture_traces" / "graph_capture.trace.json.gz"
+        main_trace.parent.mkdir(parents=True)
+        capture_trace.parent.mkdir(parents=True)
+
+        def write_trace(path, *, m, n, k):
+            with gzip.open(path, "wt", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "traceEvents": [
+                            {
+                                "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                                "args": {"Input Dims": [[m, k], [n, k]]},
+                            }
+                        ]
+                    },
+                    stream,
+                )
+
+        write_trace(main_trace, m=4149, n=34816, k=5120)
+        write_trace(capture_trace, m=256, n=34816, k=5120)
+
+        shapes_json, shape_count = shape_capture._extract_vllm_block_fp8_profile_shapes(trace_root)
+
+        assert shape_count == 1
+        assert json.loads(Path(shapes_json).read_text()) == [{"K": 5120, "M": 4149, "N": 34816}]
+        assert shape_capture._extract_vllm_block_fp8_profile_shapes(capture_trace) == ("", 0)
+
+    def test_vllm_block_fp8_profile_capture_without_trace_is_explicit_failure(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hyperloom.orchestrator.actions.executors import roofline as roofline_module
+
+        state = SharedState(
+            framework="vllm",
+            model_path="/models/qwen",
+        )
+
+        class FakeRooflineExecutor:
+            def __init__(self, *, shared_state, persist_state=True):
+                pass
+
+            async def __call__(self, ctx):
+                return {"status": "succeeded"}
+
+        monkeypatch.setattr(roofline_module, "RooflineExecutor", FakeRooflineExecutor)
+
+        result = asyncio.run(
+            shape_capture._capture_vllm_tunableop_shapes(
+                state=state,
+                session_dir=tmp_path,
+                capture_mode=shape_capture.BLOCK_FP8_PROFILE_CAPTURE,
+                workspace=tmp_path / "runs" / "gemm_tuning" / "capture",
+            )
+        )
+
+        assert result["status"] == "failed"
+        assert result["decision"] == "REVERT"
+        assert result["error_class"] == "shape_capture_failed"
+        assert result["capture_mode"] == "block_fp8_profile"
+        assert result["shape_count"] == 0
+
+    def test_extract_block_fp8_shapes_rejects_empty_trace_path(self, tmp_path, monkeypatch):
+        """``Path("")`` normalizes to the CWD; it must never be walked."""
+        stale = tmp_path / "unrelated" / "old_session" / "stale.trace.json"
+        stale.parent.mkdir(parents=True)
+        stale.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[999, 111], [222, 111]]},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        assert shape_capture._extract_vllm_block_fp8_profile_shapes(Path("")) == ("", 0)
+        assert shape_capture._extract_vllm_block_fp8_profile_shapes(Path(".")) == ("", 0)
+
+    def test_vllm_block_fp8_profile_capture_without_trace_ignores_cwd_traces(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A succeeded Roofline with no steady trace must not harvest CWD shapes."""
+        from hyperloom.orchestrator.actions.executors import roofline as roofline_module
+
+        stale = tmp_path / "unrelated" / "old_session" / "stale.trace.json"
+        stale.parent.mkdir(parents=True)
+        stale.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[999, 111], [222, 111]]},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        state = SharedState(framework="vllm", model_path="/models/qwen")
+
+        class FakeRooflineExecutor:
+            def __init__(self, *, shared_state, persist_state=True):
+                pass
+
+            async def __call__(self, ctx):
+                return {"status": "succeeded", "steady_state_trace": ""}
+
+        monkeypatch.setattr(roofline_module, "RooflineExecutor", FakeRooflineExecutor)
+
+        result = asyncio.run(
+            shape_capture._capture_vllm_tunableop_shapes(
+                state=state,
+                session_dir=session_dir,
+                capture_mode=shape_capture.BLOCK_FP8_PROFILE_CAPTURE,
+                workspace=session_dir / "runs" / "gemm_tuning" / "capture",
+            )
+        )
+
+        assert result["status"] == "failed"
+        assert result["error_class"] == "shape_capture_failed"
+        assert result["shape_count"] == 0
+        assert "shapes_json" not in result
+
+    def test_multi_node_vllm_block_fp8_preserves_existing_no_capture_behavior(self, monkeypatch):
+        from hyperloom.orchestrator.actions.executors import _multi_node_env
+
+        monkeypatch.setattr(_multi_node_env, "is_multi_node", lambda: True)
+
+        assert (
+            shape_capture._vllm_block_fp8_profile_capture_required(
+                framework="vllm",
+                precision="fp8",
+                quant_type="blockscale",
+                supplied=shape_capture.SuppliedShapes(shapes_json="", tunableop_input=""),
+            )
+            is False
+        )
+
+    def test_shape_capture_kill_switch_disables_dense_and_block_fp8(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HYPERLOOM_GEMM_SHAPE_CAPTURE", "0")
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"hidden_size": 5120, "intermediate_size": 17408}))
+
+        assert (
+            shape_capture._vllm_dense_shape_capture_required(
+                framework="vllm",
+                model_path=str(model),
+                supplied=shape_capture.SuppliedShapes(shapes_json="", tunableop_input=""),
+            )
+            is False
+        )
+        assert (
+            shape_capture._vllm_block_fp8_profile_capture_required(
+                framework="vllm",
+                precision="fp8",
+                quant_type="blockscale",
+                supplied=shape_capture.SuppliedShapes(shapes_json="", tunableop_input=""),
+            )
+            is False
+        )
+
+    def test_vllm_shape_capture_empty_output_is_explicit_failure(self, tmp_path, monkeypatch):
+        from hyperloom.orchestrator.actions.executors import baseline as baseline_module
+
+        baseline_config = tmp_path / "baseline.yaml"
+        baseline_config.write_text("benchmark:\n  framework: vllm\n")
+        state = SharedState(
+            framework="vllm",
+            model_path="/models/qwen",
+            baseline_config_path=str(baseline_config),
+        )
+
+        class FakeBaselineExecutor:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __call__(self, ctx):
+                return {"status": "succeeded"}
+
+        monkeypatch.setattr(baseline_module, "BaselineExecutor", FakeBaselineExecutor)
+
+        result = asyncio.run(
+            shape_capture._capture_vllm_tunableop_shapes(
+                state=state,
+                session_dir=tmp_path,
+                workspace=tmp_path / "runs" / "gemm_tuning" / "capture",
+            )
+        )
+
+        assert result["status"] == "failed"
+        assert result["error_class"] == "shape_capture_failed"
+        assert result["shape_count"] == 0
+
+    @pytest.mark.parametrize(
+        ("framework", "shapes_json", "tunableop_input"),
+        [
+            ("sglang", "", ""),
+            ("vllm", "present", ""),
+            ("vllm", "", "/tmp/tunableop.csv"),
+        ],
+    )
+    def test_vllm_shape_capture_does_not_change_existing_input_paths(
+        self,
+        tmp_path,
+        framework,
+        shapes_json,
+        tunableop_input,
+    ):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"hidden_size": 5120, "intermediate_size": 17408}))
+        if shapes_json:
+            path = tmp_path / "shapes.json"
+            path.write_text(json.dumps([{"M": 1, "N": 2, "K": 3}]))
+            shapes_json = str(path)
+
+        assert (
+            shape_capture._vllm_dense_shape_capture_required(
+                framework=framework,
+                model_path=str(model),
+                supplied=shape_capture.SuppliedShapes(shapes_json=shapes_json, tunableop_input=tunableop_input),
+            )
+            is False
+        )
+
+    def test_multi_node_vllm_preserves_existing_no_capture_behavior(self, tmp_path, monkeypatch):
+        from hyperloom.orchestrator.actions.executors import _multi_node_env
+
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"hidden_size": 5120, "intermediate_size": 17408}))
+        monkeypatch.setattr(_multi_node_env, "is_multi_node", lambda: True)
+
+        assert (
+            shape_capture._vllm_dense_shape_capture_required(
+                framework="vllm",
+                model_path=str(model),
+                supplied=shape_capture.SuppliedShapes(shapes_json="", tunableop_input=""),
+            )
+            is False
+        )
+
+    def test_vllm_moe_does_not_trigger_dense_shape_capture(self, tmp_path):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                    "num_experts": 128,
+                }
+            )
+        )
+
+        assert (
+            shape_capture._vllm_dense_shape_capture_required(
+                framework="vllm",
+                model_path=str(model),
+                supplied=shape_capture.SuppliedShapes(shapes_json="", tunableop_input=""),
+            )
+            is False
+        )
+
+    def test_vllm_dense_without_shapes_captures_tunableop_input(self, tmp_path, monkeypatch):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                }
+            )
+        )
+        SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path=str(model),
+            gpu_type="mi300x",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+        ).save(tmp_path)
+
+        capture_calls: list[dict] = []
+        captured_input: dict = {}
+
+        async def fake_capture(*, state, session_dir, workspace, capture_mode=""):
+            capture_calls.append(
+                {
+                    "state": state,
+                    "session_dir": session_dir,
+                    "workspace": workspace,
+                    "capture_mode": capture_mode,
+                }
+            )
+            path = tmp_path / "tunableop_untuned.csv"
+            path.write_text("GemmTunableOp_BFloat16_NT,nt_5120_4149_17408_ld_5120_17408_5120\n")
+            return {"status": "ok", "tunableop_input": str(path)}
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured_input.update(_FORGE_GEMM_PAYLOADS[-1])
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "no_improvement",
+                        "recommended_env": {},
+                        "tuners_run": [{"tuner_name": "vllm_dense_tunableop"}],
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_capture_vllm_tunableop_shapes", fake_capture, raising=False)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        result = asyncio.run(krh.run_gemm_tuning_handler({"task_id": "capture"}, session_dir=tmp_path))
+
+        assert len(capture_calls) == 1
+        assert captured_input["tunableop_input"] == str(tmp_path / "tunableop_untuned.csv")
+        assert result["status"] == "ok"
+
+    def test_vllm_dense_capture_failure_stops_before_forge(self, tmp_path, monkeypatch):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"hidden_size": 5120, "intermediate_size": 17408}))
+        SharedState(
+            precision="bf16",
+            framework="vllm",
+            model_path=str(model),
+            gpu_type="mi300x",
+        ).save(tmp_path)
+
+        async def fake_capture(**kwargs):
+            return {
+                "status": "failed",
+                "decision": "REVERT",
+                "error_class": "shape_capture_failed",
+                "error": "no complete workload recording",
+            }
+
+        async def fail_run(*args, **kwargs):
+            raise AssertionError("Forge must not run after shape capture fails")
+
+        monkeypatch.setattr(forge_gemm_tuning, "_capture_vllm_tunableop_shapes", fake_capture)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fail_run)
+
+        result = asyncio.run(
+            krh.run_gemm_tuning_handler(
+                {"task_id": "capture-failed"},
+                session_dir=tmp_path,
+            )
+        )
+
+        assert result["status"] == "failed"
+        assert result["decision"] == "REVERT"
+        assert result["error_class"] == "shape_capture_failed"
+        assert result["backend"] == "forge"
+        assert result["engine"] == "forge"
+
+    def test_vllm_block_fp8_reuses_roofline_trace_without_recapture(self, tmp_path, monkeypatch):
+        import gzip
+
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                }
+            )
+        )
+        roofline_trace = tmp_path / "roofline.trace.json.gz"
+        steady_trace = tmp_path / "mixed_steady_state.trace.json.gz"
+        with gzip.open(roofline_trace, "wt", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[1, 5120], [34816, 5120]]},
+                        }
+                    ]
+                },
+                stream,
+            )
+        with gzip.open(steady_trace, "wt", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {
+                                "Input Dims": [
+                                    [4149, 5120],
+                                    [34816, 5120],
+                                    [33, 40],
+                                    [272, 40],
+                                ]
+                            },
+                        }
+                    ]
+                },
+                stream,
+            )
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path=str(model),
+            gpu_type="mi325x",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            max_model_len=4096,
+            last_profile_trace=str(roofline_trace),
+            last_profile_status="succeeded",
+            last_trace_analyze={
+                "trace_input": str(roofline_trace),
+                "steady_state_trace": str(steady_trace),
+            },
+        )
+        state.last_profile_workload = state.current_profile_workload_context()
+        state.save(tmp_path)
+        captured_input: dict = {}
+
+        async def fail_capture(**kwargs):
+            raise AssertionError("valid Roofline shapes must bypass a second profile capture")
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured_input.update(_FORGE_GEMM_PAYLOADS[-1])
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "no_improvement",
+                        "tuners_run": [{"tuner_name": "a8w8_blockscale"}],
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_capture_vllm_tunableop_shapes", fail_capture)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        result = asyncio.run(
+            krh.run_gemm_tuning_handler(
+                {"task_id": "reuse-roofline"},
+                session_dir=tmp_path,
+            )
+        )
+
+        assert captured_input["framework"] == "vllm-aiter"
+        shapes_path = Path(captured_input["shapes_json"])
+        # The traced M=4149 is re-keyed onto the padded M aiter looks up, plus a power-of-two ladder so the rows stay
+        # reachable for the M values the profile never sampled.
+        aligned = json.loads(shapes_path.read_text())
+        assert {row["N"] for row in aligned} == {34816}
+        assert {row["M"] for row in aligned} == {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4224, 8192}
+        assert result["shape_alignment"]["applied"] is True
+        assert captured_input["untuned_csv"] == ""
+        assert result["shape_capture"]["capture_mode"] == "roofline_profile_reuse"
+        assert result["shape_capture"]["source_profile_trace"] == str(steady_trace)
+        assert result["status"] == "ok"
+
+    @pytest.mark.parametrize("stale_reason", ["legacy_metadata", "missing_steady_trace"])
+    def test_vllm_block_fp8_handler_runs_one_standard_roofline_fallback(
+        self,
+        tmp_path,
+        monkeypatch,
+        stale_reason,
+    ):
+        import gzip
+
+        from hyperloom.orchestrator.actions.executors import roofline as roofline_module
+
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                }
+            )
+        )
+        old_trace = tmp_path / "old.trace.json"
+        old_trace.write_text(json.dumps({"traceEvents": []}))
+        old_selected_trace = tmp_path / "old_mixed_steady_state.trace.json"
+        old_selected_trace.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[1, 5120], [34816, 5120]]},
+                        }
+                    ]
+                }
+            )
+        )
+        selected_trace = tmp_path / "decode_only_steady_state.trace.json.gz"
+        with gzip.open(selected_trace, "wt", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[64, 5120], [34816, 5120]]},
+                        }
+                    ]
+                },
+                stream,
+            )
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path=str(model),
+            gpu_type="mi325x",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            max_model_len=4096,
+            last_profile_trace=str(old_trace),
+            last_profile_status="succeeded",
+            last_trace_analyze={
+                "trace_input": str(old_trace),
+                **({"steady_state_trace": str(old_selected_trace)} if stale_reason == "legacy_metadata" else {}),
+            },
+            current_best={
+                "extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "1"},
+            },
+        )
+        if stale_reason == "missing_steady_trace":
+            state.last_profile_workload = state.current_profile_workload_context()
+        state.save(tmp_path)
+        roofline_calls = 0
+        captured_input: dict = {}
+
+        class FakeRooflineExecutor:
+            def __init__(self, *, shared_state):
+                self.shared_state = shared_state
+
+            async def __call__(self, ctx):
+                nonlocal roofline_calls
+                roofline_calls += 1
+                return {
+                    "status": "succeeded",
+                    "steady_state_trace": str(selected_trace),
+                }
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured_input.update(_FORGE_GEMM_PAYLOADS[-1])
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps({"status": "ok", "micro_decision": "no_improvement"})
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(roofline_module, "RooflineExecutor", FakeRooflineExecutor)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        result = asyncio.run(
+            krh.run_gemm_tuning_handler(
+                {"task_id": f"fallback-{stale_reason}"},
+                session_dir=tmp_path,
+            )
+        )
+
+        assert roofline_calls == 1
+        assert captured_input["framework"] == "vllm-aiter"
+        captured_shapes = json.loads(Path(captured_input["shapes_json"]).read_text())
+        assert {(row["N"], row["K"]) for row in captured_shapes} == {(34816, 5120)}
+        assert {row["M"] for row in captured_shapes} == {16, 32, 64}
+        assert result["shape_capture"]["capture_mode"] == "block_fp8_profile"
+        assert result["shape_capture"]["source_profile_trace"] == str(selected_trace)
+
+    @pytest.mark.parametrize("profile_status", ["failed", ""])
+    def test_vllm_block_fp8_rejects_unusable_profile_state(
+        self,
+        tmp_path,
+        profile_status,
+    ):
+        profile_trace = tmp_path / "profile.trace.json"
+        stale_trace = tmp_path / "stale.trace.json"
+        steady_trace = tmp_path / "mixed_steady_state.trace.json"
+        for path in (profile_trace, stale_trace, steady_trace):
+            path.write_text(json.dumps({"traceEvents": []}))
+        state = SharedState(
+            framework="vllm",
+            precision="fp8",
+            model_path="/models/qwen",
+            last_profile_trace=str(profile_trace),
+            last_profile_status=profile_status or "succeeded",
+            last_trace_analyze={
+                "trace_input": (str(profile_trace) if profile_status else str(stale_trace)),
+                "steady_state_trace": str(steady_trace),
+            },
+        )
+        state.last_profile_workload = state.current_profile_workload_context()
+
+        assert (
+            shape_capture._reuse_vllm_block_fp8_roofline_shapes(
+                state,
+                workspace=tmp_path / "gemm",
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "profile_value"),
+        [
+            ("model_path", "/models/old-qwen"),
+            ("tp", 2),
+            ("conc", 32),
+            ("isl", 512),
+            ("osl", 512),
+            ("max_model_len", 2048),
+        ],
+    )
+    def test_vllm_block_fp8_rejects_roofline_trace_after_workload_change(
+        self,
+        tmp_path,
+        field,
+        profile_value,
+    ):
+        roofline_trace = tmp_path / "roofline.trace.json"
+        roofline_trace.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[4149, 5120], [34816, 5120]]},
+                        }
+                    ]
+                }
+            )
+        )
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path="/models/qwen",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            max_model_len=4096,
+            last_profile_trace=str(roofline_trace),
+            last_profile_status="succeeded",
+            last_trace_analyze={
+                "trace_input": str(roofline_trace),
+                "steady_state_trace": str(roofline_trace),
+            },
+        )
+        state.last_profile_workload = state.current_profile_workload_context()
+        state.last_profile_workload[field] = profile_value
+
+        assert (
+            shape_capture._reuse_vllm_block_fp8_roofline_shapes(
+                state,
+                workspace=tmp_path / "gemm",
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("recorded_runtime", "current_best"),
+        [
+            (
+                {"base_extra_args": "--attention-backend TRITON"},
+                {"extra_server_args": "--attention-backend AITER"},
+            ),
+            (
+                {"base_extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "0"}},
+                {"extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "1"}},
+            ),
+            (
+                {"base_remove_args": ["--old-backend"]},
+                {"remove_args": ["--other-backend"]},
+            ),
+            (
+                {"base_unset_envs": ["OLD_BACKEND"]},
+                {"unset_envs": ["OTHER_BACKEND"]},
+            ),
+            (
+                {"base_args_mode": "append"},
+                {"args_mode": "replace"},
+            ),
+        ],
+    )
+    def test_vllm_block_fp8_rejects_roofline_trace_after_backend_change(
+        self,
+        tmp_path,
+        recorded_runtime,
+        current_best,
+    ):
+        roofline_trace = tmp_path / "roofline.trace.json"
+        roofline_trace.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[4149, 5120], [34816, 5120]]},
+                        }
+                    ]
+                }
+            )
+        )
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path="/models/qwen",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            max_model_len=4096,
+            last_profile_trace=str(roofline_trace),
+            last_profile_status="succeeded",
+            last_trace_analyze={
+                "trace_input": str(roofline_trace),
+                "steady_state_trace": str(roofline_trace),
+            },
+        )
+        state.last_profile_workload = state.profile_workload_context(recorded_runtime)
+        state.current_best = current_best
+
+        assert (
+            shape_capture._reuse_vllm_block_fp8_roofline_shapes(
+                state,
+                workspace=tmp_path / "gemm",
+                current_workload=state.current_profile_workload_context(),
+            )
+            is None
+        )
+
+    def test_vllm_block_fp8_logs_when_roofline_has_no_shapes(self, tmp_path, caplog):
+        roofline_trace = tmp_path / "mixed_steady_state.trace.json"
+        roofline_trace.write_text(json.dumps({"traceEvents": [{"name": "vllm::unrelated_op", "args": {}}]}))
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path="/models/qwen",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            max_model_len=4096,
+            last_profile_trace=str(roofline_trace),
+            last_profile_status="succeeded",
+            last_trace_analyze={
+                "trace_input": str(roofline_trace),
+                "steady_state_trace": str(roofline_trace),
+            },
+        )
+        state.last_profile_workload = state.profile_workload_context()
+        caplog.set_level(20, logger=shape_capture.log.name)
+
+        assert (
+            shape_capture._reuse_vllm_block_fp8_roofline_shapes(
+                state,
+                workspace=tmp_path / "gemm",
+            )
+            is None
+        )
+        assert "contains no reusable block-FP8 shapes" in caplog.text
+
+    def test_vllm_block_fp8_reuses_decode_only_selected_by_roofline(self, tmp_path):
+        decode_trace = tmp_path / "decode_only_steady_state.trace.json"
+        decode_trace.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "vllm::w8a8_triton_block_scaled_mm_func",
+                            "args": {"Input Dims": [[64, 5120], [34816, 5120]]},
+                        }
+                    ]
+                }
+            )
+        )
+        state = SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path="/models/qwen",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            max_model_len=4096,
+            last_profile_trace=str(decode_trace),
+            last_profile_status="succeeded",
+            last_trace_analyze={
+                "trace_input": str(decode_trace),
+                "steady_state_trace": str(decode_trace),
+            },
+        )
+        state.last_profile_workload = state.current_profile_workload_context()
+
+        reused = shape_capture._reuse_vllm_block_fp8_roofline_shapes(
+            state,
+            workspace=tmp_path / "gemm",
+        )
+
+        assert reused is not None
+        assert reused["source_profile_trace"] == str(decode_trace)
+        assert reused["shape_count"] == 1
+
+    def test_vllm_block_fp8_routes_profile_shapes_to_aiter(self, tmp_path, monkeypatch):
+        model = tmp_path / "model"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    },
+                }
+            )
+        )
+        unrelated_trace = tmp_path / "roofline.trace.json"
+        unrelated_trace.write_text(json.dumps({"traceEvents": [{"name": "vllm::unrelated_op", "args": {}}]}))
+        SharedState(
+            precision="fp8",
+            framework="vllm",
+            model_path=str(model),
+            gpu_type="mi325x",
+            tp=1,
+            conc=64,
+            isl=1024,
+            osl=1024,
+            last_profile_trace=str(unrelated_trace),
+        ).save(tmp_path)
+        shapes_path = tmp_path / "profile_shapes.json"
+        shapes_path.write_text(json.dumps([{"M": 4149, "N": 34816, "K": 5120}]))
+        stale_untuned = tmp_path / "stale_untuned.csv"
+        stale_untuned.write_text("M,N,K\n1,5120,5120\n")
+        captured_input: dict = {}
+
+        async def fake_capture(*, state, session_dir, workspace, capture_mode=""):
+            return {
+                "status": "ok",
+                "shapes_json": str(shapes_path),
+                "shape_count": 1,
+                "shape_capture_workspace": str(workspace / "shape_capture"),
+            }
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured_input.update(_FORGE_GEMM_PAYLOADS[-1])
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "no_improvement",
+                        "tuners_run": [{"tuner_name": "a8w8_blockscale"}],
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_capture_vllm_tunableop_shapes", fake_capture)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(
+            forge_gemm_tuning,
+            "_resolve_forge_untuned_csv",
+            lambda *args, **kwargs: str(stale_untuned),
+        )
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        result = asyncio.run(krh.run_gemm_tuning_handler({"task_id": "capture"}, session_dir=tmp_path))
+
+        assert captured_input["framework"] == "vllm-aiter"
+        # Captured shapes are routed to the aiter family, then re-keyed onto the padded M values the runtime actually
+        # looks up.
+        assert result["shape_alignment"]["source_shapes_json"] == str(shapes_path)
+        aligned = json.loads(Path(captured_input["shapes_json"]).read_text())
+        assert {row["M"] for row in aligned} == {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4224, 8192}
+        assert captured_input["untuned_csv"] == ""
+        assert captured_input["tunableop_input"] == ""
+        assert result["shape_capture"]["shape_count"] == 1
+        assert result["status"] == "ok"
+
+    def test_forge_uses_runtime_fp8_blockscale_for_aiter_backend(self, tmp_path, monkeypatch):
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi300x",
+            tp=1,
+            conc=256,
+        )
+        state.current_best = {
+            "extra_server_args": "--quantization fp8 --fp8-gemm-backend aiter",
+            "extra_envs": {},
+        }
+        state.save(tmp_path)
+        captured: dict[str, object] = {}
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured["cmd"] = cmd
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "candidate",
+                        "recommended_env": {"AITER_CONFIG_FMOE": "/tmp/fmoe.csv"},
+                        "tuners_run": [{"best_micro_speedup": 1.1}],
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        result = asyncio.run(krh.run_gemm_tuning_handler({"task_id": "forge"}, session_dir=tmp_path))
+
+        cmd = captured["cmd"]  # type: ignore[assignment]
+        data = _FORGE_GEMM_PAYLOADS[-1]
+        assert data["precision"] == "fp8"
+        # Do not force blockscale from Hyperloom; forge decides (auto).
+        assert data["quant_type"] == "auto"
+        assert data["conc"] == 256
+        assert result["extra_envs"] == {"AITER_CONFIG_FMOE": "/tmp/fmoe.csv"}
+
+    def test_handler_writes_gemm_tuning_audit_row(self, tmp_path, monkeypatch):
+        """run_gemm_tuning_handler appends a source-attribution audit row backfilled as a ``gemm_tuning:<engine>`` span."""
+        from hyperloom.inference_optimizer.session.session_paths import gemm_tuning_steps_path
+
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi300x",
+            tp=1,
+            conc=256,
+        )
+        state.save(tmp_path)
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "ok",
+                        "micro_decision": "candidate",
+                        "recommended_env": {"AITER_CONFIG_FMOE": "/tmp/fmoe.csv"},
+                        "tuners_run": [{"tuner": "fmoe_ck", "best_micro_speedup": 1.1}],
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        asyncio.run(krh.run_gemm_tuning_handler({"task_id": "forge"}, session_dir=tmp_path))
+
+        rows = [
+            json.loads(line)
+            for line in gemm_tuning_steps_path(tmp_path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["kind"] == "gemm_tuning"
+        assert row["engine"] == "forge"
+        assert row["decision"] == "KEEP"
+        assert row["tuners_run"][0]["tuner"] == "fmoe_ck"
+        # A clean run gains nothing it did not carry before, bar status.
+        assert "error" not in row["tuners_run"][0]
+        assert "error_class" not in row["tuners_run"][0]
+
+    def test_forge_uses_per_token_only_for_explicit_env(self, tmp_path, monkeypatch):
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi300x",
+            tp=1,
+            conc=256,
+        )
+        state.current_best = {
+            "extra_server_args": "--quantization fp8 --fp8-gemm-backend aiter",
+            "extra_envs": {"SGLANG_USE_AITER_FP8_PER_TOKEN": "1"},
+        }
+        state.save(tmp_path)
+        captured: dict[str, object] = {}
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured["cmd"] = cmd
+            return (
+                0,
+                "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+                + json.dumps(
+                    {
+                        "status": "skipped",
+                        "micro_decision": "skipped",
+                        "recommended_env": {},
+                    }
+                )
+                + "\nFORGE_GEMM_TUNE_RESULT_END\n",
+                "",
+            )
+
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        asyncio.run(krh.run_gemm_tuning_handler({"task_id": "forge"}, session_dir=tmp_path))
+
+        cmd = captured["cmd"]  # type: ignore[assignment]
+        data = _FORGE_GEMM_PAYLOADS[-1]
+        assert data["precision"] == "fp8"
+        assert data["quant_type"] == "per_token"
+
+    def test_forge_fallback_to_session_precision_when_no_quantization(self, tmp_path, monkeypatch):
+        """When current_best has no --quantization, fall back to state.precision."""
+        model_dir = tmp_path / "moe"
+        model_dir.mkdir()
+        state = SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi300x",
+            tp=1,
+            conc=256,
+        )
+        state.current_best = {"extra_server_args": "", "extra_envs": {}}
+        state.save(tmp_path)
+        captured: dict[str, object] = {}
+
+        async def fake_run(cmd: list[str], *, timeout_sec: int, **_kwargs):
+            captured["cmd"] = cmd
+            return (0, json.dumps({"status": "ok", "micro_decision": "skipped"}), "")
+
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", fake_run)
+
+        asyncio.run(krh.run_gemm_tuning_handler({"task_id": "forge"}, session_dir=tmp_path))
+
+        cmd = captured["cmd"]  # type: ignore[assignment]
+        data = _FORGE_GEMM_PAYLOADS[-1]
+        assert data["precision"] == "bf16"
+        assert data["quant_type"] == "auto"
+
+    def test_forge_shapes_json_schema_validation(self, tmp_path):
+        good = tmp_path / "good_shapes.json"
+        good.write_text(json.dumps({"shapes": [{"M": 1, "N": 2, "K": 3}]}))
+        bad_empty = tmp_path / "bad_empty.json"
+        bad_empty.write_text(json.dumps({"shapes": []}))
+        bad_trace_shape = tmp_path / "bad_trace_shape.json"
+        bad_trace_shape.write_text(json.dumps([{"shape": [1, 2, 3]}]))
+
+        assert forge_shapes._is_forge_compatible_shapes_json(good) is True
+        assert forge_shapes._is_forge_compatible_shapes_json(bad_empty) is False
+        assert forge_shapes._is_forge_compatible_shapes_json(bad_trace_shape) is False
+        assert forge_shapes._is_forge_compatible_shapes_json(tmp_path / "missing.json") is False
+
+    def test_resolve_forge_shapes_prefers_compatible_artifact(self, tmp_path):
+        session_dir = tmp_path / "session"
+        shapes = tmp_path / "shapes.json"
+        shapes.write_text(json.dumps([{"m": 4, "n": 5, "k": 6}]))
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps([{"shape": [1, 2, 3]}]))
+
+        state = SharedState()
+        state.last_trace_analyze = {
+            "shapes_json": str(bad),
+            "artifact_paths": {"gemm_shapes_json": str(shapes)},
+        }
+
+        assert forge_shapes._resolve_forge_shapes(_fresh_profile(state)) == str(shapes)
+
+    @pytest.mark.parametrize(
+        "quant_type",
+        [
+            "bpreshuffle",
+            "a8w8_bpreshuffle",
+            "blockscale_bpreshuffle",
+            "a8w8_blockscale_bpreshuffle",
+        ],
+    )
+    def test_vllm_block_fp8_rejects_sglang_bpreshuffle_types(self, quant_type):
+        assert shape_capture._is_vllm_block_fp8("fp8", quant_type) is False
+
+    def test_resolve_forge_shapes_extracts_only_latest_trace(self, tmp_path):
+        session_dir = tmp_path / "session"
+        runs = session_dir / "kernel-agent" / "runs"
+        old_candidates = runs / "old" / "kernel_candidates.json"
+        latest_candidates = runs / "latest" / "kernel_candidates.json"
+        old_candidates.parent.mkdir(parents=True)
+        latest_candidates.parent.mkdir(parents=True)
+
+        def _write_candidates(path: Path, m: int) -> None:
+            path.write_text(
+                json.dumps(
+                    {
+                        "hot_kernels": [
+                            {
+                                "name": "aiter::gemm_a8w8_blockscale",
+                                "input_shapes": [{"shape": f"({m},5120) fp8<br>(34816,5120) fp8"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        _write_candidates(old_candidates, 16384)
+        _write_candidates(latest_candidates, 4096)
+        state = SharedState(last_trace_analyze={"candidates_path": str(latest_candidates)})
+
+        shapes_path = forge_shapes._resolve_forge_shapes(_fresh_profile(state))
+
+        assert json.loads(Path(shapes_path).read_text(encoding="utf-8")) == [{"M": 4096, "N": 34816, "K": 5120}]
+
+    def test_extract_gemm_shapes_tolerates_whitespace_after_comma(self, tmp_path):
+        # TraceLens may render tuples with a space after the comma ("(1024, 5120)"); the extractor must still parse
+        # M/N/K instead of silently dropping every shape and falling back to config defaults.
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale",
+                            "input_shapes": [{"shape": "(1024, 5120) fp8<br>(34816, 5120) fp8"}],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates))
+
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [{"M": 1024, "N": 34816, "K": 5120}]
+
+    def test_extract_gemm_shapes_parses_per_tensor_input_shapes(self, tmp_path):
+        # Current TraceLens emits one entry per tensor ({"call_num": .., "shape": "(M,K) fp8"}) instead of a single
+        # <br>-joined string.
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale_ck",
+                            "input_shapes": [
+                                {"call_num": 48, "shape": "(3126,512) fp8"},
+                                {"call_num": 48, "shape": "(3072,512) fp8"},
+                                {"call_num": 48, "shape": "(0,) fp32"},
+                            ],
+                        },
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale_ck",
+                            "input_shapes": [
+                                {"call_num": 1440, "shape": "(64,3072) fp8"},
+                                {"call_num": 1440, "shape": "(10240,3072) fp8"},
+                                {"call_num": 1440, "shape": "(0,) fp32"},
+                            ],
+                        },
+                        {
+                            # Matrix-vector head: highest call count, but N==1 is not a tunable GEMM tile and must be
+                            # dropped.
+                            "name": "vllm::rocm_unquantized_gemm",
+                            "input_shapes": [
+                                {"call_num": 9999, "shape": "(64,3072) bf16"},
+                                {"call_num": 9999, "shape": "(1,3072) bf16"},
+                            ],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates))
+
+        assert out, "per-tensor input_shapes yielded no GEMM shapes"
+        shapes = json.loads(Path(out).read_text(encoding="utf-8"))
+        # The decode shape is present (it was dropped entirely before) and, being the most-called, is tuned first when
+        # the tuner runs out of budget.
+        assert shapes == [
+            {"M": 64, "N": 10240, "K": 3072},
+            {"M": 3126, "N": 3072, "K": 512},
+        ]
+
+    @staticmethod
+    def _mixed_dtype_candidates(path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale_ck",
+                            "input_shapes": [
+                                {"call_num": 360, "shape": "(64,3072) fp8"},
+                                {"call_num": 360, "shape": "(8704,3072) fp8"},
+                            ],
+                        },
+                        {
+                            # BF16 router head: most-called, so without dtype scoping it displaces the FP8 shape being
+                            # tuned.
+                            "name": "vllm::rocm_unquantized_gemm",
+                            "input_shapes": [
+                                {"call_num": 1440, "shape": "(64,3072) bf16"},
+                                {"call_num": 1440, "shape": "(256,3072) bf16"},
+                            ],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_extract_gemm_shapes_scopes_to_tuned_precision(self, tmp_path):
+        candidates = tmp_path / "kernel_candidates.json"
+        self._mixed_dtype_candidates(candidates)
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates), precision="fp8")
+
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [{"M": 64, "N": 8704, "K": 3072}]
+
+    def test_extract_gemm_shapes_scopes_to_bf16_precision(self, tmp_path):
+        candidates = tmp_path / "kernel_candidates.json"
+        self._mixed_dtype_candidates(candidates)
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates), precision="bf16")
+
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [{"M": 64, "N": 256, "K": 3072}]
+
+    def test_extract_gemm_shapes_keeps_every_dtype_without_precision(self, tmp_path):
+        candidates = tmp_path / "kernel_candidates.json"
+        self._mixed_dtype_candidates(candidates)
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates))
+
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [
+            {"M": 64, "N": 256, "K": 3072},
+            {"M": 64, "N": 8704, "K": 3072},
+        ]
+
+    @pytest.mark.parametrize(
+        ("precision", "traced"),
+        [
+            ("fp8", "fp8_e4m3"),
+            ("fp8", "e4m3fnuz"),
+            ("fp8", "torch.float8_e4m3fn"),
+            ("fp16", "f16"),  # what this repo's _TRACE_DTYPE_SUFFIX emits
+            ("bf16", "b16"),
+            ("mxfp4", "fp4x2"),
+            ("fp4", "mxfp4"),
+        ],
+    )
+    def test_extract_gemm_shapes_matches_dtype_aliases(self, tmp_path, precision, traced):
+        """A precision and a traced token spell the same dtype many ways; exact string matching would drop shapes that do belong to the tuned family."""
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm",
+                            "input_shapes": [
+                                {"call_num": 8, "shape": f"(64,3072) {traced}"},
+                                {"call_num": 8, "shape": f"(8704,3072) {traced}"},
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates), precision=precision)
+
+        assert out, f"{precision!r} rejected the equivalent traced token {traced!r}"
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [{"M": 64, "N": 8704, "K": 3072}]
+
+    def test_extract_gemm_shapes_keeps_the_highest_call_count(self, tmp_path):
+        """The same (M,N,K) can be reported by several kernels; the hot sighting must win, otherwise a rare first one buries the real decode hotspot."""
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_cold_first",
+                            "input_shapes": [
+                                {"call_num": 10, "shape": "(64,3072) fp8"},
+                                {"call_num": 10, "shape": "(8704,3072) fp8"},
+                            ],
+                        },
+                        {
+                            "name": "aiter::gemm_other",
+                            "input_shapes": [
+                                {"call_num": 100, "shape": "(64,3072) fp8"},
+                                {"call_num": 100, "shape": "(10240,3072) fp8"},
+                            ],
+                        },
+                        {
+                            "name": "aiter::gemm_same_shape_hot",
+                            "input_shapes": [
+                                {"call_num": 1000, "shape": "(64,3072) fp8"},
+                                {"call_num": 1000, "shape": "(8704,3072) fp8"},
+                            ],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates))
+
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [
+            {"M": 64, "N": 8704, "K": 3072},  # 1000, not the first sighting's 10
+            {"M": 64, "N": 10240, "K": 3072},  # 100
+        ]
+
+    @pytest.mark.parametrize("sep", ["<br>", "<br/>", "<BR/>", "<BR>"])
+    def test_extract_gemm_shapes_accepts_legacy_separator_spellings(self, tmp_path, sep):
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale",
+                            "input_shapes": [{"shape": f"(1024, 5120) fp8{sep}(34816, 5120) fp8"}],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = forge_shapes._extract_gemm_shapes_from_candidates(str(candidates))
+
+        assert out, f"separator {sep!r} was not recognised"
+        assert json.loads(Path(out).read_text(encoding="utf-8")) == [{"M": 1024, "N": 34816, "K": 5120}]
+
+    def test_resolve_forge_shapes_prefers_scoped_candidates_over_untyped_artifact(self, tmp_path):
+        """A pre-rendered shapes artifact carries no dtype, so it must not win over candidates that were actually scoped to the tuned precision."""
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        artifact = tmp_path / "shapes.json"  # recorded from the BF16 head
+        artifact.write_text(json.dumps([{"M": 64, "N": 256, "K": 3072}]), encoding="utf-8")
+        candidates = tmp_path / "kernel_candidates.json"
+        candidates.write_text(
+            json.dumps(
+                {
+                    "hot_kernels": [
+                        {
+                            "name": "aiter::gemm_a8w8_blockscale_ck",
+                            "input_shapes": [
+                                {"call_num": 360, "shape": "(64,3072) fp8"},
+                                {"call_num": 360, "shape": "(8704,3072) fp8"},
+                            ],
+                        },
+                        {
+                            "name": "vllm::rocm_unquantized_gemm",
+                            "input_shapes": [
+                                {"call_num": 1440, "shape": "(64,3072) bf16"},
+                                {"call_num": 1440, "shape": "(256,3072) bf16"},
+                            ],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        state = SharedState(
+            last_trace_analyze={
+                "shapes_json": str(artifact),
+                "candidates_path": str(candidates),
+            }
+        )
+
+        resolved = forge_shapes._resolve_forge_shapes(_fresh_profile(state), precision="fp8")
+
+        assert json.loads(Path(resolved).read_text(encoding="utf-8")) == [{"M": 64, "N": 8704, "K": 3072}]
+
+    def test_resolve_forge_shapes_still_uses_artifact_when_unscoped(self, tmp_path):
+        """Without a precision to scope by, the explicit artifact keeps priority."""
+        session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        artifact = tmp_path / "shapes.json"
+        artifact.write_text(json.dumps([{"M": 64, "N": 256, "K": 3072}]), encoding="utf-8")
+        state = SharedState(last_trace_analyze={"shapes_json": str(artifact)})
+
+        assert forge_shapes._resolve_forge_shapes(_fresh_profile(state)) == str(artifact)
+
+
+# _default_kernel_batch_parallel — adaptive batch fanout scaling with visible GPUs. _resolve_candidate_id /
+# _all_kernel_candidates — canonicalizes an aliased id against the full hot ∪ skipped set (no fallback).
+class TestTracelensRootResolution:
+    """The resolved TraceLens root is validated before trace analysis uses it."""
+
+    def test_root_error_none_when_present(self, tmp_path):
+        tl = tmp_path / "tl"
+        (tl / ".git").mkdir(parents=True)  # usable git checkout
+        assert ta._tracelens_root_error(tl) is None
+
+    def test_root_error_message_when_missing(self, tmp_path):
+        err = ta._tracelens_root_error(tmp_path / "ghost")
+        assert err is not None
+        assert "TraceLens root not found" in err
+
+    def test_root_error_message_when_incomplete(self, tmp_path):
+        # Dir exists but is not a git checkout (no .git) -> unusable.
+        tl = tmp_path / "tl"
+        tl.mkdir()
+        err = ta._tracelens_root_error(tl)
+        assert err is not None
+        assert "incomplete" in err
+
+    def test_trace_analyze_handler_selfheals_default_root_then_fails_if_unrecovered(self, tmp_path, monkeypatch):
+        # Default root missing: handler attempts self-heal before failing.
+        monkeypatch.delenv("TRACELENS_ROOT", raising=False)
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "no-tracelens-here"))
+        called = {"n": 0}
+
+        def _fake_heal(root, *, log=None):
+            called["n"] += 1
+
+        monkeypatch.setattr(ta, "_maybe_selfheal_tracelens_root", _fake_heal)
+        out = asyncio.run(
+            ta.trace_analyze_handler(
+                {"trace_input": str(tmp_path / "trace"), "analysis_route": "agent"}, session_dir=tmp_path
+            )
+        )
+        assert called["n"] == 1  # self-heal was attempted
+        assert out["status"] == "failed"
+        assert out["error_class"] == "tracelens_root_missing"
+
+    def test_trace_analyze_handler_non_llm_selfheals_default_root_then_fails_if_unrecovered(
+        self, tmp_path, monkeypatch
+    ):
+        # The non-llm route runs TraceLens in-process, so it is provisioned like the agent route:
+        # a missing default root self-heals, then fails clearly instead of crashing the subprocess at import time.
+        monkeypatch.delenv("TRACELENS_ROOT", raising=False)
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "no-tracelens-here"))
+        called = {"n": 0}
+
+        def _fake_heal(root, *, log=None):
+            called["n"] += 1
+
+        monkeypatch.setattr(ta, "_maybe_selfheal_tracelens_root", _fake_heal)
+        out = asyncio.run(
+            ta.trace_analyze_handler(
+                {"trace_input": str(tmp_path / "trace"), "analysis_route": "non-llm"}, session_dir=tmp_path
+            )
+        )
+        assert called["n"] == 1  # self-heal attempted on the non-llm route too
+        assert out["status"] == "failed"
+        assert out["error_class"] == "tracelens_root_missing"
+
+    def test_trace_analyze_handler_selfheals_incomplete_default_root(self, tmp_path, monkeypatch):
+        # an incomplete default checkout (dir present, no .git) must still trigger self-heal.
+        monkeypatch.delenv("TRACELENS_ROOT", raising=False)
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        # Create an incomplete default checkout: the dir exists but has no .git.
+        incomplete = tmp_path / "podlocal" / "TraceLens"
+        incomplete.mkdir(parents=True)
+        (incomplete / "partial").write_text("half", encoding="utf-8")
+        called = {"n": 0}
+
+        def _fake_heal(root, *, log=None):
+            called["n"] += 1
+            # Simulate an unrecoverable heal so the handler fail-fasts here.
+            shutil.rmtree(root, ignore_errors=True)
+
+        monkeypatch.setattr(ta, "_maybe_selfheal_tracelens_root", _fake_heal)
+        out = asyncio.run(
+            ta.trace_analyze_handler(
+                {"trace_input": str(tmp_path / "trace"), "analysis_route": "agent"}, session_dir=tmp_path
+            )
+        )
+        assert called["n"] == 1  # self-heal attempted despite the dir existing
+        assert out["status"] == "failed"
+        assert out["error_class"] == "tracelens_root_missing"
+
+    def test_trace_analyze_handler_reports_missing_root_when_heal_module_cannot_import(self, tmp_path, monkeypatch):
+        # tracelens_analysis imports TraceLens from the checkout, so a vanished checkout fails the heal's own import.
+        from hyperloom.orchestrator import trace_analysis
+
+        monkeypatch.delenv("TRACELENS_ROOT", raising=False)
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        monkeypatch.delattr(trace_analysis, "tracelens_analysis", raising=False)
+        monkeypatch.setitem(sys.modules, f"{trace_analysis.__name__}.tracelens_analysis", None)
+
+        out = asyncio.run(
+            ta.trace_analyze_handler(
+                {"trace_input": str(tmp_path / "trace"), "analysis_route": "agent"}, session_dir=tmp_path
+            )
+        )
+
+        assert out == {
+            "status": "failed",
+            "error_class": "tracelens_root_missing",
+            "error": ta._tracelens_root_error(tmp_path / "podlocal" / "TraceLens"),
+        }
+
+    def test_trace_analyze_handler_failfast_on_incomplete_override(self, tmp_path, monkeypatch):
+        # an incomplete non-default operator override (dir present, no .git) must fail fast — never adopted, never
+        # auto-cloned.
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        override = tmp_path / "operator-tl"
+        override.mkdir()
+        (override / "partial").write_text("half", encoding="utf-8")  # no .git
+        monkeypatch.setenv("TRACELENS_ROOT", str(override))
+        heal_called = {"n": 0}
+        monkeypatch.setattr(
+            ta,
+            "_maybe_selfheal_tracelens_root",
+            lambda *_a, **_k: heal_called.__setitem__("n", heal_called["n"] + 1),
+        )
+        out = asyncio.run(
+            ta.trace_analyze_handler(
+                {"trace_input": str(tmp_path / "trace"), "analysis_route": "agent"}, session_dir=tmp_path
+            )
+        )
+        assert out["status"] == "failed"
+        assert out["error_class"] == "tracelens_root_missing"
+
+    def test_selfheal_skips_non_default_override(self, tmp_path, monkeypatch):
+        # An operator override at a NON-default path is never auto-cloned, even though TRACELENS_ROOT is set in env.
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        override = tmp_path / "operator-tl"
+        monkeypatch.setenv("TRACELENS_ROOT", str(override))
+        called = {"n": 0}
+
+        def _fake_ensure(root, *, log_path=None):
+            called["n"] += 1
+
+        _stub_tracelens_analysis(monkeypatch, _fake_ensure)
+        ta._maybe_selfheal_tracelens_root(override)
+        assert called["n"] == 0
+
+    def test_selfheal_runs_on_default_path_even_when_env_set(self, tmp_path, monkeypatch):
+        # the default path is persisted as TRACELENS_ROOT in kernel-agent.env.sh, so "env set" must NOT be treated as
+        # an override.
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        default_root = tmp_path / "podlocal" / "TraceLens"
+        monkeypatch.setenv("TRACELENS_ROOT", str(default_root))
+        called = {"n": 0, "root": None}
+
+        def _fake_ensure(root, *, log_path=None):
+            called["n"] += 1
+            called["root"] = Path(root)
+
+        _stub_tracelens_analysis(monkeypatch, _fake_ensure)
+        ta._maybe_selfheal_tracelens_root(default_root)
+        assert called["n"] == 1
+        assert called["root"] == default_root
+
+    def test_selfheal_runs_on_pinned_at_sha_default(self, tmp_path, monkeypatch):
+        # install.sh clones the default checkout as TraceLens@<sha>; a vanished per-revision default must still
+        # self-heal, not be misread as an operator override (the bare-only default_root check missed @sha dirs).
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        default_root = tmp_path / "podlocal" / "TraceLens@deadbeef"
+        monkeypatch.setenv("TRACELENS_ROOT", str(default_root))
+        called = {"n": 0, "root": None}
+
+        def _fake_ensure(root, *, log_path=None):
+            called["n"] += 1
+            called["root"] = Path(root)
+
+        _stub_tracelens_analysis(monkeypatch, _fake_ensure)
+        ta._maybe_selfheal_tracelens_root(default_root)
+        assert called["n"] == 1
+        assert called["root"] == default_root
+
+    @pytest.mark.parametrize("error", [OSError("disk gone"), subprocess.TimeoutExpired(cmd="git", timeout=600)])
+    def test_selfheal_logs_an_expected_failure_and_returns(self, tmp_path, monkeypatch, error):
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+        default_root = tmp_path / "podlocal" / "TraceLens"
+        warnings = []
+
+        def _fail(root, *, log_path=None):
+            raise error
+
+        _stub_tracelens_analysis(monkeypatch, _fail)
+        ta._maybe_selfheal_tracelens_root(
+            default_root, log=types.SimpleNamespace(warning=lambda *a: warnings.append(a))
+        )
+
+        assert warnings == [
+            ("trace_analyze: TraceLens root %s missing; attempting self-heal", default_root),
+            ("trace_analyze: TraceLens self-heal failed: %s", error),
+        ]
+
+    def test_selfheal_lets_an_unexpected_failure_propagate(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HYPERLOOM_CACHE_DIR", str(tmp_path / "podlocal"))
+
+        def _fail(root, *, log_path=None):
+            raise RuntimeError("heal bug")
+
+        _stub_tracelens_analysis(monkeypatch, _fail)
+
+        with pytest.raises(RuntimeError, match="heal bug"):
+            ta._maybe_selfheal_tracelens_root(tmp_path / "podlocal" / "TraceLens")
+
+
+class TestBuildTraceAnalyzeCmd:
+    """argv golden for ``_build_trace_analyze_cmd``: the splitter surface and the route flag."""
+
+    def _common(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("INFERENCE_OPTIMIZER_STEADY_STATE_MODE", raising=False)
+        return tmp_path / "sess"
+
+    def test_tracelens_splitter_cmd(self, monkeypatch, tmp_path):
+        session_dir = self._common(monkeypatch, tmp_path)
+        cmd, steady = ta._build_trace_analyze_cmd(
+            {"session_id": "sid", "trace_input": "/t/trace", "split_conc": "64", "split_osl": "1024"},
+            ta._AnalysisRun(
+                trace_input="/t/trace",
+                workspace_path="/ws",
+                tracelens_root=Path("/tl"),
+                route=AnalysisRoute.AGENT,
+                scriptable=False,
+                model_name="Qwen",
+                framework="sglang",
+                target_platform="MI300X",
+            ),
+            session_dir=session_dir,
+            workload={"conc": 8, "osl": 256, "random_range_ratio": "0.5"},
+        )
+        assert cmd == [
+            sys.executable,
+            "-m",
+            ta._TRACELENS_ANALYSIS_MODULE,
+            "--trace-input",
+            "/t/trace",
+            "--session-id",
+            "sid",
+            "--workspace-path",
+            "/ws",
+            "--route",
+            "agent",
+            "--tracelens-root",
+            "/tl",
+            "--model-name",
+            "Qwen",
+            "--framework",
+            "sglang",
+            "--target-platform",
+            "MI300X",
+            # LLM inference flag + splitter hints: payload override wins over workload metadata.
+            "--split-llm-inference",
+            "--split-conc",
+            "64",
+            "--split-osl",
+            "1024",
+            "--split-r",
+            "0.5",
+        ]
+        assert steady == ""
+
+    def test_splitter_forwards_zero_workload_hints(self, monkeypatch, tmp_path):
+        """A zero conc/osl/ratio is a real workload value, not an unset one."""
+        session_dir = self._common(monkeypatch, tmp_path)
+        cmd, _steady = ta._build_trace_analyze_cmd(
+            {"trace_input": "/t/trace"},
+            ta._AnalysisRun(
+                trace_input="/t/trace",
+                workspace_path="/ws",
+                tracelens_root=Path("/tl"),
+                route=AnalysisRoute.AGENT,
+                scriptable=False,
+                model_name="",
+                framework="",
+                target_platform="",
+            ),
+            session_dir=session_dir,
+            workload={"conc": 0, "osl": 0, "random_range_ratio": 0.0},
+        )
+        assert cmd[cmd.index("--split-conc") :] == ["--split-conc", "0", "--split-osl", "0", "--split-r", "0.0"]
+
+    def test_cmd_carries_the_requested_route(self, monkeypatch, tmp_path):
+        session_dir = self._common(monkeypatch, tmp_path)
+        cmd, _steady = ta._build_trace_analyze_cmd(
+            {"trace_input": "/t/trace"},
+            ta._AnalysisRun(
+                trace_input="/t/trace",
+                workspace_path="/ws",
+                tracelens_root=Path("/tl"),
+                route=AnalysisRoute.NON_LLM,
+                scriptable=False,
+                model_name="",
+                framework="",
+                target_platform="",
+            ),
+            session_dir=session_dir,
+            workload={},
+        )
+        assert cmd[cmd.index("--route") + 1] == "non-llm"
+
+    def test_tracelens_cmd_carries_the_ambient_trajectory_scope(self, monkeypatch, tmp_path):
+        from hyperloom.inference_optimizer.trace.trajectory_trace import trajectory_scope
+
+        session_dir = self._common(monkeypatch, tmp_path)
+        run = dict(
+            workspace_path="/ws",
+            trace_input="/t/trace",
+            model_name="",
+            framework="",
+            target_platform="",
+            scriptable=False,
+        )
+        with trajectory_scope(
+            session_dir=session_dir,
+            component="coordinator",
+            phase_tick_source=lambda: ("roofline", 3),
+            task_id="t-roof",
+            parent_span_id="span-roof",
+        ):
+            cmd, _steady = ta._build_trace_analyze_cmd(
+                {"trace_input": "/t/trace"},
+                ta._AnalysisRun(tracelens_root=Path("/tl"), route=AnalysisRoute.AGENT, **run),
+                session_dir=session_dir,
+                workload={},
+            )
+        assert cmd[cmd.index("--trajectory-session-dir") + 1] == str(session_dir)
+        assert cmd[cmd.index("--trajectory-phase") + 1] == "roofline"
+        assert cmd[cmd.index("--trajectory-tick") + 1] == "3"
+        assert cmd[cmd.index("--trajectory-task-id") + 1] == "t-roof"
+        assert cmd[cmd.index("--trajectory-parent-span-id") + 1] == "span-roof"
+
+    def test_steady_state_mode_from_env(self, monkeypatch, tmp_path):
+        session_dir = self._common(monkeypatch, tmp_path)
+        monkeypatch.setenv("INFERENCE_OPTIMIZER_STEADY_STATE_MODE", "median")
+        cmd, steady = ta._build_trace_analyze_cmd(
+            {"trace_input": "/t/trace"},
+            ta._AnalysisRun(
+                trace_input="/t/trace",
+                workspace_path="/ws",
+                tracelens_root=Path("/tl"),
+                route=AnalysisRoute.AGENT,
+                scriptable=False,
+                model_name="",
+                framework="",
+                target_platform="",
+            ),
+            session_dir=session_dir,
+            workload={},
+        )
+        assert steady == "median"
+        assert cmd[cmd.index("--steady-state-mode") + 1] == "median"
+        # session-id falls back to the session dir name when payload omits it.
+        assert cmd[cmd.index("--session-id") + 1] == session_dir.name
+
+
+class TestTheGemmLaneBudgetReachesTheInputJson:
+    """The gemm lane's share of the phase, as the wrapper actually receives it."""
+
+    @staticmethod
+    def _sentinel() -> str:
+        return (
+            "FORGE_GEMM_TUNE_RESULT_BEGIN\n"
+            + json.dumps({"status": "ok", "micro_decision": "skipped"})
+            + "\nFORGE_GEMM_TUNE_RESULT_END\n"
+        )
+
+    def _prepare(self, tmp_path, monkeypatch, *, remaining_minutes, targets):
+        from hyperloom.orchestrator.state.shared_state import SharedState
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir(exist_ok=True)
+        SharedState(
+            precision="bf16",
+            framework="sglang",
+            model_path=str(model_dir),
+            gpu_type="mi355x",
+            tp=1,
+            conc=64,
+        ).save(tmp_path)
+        # Pinned: a live clock would tick between the split and the assertion.
+        monkeypatch.setattr(SharedState, "remaining_minutes", lambda _self, **_kw: remaining_minutes)
+
+        monkeypatch.delenv("HYPERLOOM_GEMM_TUNING_TIMEOUT_SEC", raising=False)
+        monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+        monkeypatch.setattr(forge_lane_budget, "_gemm_router_targets", lambda **_kwargs: targets)
+
+        async def _fake_subprocess(cmd, *, timeout_sec, **_kwargs):
+            return 0, self._sentinel(), ""
+
+        monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _fake_subprocess)
+
+    async def _written(self, tmp_path, payload):
+        await forge_gemm_tuning._run_forge_gemm_tuning(payload, session_dir=tmp_path)
+        workspace = forge_lane_budget._gemm_tuning_workspace(payload["task_id"], session_dir=tmp_path)
+        return _FORGE_GEMM_PAYLOADS[-1]
+
+    @pytest.mark.asyncio
+    async def test_a_share_that_funds_one_tuner_caps_the_routed_set_at_one(self, tmp_path, monkeypatch):
+        # 600 min less the 5 min reserve leaves 35700s; gemm's 20% is 7140s, which funds the first 60-minute tuner and
+        # not the second.
+        self._prepare(
+            tmp_path,
+            monkeypatch,
+            remaining_minutes=600.0,
+            targets=(("fmoe_ck", 3600), ("a8w8", 3600)),
+        )
+        written = await self._written(tmp_path, {"task_id": "cap-one"})
+        assert written["max_tuners"] == 1
+        assert written["global_timeout"] == 7140
+        assert written["timeout"] == forge_gemm_tuning.gemm_per_tuner_timeout_sec(7140)
+
+    @pytest.mark.asyncio
+    async def test_a_share_that_funds_every_tuner_caps_at_that_count(self, tmp_path, monkeypatch):
+        self._prepare(
+            tmp_path,
+            monkeypatch,
+            remaining_minutes=600.0,
+            targets=(("fmoe_ck", 600), ("a8w8", 600)),
+        )
+        written = await self._written(tmp_path, {"task_id": "cap-none"})
+        assert written["max_tuners"] == 2
+        assert written["global_timeout"] == 7140
+
+    @pytest.mark.asyncio
+    async def test_an_unbounded_session_keeps_the_module_default_and_no_pin(self, tmp_path, monkeypatch):
+        """No allocation must degrade to the default session, never to zero."""
+        self._prepare(
+            tmp_path,
+            monkeypatch,
+            remaining_minutes=None,
+            targets=(("fmoe_ck", 3600), ("a8w8", 3600)),
+        )
+        written = await self._written(tmp_path, {"task_id": "cap-unbounded"})
+        assert written["global_timeout"] == 18000
+
+
+@pytest.mark.asyncio
+async def test_a_bounded_phase_that_cannot_fund_a_lane_skips_it_without_launching(tmp_path, monkeypatch):
+    """Under the 5 min phase reserve no lane funds a target, so neither lane starts."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    trace = tmp_path / "decode.trace.json.gz"
+    trace.write_text("{}", encoding="utf-8")
+    SharedState(
+        precision="bf16",
+        framework="sglang",
+        model_path=str(model_dir),
+        gpu_type="mi355x",
+        tp=1,
+        conc=64,
+        last_profile_trace=str(trace),
+    ).save(tmp_path)
+    monkeypatch.setattr(SharedState, "remaining_minutes", lambda _self, **_kw: 4.0)
+    _pin_fusion_provider_env(monkeypatch, _ANTHROPIC_ONLY_ENV)
+    monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+    monkeypatch.setattr(forge_fusion_run, "_forge_fusion_available", lambda: True)
+    monkeypatch.setattr(forge_lane_budget, "_gemm_router_targets", lambda **_kwargs: (("fmoe_ck", 600),))
+    launched: list[object] = []
+
+    async def _launch(*args, **_kwargs):
+        launched.append(args)
+        return {}
+
+    monkeypatch.setattr(forge_gemm_tuning, "_run_subprocess", _launch)
+    monkeypatch.setattr(forge_fusion_run.forge_fusion, "run_forge_fusion", _launch)
+
+    gemm = await forge_gemm_tuning._run_forge_gemm_tuning({"task_id": "gemm"}, session_dir=tmp_path)
+    fusion = await forge_fusion_run.run_fusion_handler({"task_id": "fusion"}, session_dir=tmp_path)
+
+    for result in (gemm, fusion):
+        assert (result["status"], result["error_class"]) == ("skipped", lane_budget.INSUFFICIENT_BUDGET)
+        assert "decision" not in result
+    assert launched == []
+    assert _FORGE_GEMM_PAYLOADS == []
+
+
+@pytest.mark.asyncio
+async def test_a_shape_capture_for_a_lane_the_phase_cannot_fund_never_starts(tmp_path, monkeypatch):
+    """The capture is priced on the input it would record, and a lane that input cannot fund boots no capture server."""
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen3ForCausalLM"], "hidden_size": 5120, "intermediate_size": 17408})
+    )
+    SharedState(precision="fp8", framework="vllm", model_path=str(model), gpu_type="mi300x", tp=1, conc=64).save(
+        tmp_path
+    )
+    monkeypatch.setattr(SharedState, "remaining_minutes", lambda _self, **_kw: 4.0)
+    monkeypatch.setattr(forge_gemm_tuning, "_forge_gemm_tune_available", lambda: True)
+    router_calls: list[dict] = []
+
+    def _router(**kwargs):
+        router_calls.append(kwargs)
+        return (("vllm_dense_tunableop", 600),)
+
+    async def _must_not_capture(**_kwargs):
+        raise AssertionError("a capture whose lane cannot be funded must not start")
+
+    monkeypatch.setattr(forge_lane_budget, "_gemm_router_targets", _router)
+    monkeypatch.setattr(forge_gemm_tuning, "_capture_vllm_tunableop_shapes", _must_not_capture)
+
+    result = await forge_gemm_tuning._run_forge_gemm_tuning({"task_id": "capture"}, session_dir=tmp_path)
+
+    assert (result["status"], result["error_class"]) == ("skipped", lane_budget.INSUFFICIENT_BUDGET)
+    assert [call["evidence"].has_tunableop_input for call in router_calls] == [True]
+    assert _FORGE_GEMM_PAYLOADS == []

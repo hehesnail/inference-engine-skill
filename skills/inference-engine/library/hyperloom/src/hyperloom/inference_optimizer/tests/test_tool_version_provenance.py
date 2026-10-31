@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Tool-build provenance, and the phase timeline it lands beside.
+
+Which build of tracelens, GEAK or forge produced a session's numbers is in scope
+only while the run that used it is running, and nothing downstream can recover
+it, so these pin the recording at each point it is decided.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from hyperloom.inference_optimizer.breakdown.recorder import assemble_parts, tool_versions
+
+
+def _init_git_repo(path: Path) -> str:
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "config", "user.name", "t"],
+        ["git", "commit", "--allow-empty", "-q", "-m", "init"],
+    ):
+        subprocess.run(argv, cwd=path, check=True, capture_output=True)
+    out = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+def _distribution_version() -> str:
+    """The version forge must report, resolved without the recorder's probe so the assertion is an oracle.
+
+    A source checkout with no installed distribution resolves to the empty string, which is still the
+    answer owed: an unresolvable build reports nothing rather than the git SHA ``root`` happens to yield.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("hyperloom-inference_optimizer")
+    except PackageNotFoundError:
+        return ""
+
+
+def test_versions_map_composed_at_top_level(tmp_path: Path) -> None:
+    # Every producer that resolves a build writes to one map, keyed by tool.
+    tool_versions.record_tool_version(tmp_path, tool="tracelens", root=str(tmp_path))
+    tool_versions.record_tool_version(tmp_path, tool="geak")
+    out = assemble_parts(tmp_path)
+    versions = out["metadata"]["versions"]["tools"]
+    assert isinstance(versions, dict)
+    assert set(versions) >= {"tracelens", "geak"}
+    assert versions["geak"]["tool"] == "geak"
+
+
+def test_forge_mints_versions_entry(tmp_path: Path) -> None:
+    sha = _init_git_repo(tmp_path)
+    tool_versions.record_tool_version(tmp_path, tool="forge", root=str(tmp_path))
+    out = assemble_parts(tmp_path)
+    versions = out["metadata"]["versions"]["tools"]
+    assert versions["forge"]["tool"] == "forge"
+    # KernelForge ships inside this distribution, so its version IS Hyperloom's;
+    # the producer-supplied root still yields a commit, so both halves survive.
+    assert versions["forge"]["version"] == _distribution_version()
+    assert versions["forge"]["version"] != sha
+    assert versions["forge"]["commit"] == sha
+
+
+def test_geak_provenance_resolves_geak_root_env_without_explicit_root(tmp_path: Path, monkeypatch) -> None:
+    # With no producer-supplied root, ``geak`` falls back to $GEAK_ROOT.
+    geak_root = tmp_path / "GEAK"
+    geak_root.mkdir()
+    geak_sha = _init_git_repo(geak_root)
+    monkeypatch.setenv("GEAK_ROOT", str(geak_root))
+
+    meta = tool_versions._tool_metadata("geak")
+
+    assert meta["tool"] == "geak"
+    assert meta["root_dir"] == str(geak_root)
+    assert meta["commit"] == geak_sha
+    assert meta["version"] == geak_sha
+
+
+def test_tool_version_probe_git_strategies(tmp_path: Path) -> None:
+    sha = _init_git_repo(tmp_path)
+    # geak -> git short SHA; commit == version.
+    meta = tool_versions._tool_metadata("geak", root=str(tmp_path))
+    assert meta["commit"] == sha
+    assert meta["version"] == sha
+    # tracelens -> git describe (--always falls back to the short sha here).
+    meta_tl = tool_versions._tool_metadata("tracelens", root=str(tmp_path))
+    assert meta_tl["version"]  # non-empty describe output
+    # forge -> the distribution version: vendored, not a checkout, so geak's git strategy
+    # does not apply; the commit still comes from the root the caller passed.
+    meta_forge = tool_versions._tool_metadata("forge", root=str(tmp_path))
+    assert meta_forge["commit"] == sha
+    assert meta_forge["version"] == _distribution_version()
+    assert meta_forge["version"] != sha
+    # A caller-supplied version always wins over the probe.
+    meta_explicit = tool_versions._tool_metadata(
+        "geak",
+        root=str(tmp_path),
+        version="v9.9",
+    )
+    assert meta_explicit["version"] == "v9.9"
+
+
+def test_tool_version_probe_cmd_and_dist() -> None:
+    # CLI strategy: python3 --version.
+    assert (
+        tool_versions._probe_tool_version(
+            ("cmd", ("python3", "--version")),
+            "",
+        )
+        .lower()
+        .startswith("python")
+    )
+    # dist strategy resolves an installed package and rejects a bogus name.
+    assert tool_versions._dist_version(("pytest",))
+    assert tool_versions._dist_version(("definitely-not-a-real-dist-xyz",)) == ""
+    # A missing binary is an environmental miss, not a recorder defect.
+    assert tool_versions._run_first_line(["definitely-not-a-hyperloom-binary"]) == ""
+    assert tool_versions._probe_tool_version(("cmd", ("definitely-not-a-hyperloom-binary",)), "") == ""

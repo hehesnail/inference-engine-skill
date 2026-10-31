@@ -1,0 +1,172 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+"""Launcher-side preflight for hyperloom.inference_optimizer.
+
+Usage:
+    hyperloom check MODEL_PATH
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import sys
+
+from hyperloom.common import rocm_smi
+
+
+#: Command-line fragments that identify a leftover optimizer or serving
+#: process. vLLM and SGLang are matched twice over: by the module path an older
+#: launch used, and by the ``setproctitle`` name the current one rewrites argv
+#: to. Magpie launches the server as ``vllm serve``, and vLLM then renames its
+#: own processes to ``VLLM::APIServer`` / ``VLLM::EngineCore`` /
+#: ``VLLM::Worker_TP<n>``, so a scan for ``vllm.entrypoints`` alone sees
+#: nothing. That blind spot is not covered by the VRAM check either: an orphan
+#: that is still reading weights holds no VRAM yet and reads as idle. ATOM is
+#: matched on its entrypoint alone: its per-rank workers are
+#: ``multiprocessing.spawn`` children carrying no identifying argv, so only
+#: descent from the wrapper reaches them, which is teardown's job and not this
+#: scan's.
+STALE_PROCESS_PATTERNS = (
+    "hyperloom optimize",
+    "Magpie",
+    "atom.entrypoints",
+    "sglang.launch_server",
+    "sglang::",
+    "vllm.entrypoints",
+    "vllm serve",
+    "VLLM::",
+)
+
+
+def _read_cmdline(pid: str) -> str:
+    """Read and decode the ``/proc/<pid>/cmdline`` for the given pid."""
+    try:
+        raw = pathlib.Path("/proc", pid, "cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "ignore")
+
+
+def _parent_pid(pid: int) -> int:
+    """Return the parent pid from ``/proc/<pid>/status``, or 0 when it is gone."""
+    try:
+        status = pathlib.Path("/proc", str(pid), "status").read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            return int(line.split()[1])
+    return 0
+
+
+def _own_process_chain() -> set[int]:
+    """Return this process and every ancestor up to init.
+
+    The launcher shell carries the whole command text in its own argv, so it and
+    everything above it match the patterns without a leftover run existing.
+    """
+    chain: set[int] = set()
+    pid = os.getpid()
+    while pid > 1 and pid not in chain:
+        chain.add(pid)
+        pid = _parent_pid(pid)
+    return chain
+
+
+def _print_torch_visibility() -> bool:
+    """Print torch CUDA visibility and report whether a device is usable."""
+    try:
+        import torch  # type: ignore[import-not-found]
+    except ImportError as exc:
+        print("torch_check_error=", type(exc).__name__, str(exc)[:300])
+        return False
+
+    available = bool(torch.cuda.is_available())
+    count = int(torch.cuda.device_count())
+    print("torch_cuda_available=", available)
+    print("torch_cuda_device_count=", count)
+    return available and count > 0
+
+
+def _check_gpu_occupancy() -> bool:
+    """Print per-GPU VRAM usage and report whether every GPU is idle."""
+    snapshots = rocm_smi.gpu_vram_usage()
+    if snapshots is None:
+        print("gpu_vram=unreadable")
+        return False
+
+    idle = True
+    for idx, snap in enumerate(snapshots):
+        busy = rocm_smi.vram_busy(snap)
+        print(
+            f"gpu{idx}_vram_used={snap.used_mib:.1f}/{snap.total_mib:.1f} MiB"
+            f" ({snap.used_mib / snap.total_mib:.2%}) {'BUSY' if busy else 'idle'}"
+        )
+        idle = idle and not busy
+    return idle
+
+
+def _find_stale_processes() -> list[tuple[str, str]]:
+    """Scan ``/proc`` for running processes matching known stale patterns."""
+    matches: list[tuple[str, str]] = []
+    own = _own_process_chain()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if int(pid) in own:
+            continue
+        text = _read_cmdline(pid)
+        if text and any(pattern in text for pattern in STALE_PROCESS_PATTERNS):
+            matches.append((pid, text[:300]))
+    return matches
+
+
+def run_checks(argv: list[str] | None = None) -> int:
+    """Run launcher preflight checks and return a process exit code."""
+    parser = argparse.ArgumentParser(prog="hyperloom check", description=__doc__)
+    parser.add_argument("model_path", help="Model directory to optimize.")
+    args = parser.parse_args(argv)
+
+    model_path = pathlib.Path(args.model_path)
+    ok = True
+
+    if not model_path.is_dir():
+        print(f"model_path_missing={model_path}", file=sys.stderr)
+        ok = False
+    else:
+        print(f"model_path_ok={model_path}")
+
+    if not _print_torch_visibility():
+        ok = False
+
+    if not _check_gpu_occupancy():
+        ok = False
+
+    stale = _find_stale_processes()
+    for pid, cmdline in stale:
+        print(f"existing_process {pid}: {cmdline}")
+    if stale:
+        ok = False
+
+    return 0 if ok else 2
+
+
+def _exit(code: int) -> None:
+    """Leave the process with ``code`` without going through interpreter teardown.
+
+    This exit status is the IR-1 gate the launcher branches on, so nothing
+    in-process may override it. ``import torch`` does exactly that on the ROCm
+    build shipped in these pods: its teardown forces status 0, which silently
+    turned every violation this tool detects into a pass.
+
+    Args:
+        code: The status to leave the process with.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """``hyperloom check``: run the checks and leave with their status."""
+    _exit(run_checks(argv))

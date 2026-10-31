@@ -1,0 +1,262 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Session manifest writer — the first file written after ``make_session_dir()`` and the canonical session-resume tag."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import platform
+import socket
+import subprocess
+import uuid
+from pathlib import Path
+from typing import Any
+
+from hyperloom_common.io import atomic_write_json
+from hyperloom.common.provenance import build_provenance
+from hyperloom_common.timeutil import now_iso, utc_now_compact
+
+from . import paths as _paths
+from .session_paths import manifest_path
+
+log = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 4
+
+
+def _git_capture(path: Path, args: list[str]) -> str:
+    """Best-effort ``git -C <path> <args>`` returning trimmed stdout."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if out.returncode != 0:
+            return ""
+        return out.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError, OSError):
+        return ""
+
+
+def _git_revision_at(path: Path) -> str:
+    """Best-effort short git SHA at ``path`` (empty when not a checkout/fails)."""
+    return _git_capture(path, ["rev-parse", "--short", "HEAD"])
+
+
+def _git_remote_at(path: Path) -> str:
+    """Best-effort ``origin`` remote URL at ``path`` (empty when unset/fails)."""
+    return _git_capture(path, ["config", "--get", "remote.origin.url"])
+
+
+# Pod-local, non-persistent roots: a dependency checkout under one of these is erased on pod recycle.
+_POD_LOCAL_PREFIXES = ("/workspace", "/tmp", "/root")  # nosec B108 - path-prefix heuristic only.
+
+
+def _warn_if_dependency_escapes_user_data(env_var: str, raw: str) -> None:
+    """Warn when a dependency checkout points at a pod-local, non-persistent path (erased on pod recycle); a shared checkout outside USER_DATA_PATH is legitimate and does not warn."""
+    user_data = (os.environ.get(_paths.ENV_USER_DATA_PATH) or "").strip()
+    if not user_data:
+        return
+    dep_path = Path(raw)
+    if _paths.is_path_within(dep_path, Path(user_data)):
+        return
+    try:
+        resolved = str(dep_path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        # Unresolvable path can't be proven pod-local; skip the warning.
+        return
+    is_pod_local = any(resolved == p or resolved.startswith(p + "/") for p in _POD_LOCAL_PREFIXES)
+    if not is_pod_local:
+        return
+    log.warning(
+        "%s=%s is a pod-local path outside %s=%s; runtime artefacts there are "
+        "erased on pod recycle. install.sh now defaults open-source "
+        "dependencies to the repo-local cache; set a stable %s or "
+        "HYPERLOOM_CACHE_DIR only when the checkout must persist.",
+        env_var,
+        raw,
+        _paths.ENV_USER_DATA_PATH,
+        user_data,
+        env_var,
+    )
+
+
+def _describe_dep(*env_vars: str) -> dict[str, str]:
+    """Build a ``{path, commit, remote}`` provenance dict for one dependency pointed at by the first set env var among ``env_vars`` (in priority order)."""
+    raw = ""
+    for env_var in env_vars:
+        raw = (os.environ.get(env_var) or "").strip()
+        if raw:
+            break
+    if not raw:
+        return {"path": "", "commit": "", "remote": ""}
+    _warn_if_dependency_escapes_user_data(env_var, raw)
+    path = Path(raw)
+    if not path.is_dir():
+        return {"path": raw, "commit": "", "remote": ""}
+    return {
+        "path": raw,
+        "commit": _git_revision_at(path),
+        "remote": _git_remote_at(path),
+    }
+
+
+def _build_dependencies() -> dict[str, dict[str, str]]:
+    """Provenance (path/commit/remote) for the Magpie / InferenceX trees this session executes against, so debuggers can answer "which upstream?" later."""
+    return {
+        "magpie": _describe_dep("MAGPIE_PATH"),
+        "inferencex": _describe_dep("INFERENCEX_PATH"),
+    }
+
+
+def _objective_summary(args: argparse.Namespace | None) -> dict[str, Any]:
+    """Mirror cli._run_optimize's objective derivation, without importing it."""
+    targets: list[dict[str, Any]] = []
+    if getattr(args, "target_gain", None):
+        targets.append({"kind": "gain_pct", "value": float(args.target_gain)})
+    elif getattr(args, "target_tput", None):
+        targets.append({"kind": "tput", "value": float(args.target_tput)})
+    elif getattr(args, "target_baseline_dir", None):
+        targets.append({"kind": "baseline", "value": str(args.target_baseline_dir)})
+    if getattr(args, "target_roofline", None):
+        targets.append({"kind": "roofline_pct", "value": float(args.target_roofline)})
+    if not targets:
+        return {"kind": "time_only", "value": None}
+    if len(targets) == 1:
+        return targets[0]
+    return {**targets[0], "objectives": targets}
+
+
+def build_session_id(model_name: str = "") -> str:
+    """Derive an internal session_id label for manifest / SharedState / report metadata (not used for path computation)."""
+    stem = (model_name or "session").strip().replace("/", "_") or "session"
+    return f"{stem}_{utc_now_compact()}_{uuid.uuid4().hex[:8]}"
+
+
+def _env_digits(name: str) -> int | None:
+    """The env var as an ``int`` when it is all digits, else ``None``."""
+    raw = os.environ.get(name, "")
+    return int(raw) if raw.strip().isdigit() else None
+
+
+def build_manifest(
+    session_dir: Path,
+    *,
+    args: argparse.Namespace | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the session manifest dictionary (schema ``SCHEMA_VERSION``)."""
+    from ..breakdown.workflow_contract import workflow_contract, workflow_contract_digest
+
+    model_path = model_name = ""
+    model = getattr(args, "model", None)
+    if model:
+        model_path = str(model)
+        # Prefer the quantize prelude's pinned source identity over the generic "quantized" export-dir basename.
+        model_name = (getattr(args, "model_display_name", "") or "").strip() or Path(model_path).name
+    framework = str(getattr(args, "framework", None) or os.environ.get("FRAMEWORK", ""))
+    gpu_type = str(getattr(args, "gpu_type", None) or os.environ.get("GPU_TYPE", ""))
+    workload: dict[str, Any] = {
+        "max_model_len": _env_digits("MAX_MODEL_LEN"),
+        "precision": str(getattr(args, "precision", None) or os.environ.get("PRECISION", "")) or None,
+        "conc": _env_digits("CONC"),
+    }
+    # An agentic replay takes its request shape from the corpus, so $ISL/$OSL
+    # are inert. The Critic reads this block, so it carries the distribution.
+    from hyperloom.common.perf_metric import agentx_enabled
+    from hyperloom.common.benchmark_config import benchmark_config_path
+
+    if agentx_enabled():
+        workload.update(benchmark_mode="agentx", benchmark_config=str(benchmark_config_path() or ""))
+    else:
+        isl, osl = getattr(args, "isl", None), getattr(args, "osl", None)
+        workload["isl"] = _env_digits("ISL") if isl is None else int(isl)
+        workload["osl"] = _env_digits("OSL") if osl is None else int(osl)
+    # Shared provenance builder (WP-0) so a trace consumer can pin gfx arch / EP / graph mode / server args.
+    _prov = build_provenance(args, env=os.environ)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id or build_session_id(model_name),
+        "claw_session_id": os.environ.get("CLAW_SESSION_ID", "").strip() or None,
+        "sandbox_user_id": os.environ.get("SANDBOX_USER_ID", "").strip() or None,
+        "created_at_utc": now_iso(timespec="seconds"),
+        "session_dir": str(session_dir),
+        # USER_DATA_PATH root snapshotted so a trace-based consumer can locate the on-disk artifacts.
+        "user_data_path": str(_paths.workspace_root()),
+        "model_path": model_path,
+        "model_name": model_name,
+        "framework": framework or "sglang",
+        "gpu_type": gpu_type,
+        "tp": _env_digits("TP"),
+        **{key: _prov.get(key) for key in ("gfx_arch", "ep", "graph_mode", "server_args", "server_args_hash")},
+        "workload": workload,
+        "objective": _objective_summary(args),
+        "max_minutes": int((getattr(args, "max_hours", 0) or 0) * 60),
+        "code_revision": _prov["code_revision"],
+        "dependencies": _build_dependencies(),
+        "pid": os.getpid(),
+        "host": platform.node() or socket.gethostname(),
+        "image": _prov["image"],
+        # Snapshotted so resume-after-redeploy can detect drift.
+        "stack_fingerprint": _prov.get("stack_fingerprint") or {},
+        # Workflow identity is stamped only on a fresh manifest. Resumed
+        # pre-contract sessions therefore remain honestly legacy.
+        "workflow_contract_version": workflow_contract()["workflow_contract_version"],
+        "workflow_contract_digest": workflow_contract_digest(),
+        "workflow_flags": {
+            "kernel_enabled": not getattr(args, "no_kernel", False),
+            "framework_agent_enabled": not getattr(args, "no_framework_agent", False),
+            "enablement_mode": getattr(args, "enablement", "all"),
+        },
+        # IR-3 soft-degrade audit.
+        "kb_degraded_reason": getattr(args, "kb_degraded_reason", None),
+        "pr_degraded_reason": getattr(args, "pr_degraded_reason", None),
+        # Operator-supplied reference recipe source (audit only); the resolved server_args / envs / model are
+        # authoritative in state.json.
+        "reference_script": getattr(args, "reference_script", None),
+    }
+
+
+def write_manifest(
+    session_dir: Path,
+    *,
+    args: argparse.Namespace | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Atomically write ``manifest.json`` under session_dir; returns the manifest dict."""
+    sd = Path(session_dir)
+    manifest = build_manifest(sd, args=args, session_id=session_id)
+    atomic_write_json(manifest_path(sd), manifest)
+    # The manifest stamp is where the spawn-time image, host and pid are
+    # resolved; record them now so the exporter reads a fact instead of
+    # re-probing the environment of whichever process happens to export.
+    from ..breakdown.recorder import record_metadata_identity
+
+    record_metadata_identity(sd, manifest)
+    return manifest
+
+
+def load_manifest(session_dir: Path) -> dict[str, Any]:
+    """Read ``manifest.json`` for an existing session."""
+    p = manifest_path(Path(session_dir))
+    if not p.exists():
+        raise FileNotFoundError(
+            f"manifest.json not found under {session_dir} — the session was never initialised; cannot resume"
+        )
+    with p.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "build_manifest",
+    "build_session_id",
+    "load_manifest",
+    "write_manifest",
+]

@@ -1,0 +1,271 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for ``multi_node/scripts/kernel_node_ops.py``."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import sys
+import types
+
+import pytest
+
+from hyperloom.inference_optimizer.multi_node import cli as mn_cli
+
+
+@pytest.fixture
+def patch_env(tmp_path, monkeypatch):
+    fw = tmp_path / "lib" / "python3.12" / "site-packages" / "vllm"
+    fw.mkdir(parents=True)
+    bak = tmp_path / "bak"
+    bak.mkdir()
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS", f"{fw}/")
+    monkeypatch.setenv("HYPERLOOM_MN_KERNEL_BACKUP_DIR", str(bak))
+    return fw, bak
+
+
+def _bundle_kernel_node_ops() -> str:
+    return mn_cli._read_bundled_pod_python_script("kernel_node_ops.py", mn_cli._KERNEL_NODE_OPS_DEPS)
+
+
+def _load(unique_name: str):
+    mod = types.ModuleType(unique_name)
+    mod.__file__ = str(mn_cli._SCRIPTS_DIR / "kernel_node_ops.py")
+    with pytest.MonkeyPatch.context() as context:
+        for dep in mn_cli._KERNEL_NODE_OPS_DEPS:
+            context.setitem(sys.modules, dep.stem, sys.modules.get(dep.stem))
+        exec(compile(_bundle_kernel_node_ops(), mod.__file__, "exec"), mod.__dict__)
+    sys.modules[unique_name] = mod
+    return mod
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _last_json(capsys) -> dict:
+    # Each op emits exactly one pretty-printed JSON document to stdout.
+    return json.loads(capsys.readouterr().out.strip())
+
+
+def test_safe_name_sanitizes_truncates_and_falls_back():
+    from hyperloom.inference_optimizer.multi_node.scripts import patch_path_safety as safety
+
+    assert safety._safe_name("a/b c:d") == "a_b_c_d"
+    assert safety._safe_name("ok.name-1_2") == "ok.name-1_2"
+    assert safety._safe_name("") == "patch"
+    assert len(safety._safe_name("x" * 200)) == 80
+
+
+def test_apply_non_py_target_skips_compile(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_apply_nonpy")
+    target = fw / "kernel.cpp"
+    target.write_text("// old", encoding="utf-8")
+    ns = argparse.Namespace(
+        target_path=str(target),
+        backup_dir=str(bak),
+        kernel_id="k1",
+        patch_b64=_b64("// new content"),
+    )
+    rc = k._do_apply(ns)
+    payload = _last_json(capsys)
+    assert rc == 0
+    assert payload["status"] == "ok"
+    assert payload["compile"]["status"] == "skipped"
+    assert target.read_text(encoding="utf-8") == "// new content"
+
+
+def test_apply_valid_py_compiles_ok(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_apply_py_ok")
+    target = fw / "mod.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    ns = argparse.Namespace(
+        target_path=str(target),
+        backup_dir=str(bak),
+        kernel_id="k",
+        patch_b64=_b64("y = 2\n"),
+    )
+    rc = k._do_apply(ns)
+    payload = _last_json(capsys)
+    assert rc == 0 and payload["status"] == "ok"
+    assert payload["compile"]["status"] == "ok"
+    assert target.read_text(encoding="utf-8") == "y = 2\n"
+
+
+def test_apply_bad_py_auto_reverts(patch_env, capsys):
+    # A syntactically invalid .py patch must be auto-reverted.
+    fw, bak = patch_env
+    k = _load("kno_apply_py_bad")
+    target = fw / "mod.py"
+    target.write_text("good = 1\n", encoding="utf-8")
+    ns = argparse.Namespace(
+        target_path=str(target),
+        backup_dir=str(bak),
+        kernel_id="k",
+        patch_b64=_b64("def broken(:\n"),
+    )
+    rc = k._do_apply(ns)
+    payload = _last_json(capsys)
+    assert rc == 1
+    assert payload["status"] == "failed"
+    assert "auto-reverted" in payload["error"]
+    # Original content restored.
+    assert target.read_text(encoding="utf-8") == "good = 1\n"
+
+
+def test_apply_missing_target_fails(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_apply_missing")
+    ns = argparse.Namespace(
+        target_path=str(fw / "nope.py"),
+        backup_dir=str(bak),
+        kernel_id="k",
+        patch_b64=_b64("x=1"),
+    )
+    rc = k._do_apply(ns)
+    payload = _last_json(capsys)
+    assert rc == 1 and payload["status"] == "failed"
+    assert "does not exist" in payload["error"]
+
+
+def test_apply_bad_base64_fails(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_apply_b64")
+    target = fw / "f.txt"
+    target.write_text("orig", encoding="utf-8")
+    ns = argparse.Namespace(
+        target_path=str(target),
+        backup_dir=str(bak),
+        kernel_id="k",
+        patch_b64="!!!not-base64!!!",
+    )
+    rc = k._do_apply(ns)
+    payload = _last_json(capsys)
+    assert rc == 1 and payload["status"] == "failed"
+    assert "base64" in payload["error"]
+
+
+def test_revert_invalid_records_json_is_structured(tmp_path, capsys):
+    k = _load("kno_revert_invalid_json")
+    rc = k._do_revert(argparse.Namespace(records_json="{"))
+    payload = _last_json(capsys)
+
+    assert rc == 1
+    assert payload["status"] == "failed"
+
+
+def test_revert_failure_stops_at_the_missing_backup(
+    patch_env,
+    capsys,
+):
+    fw, bak = patch_env
+    k = _load("kno_revert_partial")
+    restored_target = fw / "restored.py"
+    restored_target.write_text("candidate\n", encoding="utf-8")
+    valid_backup = bak / "restored.bak"
+    valid_backup.write_text("baseline\n", encoding="utf-8")
+    missing_target = fw / "missing.py"
+    missing_target.write_text("candidate\n", encoding="utf-8")
+    rc = k._do_revert(
+        argparse.Namespace(
+            records_json=json.dumps(
+                [
+                    {
+                        "target_path": str(missing_target),
+                        "backup_path": str(bak / "missing.bak"),
+                    },
+                    {
+                        "target_path": str(restored_target),
+                        "backup_path": str(valid_backup),
+                    },
+                ]
+            )
+        )
+    )
+    payload = _last_json(capsys)
+
+    assert rc == 1
+    assert payload["status"] == "failed"
+    assert "backup missing" in payload["error"]
+    assert restored_target.read_text(encoding="utf-8") == "baseline\n"
+
+
+def test_revert_restores_from_backup(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_revert_ok")
+    backup = bak / "b.bak"
+    backup.write_text("restored", encoding="utf-8")
+    target = fw / "t.py"
+    target.write_text("current", encoding="utf-8")
+    ns = argparse.Namespace(records_json=json.dumps([{"target_path": str(target), "backup_path": str(backup)}]))
+    rc = k._do_revert(ns)
+    payload = _last_json(capsys)
+    assert rc == 0 and payload["status"] == "restored"
+    assert target.read_text(encoding="utf-8") == "restored"
+
+
+def test_revert_rejects_backup_outside_root(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_revert_bad_backup")
+    target = fw / "t.py"
+    target.write_text("current", encoding="utf-8")
+    outside = bak.parent / "evil.bak"
+    outside.write_text("pwned", encoding="utf-8")
+    ns = argparse.Namespace(records_json=json.dumps([{"target_path": str(target), "backup_path": str(outside)}]))
+    rc = k._do_revert(ns)
+    payload = _last_json(capsys)
+    assert rc == 1 and payload["status"] == "failed"
+    assert "backup_path" in payload["error"]
+
+
+def test_apply_rejects_backup_dir_outside_root(patch_env, capsys):
+    fw, bak = patch_env
+    k = _load("kno_apply_bad_bdir")
+    target = fw / "mod.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    ns = argparse.Namespace(
+        target_path=str(target),
+        backup_dir=str(bak.parent / "escape"),
+        kernel_id="k",
+        patch_b64=_b64("y = 2\n"),
+    )
+    rc = k._do_apply(ns)
+    payload = _last_json(capsys)
+    assert rc == 1 and payload["status"] == "failed"
+    assert "backup_dir" in payload["error"]
+
+
+def test_finalize_deletes_only_backups_inside_the_kernel_root(patch_env, capsys):
+    """Accepting a patch clears its backups; a path outside the root is refused."""
+    _fw, bak = patch_env
+    k = _load("kno_finalize")
+    backup = bak / "kernel.bak"
+    backup.write_bytes(b"baseline")
+    outside = bak.parent / "outside.bak"
+    outside.write_bytes(b"untouched")
+
+    k._do_finalize(argparse.Namespace(records_json=json.dumps([{"backup_path": str(backup)}])))
+    accepted = _last_json(capsys)
+    assert accepted["status"] == "finalized"
+    assert accepted["deleted"] == [str(backup)]
+    assert not backup.exists()
+
+    rc = k._do_finalize(argparse.Namespace(records_json=json.dumps([{"backup_path": str(outside)}])))
+    refused = _last_json(capsys)
+    assert rc == 1
+    assert refused["status"] == "failed"
+    assert outside.read_bytes() == b"untouched"
+
+
+def test_emit_status_to_returncode_contract():
+    k = _load("kno_emit")
+    # Completed operations return zero; failures and unknown states do not.
+    for ok_status in ("ok", "restored", "finalized"):
+        assert k._emit({"status": ok_status}) == 0
+    for bad_status in ("failed", "error", ""):
+        assert k._emit({"status": bad_status}) == 1

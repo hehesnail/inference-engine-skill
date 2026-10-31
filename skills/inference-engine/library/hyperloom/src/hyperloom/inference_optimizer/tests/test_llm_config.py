@@ -1,0 +1,1645 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
+import ast
+import json
+import logging
+import sys
+import time
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+import hyperloom
+from hyperloom_common.llm import llm_config
+from hyperloom_common.llm.llm_config import (
+    ANTHROPIC_CREDENTIAL_ENV_ORDER,
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_ANTHROPIC_VERSION,
+    LLMConfigError,
+    achat_completion,
+    chat_completion,
+    apply_reasoning_effort,
+    build_http_timeout,
+    claude_sdk_env_options,
+    deepseek_compat_env,
+    derive_openai_base_url,
+    get_anthropic_client,
+    has_anthropic_side,
+    has_openai_side,
+    is_anthropic_only,
+    is_openai_only,
+    get_async_anthropic_client,
+    get_async_openai_client,
+    get_openai_client,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_DEEPSEEK_HARNESS_MODEL,
+    provider_model_defaults,
+    resolve_forge_llm_model,
+    resolve_openai_client_config,
+)
+from hyperloom_common.llm.llm_headers import parse_custom_headers
+
+_LEGACY_KEY = "_".join(("DEEPSEEK", "API", "KEY"))
+_OPENAI_KEY = "_".join(("OPENAI", "API", "KEY"))
+
+
+def test_apply_reasoning_effort_is_noop_without_env():
+    params = {"model": "m", "messages": []}
+    out = apply_reasoning_effort(params, env={})
+    assert "reasoning_effort" not in out
+    assert out is params  # mutates in place
+
+
+def test_apply_reasoning_effort_injects_recognized_value():
+    out = apply_reasoning_effort({"model": "m"}, env={"HYPERLOOM_REASONING_EFFORT": "MEDIUM"})
+    assert out["reasoning_effort"] == "medium"
+    out2 = apply_reasoning_effort({"model": "m"}, env={"OPENAI_REASONING_EFFORT": "high"})
+    assert out2["reasoning_effort"] == "high"
+
+
+def test_apply_reasoning_effort_accepts_the_top_of_the_ladder():
+    out = apply_reasoning_effort({"model": "m"}, env={"HYPERLOOM_REASONING_EFFORT": " XHigh "})
+    assert out["reasoning_effort"] == "xhigh"
+
+
+def test_apply_reasoning_effort_sends_max_as_the_gateway_level():
+    """``max`` is a Claude level this gateway 400s on, so it goes as ``xhigh``."""
+    out = apply_reasoning_effort({"model": "m"}, env={"HYPERLOOM_REASONING_EFFORT": "max"})
+    assert out["reasoning_effort"] == "xhigh"
+
+
+@pytest.mark.parametrize("value", ["turbo", "minimal", "none"])
+def test_apply_reasoning_effort_ignores_off_ladder_value(value):
+    """Only the shared four levels are injected; the rest are no-ops.
+
+    This gateway accepts ``minimal`` and ``none``, but the Claude CLI does not
+    know either and there is no Claude level below ``low`` to project them
+    onto, so neither is a level of the shared vocabulary.
+    """
+    out = apply_reasoning_effort({"model": "m"}, env={"HYPERLOOM_REASONING_EFFORT": value})
+    assert "reasoning_effort" not in out
+
+
+def test_parse_custom_headers_accepts_anthropic_env_format():
+    headers = parse_custom_headers("Ocp-Apim-Subscription-Key: ak-test\nX-Team: hyperloom")
+    assert headers == {
+        "Ocp-Apim-Subscription-Key": "ak-test",
+        "X-Team": "hyperloom",
+    }
+
+
+def test_parse_custom_headers_expands_env_references():
+    headers = parse_custom_headers(
+        "Ocp-Apim-Subscription-Key: ${ANTHROPIC_API_KEY}",
+        env={"ANTHROPIC_API_KEY": "ak-from-env"},
+    )
+    assert headers == {"Ocp-Apim-Subscription-Key": "ak-from-env"}
+
+
+def test_derive_openai_base_url_from_amd_anthropic_endpoint():
+    assert derive_openai_base_url("https://llm.example.invalid/anthropic") == "https://llm.example.invalid/Unified/v1"
+
+
+def test_derive_openai_base_url_is_case_insensitive():
+    # AMD's default endpoint uses a capitalized "/Anthropic" segment (issue #929); match case-insensitively so the
+    # OpenAI base URL is still derived.
+    assert derive_openai_base_url("https://llm-api.amd.com/Anthropic") == "https://llm-api.amd.com/Unified/v1"
+    # A lowercase "/unified" segment is normalized to the canonical "/Unified/v1".
+    assert derive_openai_base_url("https://llm-api.amd.com/unified") == "https://llm-api.amd.com/Unified/v1"
+
+
+def test_openai_kwargs_reads_openai_custom_headers():
+    """The OpenAI/Codex client applies OPENAI_CUSTOM_HEADERS verbatim."""
+    kwargs = resolve_openai_client_config(
+        env={
+            "_".join(("OPENAI", "API", "KEY")): "openai-token",
+            "OPENAI_BASE_URL": "https://llm.example.invalid/Unified/v1",
+            "OPENAI_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ak-header",
+        }
+    ).as_kwargs()
+    assert kwargs["default_headers"] == {"Ocp-Apim-Subscription-Key": "ak-header"}
+
+
+def test_openai_kwargs_ignores_anthropic_custom_headers():
+    """The OpenAI/Codex client never reads ANTHROPIC_CUSTOM_HEADERS, and explicit OpenAI-side config wins over the Anthropic host."""
+    kwargs = resolve_openai_client_config(
+        env={
+            "_".join(("OPENAI", "API", "KEY")): "openai-token",
+            "OPENAI_BASE_URL": "https://api.openai.com/v1",
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic",
+            "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ak-header",
+        }
+    ).as_kwargs()
+    assert kwargs["api_key"] == "openai-token"
+    assert kwargs["base_url"] == "https://api.openai.com/v1"
+    # Empty headers are omitted from kwargs entirely.
+    assert "default_headers" not in kwargs
+
+
+# ---- the three deployment shapes ---- Anthropic-only, codex-only (OpenAI-compatible only), and both configured.
+_ANTHROPIC_ONLY_ENV = {
+    "_".join(("ANTHROPIC", "AUTH", "TOKEN")): "gateway-token",
+    "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+    "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+    # AMD's gateway rejects a call without this, and the setup skill only ever writes it here -- so the shape is not
+    # realistic without it.
+    "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${ANTHROPIC_API_KEY}",
+}
+_CODEX_ONLY_ENV = {
+    "_".join(("OPENAI", "API", "KEY")): "openai-token",
+    "OPENAI_BASE_URL": "https://llm-api.amd.com/Unified/v1",
+}
+
+
+def test_anthropic_only_deployment_resolves_through_derivation():
+    """No OpenAI-side config at all: derive the base URL, auth with the gateway token."""
+    kwargs = resolve_openai_client_config(env=dict(_ANTHROPIC_ONLY_ENV)).as_kwargs()
+    assert kwargs["base_url"] == "https://llm-api.amd.com/Unified/v1"
+    assert kwargs["api_key"] == "gateway-token"
+
+
+def test_anthropic_only_deployment_falls_back_to_anthropic_api_key():
+    """ANTHROPIC_AUTH_TOKEN is preferred, but ANTHROPIC_API_KEY alone also authenticates."""
+    env = dict(_ANTHROPIC_ONLY_ENV)
+    del env["_".join(("ANTHROPIC", "AUTH", "TOKEN"))]
+    assert resolve_openai_client_config(env=env).as_kwargs()["api_key"] == "ak-anthropic"
+
+
+def test_codex_only_deployment_is_unchanged():
+    """No Anthropic side present: resolution is exactly the explicit OpenAI config."""
+    assert resolve_openai_client_config(env=dict(_CODEX_ONLY_ENV)).as_kwargs() == {
+        "api_key": "openai-token",
+        "base_url": "https://llm-api.amd.com/Unified/v1",
+    }
+
+
+def test_both_configured_prefers_the_explicit_openai_side():
+    """With both shapes present the Anthropic fallback must never be consulted."""
+    kwargs = resolve_openai_client_config(env={**_ANTHROPIC_ONLY_ENV, **_CODEX_ONLY_ENV}).as_kwargs()
+    assert kwargs == {
+        "api_key": "openai-token",
+        "base_url": "https://llm-api.amd.com/Unified/v1",
+    }
+
+
+def test_explicit_openai_side_wins_key_and_url_independently():
+    """A half-configured OpenAI side takes what it has and derives only the rest."""
+    key_only = resolve_openai_client_config(
+        env={**_ANTHROPIC_ONLY_ENV, "_".join(("OPENAI", "API", "KEY")): "openai-token"}
+    ).as_kwargs()
+    assert key_only["api_key"] == "openai-token"
+    assert key_only["base_url"] == "https://llm-api.amd.com/Unified/v1"
+
+    url_only = resolve_openai_client_config(
+        env={**_ANTHROPIC_ONLY_ENV, "OPENAI_BASE_URL": "https://explicit.example.invalid/v1"}
+    ).as_kwargs()
+    assert url_only["api_key"] == "gateway-token"
+    assert url_only["base_url"] == "https://explicit.example.invalid/v1"
+
+
+def test_retired_gateway_key_loses_to_the_anthropic_fallback():
+    """``LLM_GATEWAY_KEY`` is no longer a credential, so the Anthropic side answers instead."""
+    env = {**_ANTHROPIC_ONLY_ENV, "LLM_GATEWAY_KEY": "gw-key"}
+    assert resolve_openai_client_config(env=env).as_kwargs()["api_key"] == "gateway-token"
+
+
+_SUBSCRIPTION_HEADER = "Ocp-Apim-Subscription-Key"
+
+
+# ---- credential-shape predicates ----
+def test_shape_predicates_classify_all_three_deployments():
+    """One shape test for backend selection, the TraceLens runner and the kernel_backend."""
+    assert is_anthropic_only(_ANTHROPIC_ONLY_ENV)
+    assert not is_openai_only(_ANTHROPIC_ONLY_ENV)
+
+    assert is_openai_only(_CODEX_ONLY_ENV)
+    assert not is_anthropic_only(_CODEX_ONLY_ENV)
+
+    both = {**_ANTHROPIC_ONLY_ENV, **_CODEX_ONLY_ENV}
+    assert not is_anthropic_only(both)
+    assert not is_openai_only(both)
+
+
+def test_shape_predicates_report_no_side_on_an_empty_env():
+    """Neither shape holds when nothing is configured; both sides read false."""
+    assert not has_anthropic_side({})
+    assert not has_openai_side({})
+    assert not is_anthropic_only({})
+    assert not is_openai_only({})
+
+
+@pytest.mark.parametrize("key", ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_any_anthropic_variable_alone_marks_that_side_configured(key):
+    assert has_anthropic_side({key: "value"})
+
+
+@pytest.mark.parametrize("key", ["OPENAI_BASE_URL", "OPENAI_API_KEY"])
+def test_any_openai_variable_alone_marks_that_side_configured(key):
+    assert has_openai_side({key: "value"})
+
+
+def test_shape_predicates_ignore_the_retired_deepseek_variables():
+    """DeepSeek is migrated onto the standard pair, so it is not a third side."""
+    legacy = {_LEGACY_KEY: "dk", "DEEPSEEK_BASE_URL": "https://api.deepseek.com"}
+    assert not has_anthropic_side(legacy)
+    assert not has_openai_side(legacy)
+    assert not is_anthropic_only(legacy)
+    # With DeepSeek ignored, an OpenAI side alongside it is still openai-only -- the kernel backend previously read
+    # these keys and answered False here.
+    assert is_openai_only({**legacy, **_CODEX_ONLY_ENV})
+
+
+def test_openai_agent_credential_requires_a_key_not_a_bare_base_url():
+    assert not llm_config.openai_agent_credentialed({"OPENAI_BASE_URL": "https://gw/v1"})
+    assert llm_config.openai_agent_credentialed({"OPENAI_API_KEY": "sk-test"})
+
+
+def test_a_retired_gateway_key_does_not_credential_the_openai_side():
+    """`_validate_credentials` admits a run on OPENAI_API_KEY alone, so the ranking names the same one name."""
+    assert not llm_config.openai_agent_credentialed({"LLM_GATEWAY_KEY": "gw-test"})
+
+
+@pytest.mark.parametrize("gateway", ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"])
+def test_a_managed_gateway_drives_the_claude_cli_without_naming_a_key(gateway):
+    """It authenticates the CLI, but hands no key to the callers that need one."""
+    env = {gateway: "1"}
+    assert llm_config.anthropic_agent_credentialed(env)
+    assert not llm_config.has_anthropic_credential(env)
+    assert not llm_config.has_anthropic_side(env)
+
+
+@pytest.mark.parametrize(
+    ("claude_sdk", "codex_sdk", "env", "expected"),
+    [
+        (False, True, {}, llm_config.AGENT_BACKEND_CODEX),
+        (True, False, {}, llm_config.AGENT_BACKEND_CLAUDE),
+        (True, True, {}, llm_config.AGENT_BACKEND_CLAUDE),
+        (True, True, {"OPENAI_API_KEY": "sk"}, llm_config.AGENT_BACKEND_CODEX),
+        (True, True, {"ANTHROPIC_API_KEY": "sk"}, llm_config.AGENT_BACKEND_CLAUDE),
+        (True, False, {"OPENAI_API_KEY": "sk"}, llm_config.AGENT_BACKEND_CODEX),
+        (False, True, {"OPENAI_BASE_URL": "https://gw/v1"}, llm_config.AGENT_BACKEND_CODEX),
+        # A retired key names no credential on either side, so the tie falls back to the SDK and Claude keeps it.
+        (True, True, {"OPENAI_BASE_URL": "https://gw/v1", "LLM_GATEWAY_KEY": "gw"}, llm_config.AGENT_BACKEND_CLAUDE),
+        # The one shape a managed gateway decides: it holds the Anthropic side
+        # against a real OpenAI key that would otherwise win on its own.
+        (
+            True,
+            True,
+            {"CLAUDE_CODE_USE_BEDROCK": "1", "OPENAI_API_KEY": "sk"},
+            llm_config.AGENT_BACKEND_CLAUDE,
+        ),
+    ],
+)
+def test_preferred_agent_backend_ranks_credentials_then_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    claude_sdk: bool,
+    codex_sdk: bool,
+    env: dict[str, str],
+    expected: str,
+) -> None:
+    monkeypatch.setattr(llm_config, "claude_agent_sdk_installed", lambda: claude_sdk)
+    monkeypatch.setattr(llm_config, "codex_agent_sdk_installed", lambda: codex_sdk)
+    assert llm_config.preferred_agent_backend(env) == expected
+
+
+def test_derived_base_url_carries_the_anthropic_gateway_headers():
+    """An anthropic-only deployment must still send the gateway's subscription key."""
+    kwargs = resolve_openai_client_config(env=dict(_ANTHROPIC_ONLY_ENV)).as_kwargs()
+    assert kwargs["base_url"] == "https://llm-api.amd.com/Unified/v1"
+    assert kwargs["default_headers"] == {_SUBSCRIPTION_HEADER: "ak-anthropic"}
+
+
+def test_explicit_openai_base_url_does_not_borrow_anthropic_headers():
+    """An explicit OpenAI URL may be a different host, whose headers we cannot guess."""
+    kwargs = resolve_openai_client_config(
+        env={**_ANTHROPIC_ONLY_ENV, "OPENAI_BASE_URL": "https://other-host.example/v1"}
+    ).as_kwargs()
+    assert kwargs["base_url"] == "https://other-host.example/v1"
+    assert "default_headers" not in kwargs
+
+
+def test_openai_custom_headers_win_over_the_derived_gateway_headers():
+    """An operator who set the OpenAI side explicitly keeps that exact header set."""
+    kwargs = resolve_openai_client_config(
+        env={**_ANTHROPIC_ONLY_ENV, "OPENAI_CUSTOM_HEADERS": f"{_SUBSCRIPTION_HEADER}: openai-sub"}
+    ).as_kwargs()
+    assert kwargs["default_headers"] == {_SUBSCRIPTION_HEADER: "openai-sub"}
+
+
+def test_openai_kwargs_error_names_every_searched_key():
+    """The message has to list what was actually searched, Anthropic side included."""
+    with pytest.raises(LLMConfigError) as excinfo:
+        resolve_openai_client_config(env={"ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic"}).as_kwargs()
+    message = str(excinfo.value)
+    for name in ("OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        assert name in message
+
+
+def test_openai_kwargs_preserves_explicit_openai_config():
+    kwargs = resolve_openai_client_config(
+        env={
+            "_".join(("OPENAI", "API", "KEY")): "openai-token",
+            "OPENAI_BASE_URL": "https://api.openai.com/v1",
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic",
+        }
+    ).as_kwargs()
+    assert kwargs == {
+        "api_key": "openai-token",
+        "base_url": "https://api.openai.com/v1",
+    }
+
+
+def test_openai_kwargs_requires_a_key():
+    with pytest.raises(LLMConfigError):
+        resolve_openai_client_config(env={"ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic"}).as_kwargs()
+
+
+def test_deepseek_compat_env_is_empty_without_legacy_vars():
+    assert deepseek_compat_env({}) == {}
+    assert deepseek_compat_env({"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}) == {}
+
+
+def test_deepseek_compat_env_key_only_fills_both_protocol_sides():
+    """One key, two endpoints: DeepSeek is a gateway, not a third provider."""
+    updates = deepseek_compat_env({_LEGACY_KEY: "deepseek-token"})
+    assert updates["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert updates["OPENAI_BASE_URL"] == "https://api.deepseek.com/v1"
+    assert updates["_".join(("ANTHROPIC", "API", "KEY"))] == "deepseek-token"
+    assert updates["_".join(("OPENAI", "API", "KEY"))] == "deepseek-token"
+    assert updates["CLAUDE_MODEL"] == "deepseek-v4-pro"
+    assert updates["CODEX_MODEL"] == "deepseek-v4-pro"
+    assert updates["GEAK_CLAUDE_MODEL"] == "deepseek-v4-pro"
+
+
+@pytest.mark.parametrize(
+    ("legacy_url", "anthropic_url", "openai_url"),
+    [
+        ("https://gw.example/anthropic", "https://gw.example/anthropic", "https://gw.example/v1"),
+        ("https://gw.example/v1", "https://gw.example/anthropic", "https://gw.example/v1"),
+        ("https://gw.example/anthropic/", "https://gw.example/anthropic", "https://gw.example/v1"),
+        ("https://gw.example", "https://gw.example", "https://gw.example/v1"),
+    ],
+)
+def test_deepseek_compat_env_derives_the_sibling_endpoint(legacy_url, anthropic_url, openai_url):
+    """The legacy URL named only one side; the other is derived, never guessed wrong."""
+    updates = deepseek_compat_env({_LEGACY_KEY: "t", "DEEPSEEK_BASE_URL": legacy_url})
+    assert updates["ANTHROPIC_BASE_URL"] == anthropic_url
+    assert updates["OPENAI_BASE_URL"] == openai_url
+
+
+def test_deepseek_compat_env_bare_known_host_gets_both_segments():
+    """``https://api.deepseek.com`` is the documented OpenAI base, not a root."""
+    updates = deepseek_compat_env({_LEGACY_KEY: "t", "DEEPSEEK_BASE_URL": "https://api.deepseek.com"})
+    assert updates["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert updates["OPENAI_BASE_URL"] == "https://api.deepseek.com/v1"
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        {"_".join(("ANTHROPIC", "API", "KEY")): "sk-explicit"},
+        {"_".join(("ANTHROPIC", "AUTH", "TOKEN")): "sk-explicit"},
+        {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+    ],
+)
+def test_deepseek_compat_env_ignores_leftovers_once_anthropic_side_exists(configured):
+    """A stale legacy key must never re-point an explicit Anthropic credential."""
+    assert deepseek_compat_env({**configured, _LEGACY_KEY: "sk-legacy"}) == {}
+
+
+def test_deepseek_compat_env_leaves_official_anthropic_endpoint_alone():
+    """Regression: an explicit key alone still implies the OFFICIAL endpoint."""
+    env = {"_".join(("ANTHROPIC", "API", "KEY")): "sk-real-anthropic", _LEGACY_KEY: "sk-legacy"}
+    updates = deepseek_compat_env(env)
+    assert "ANTHROPIC_BASE_URL" not in updates
+    assert "OPENAI_BASE_URL" not in updates
+    assert "CLAUDE_MODEL" not in updates
+
+
+def test_claude_sdk_env_options_does_not_mix_legacy_and_explicit_keys():
+    """End-to-end guard for the same hazard through the Claude SDK options."""
+    api_key_var = "_".join(("ANTHROPIC", "API", "KEY"))
+    auth_token_var = "_".join(("ANTHROPIC", "AUTH", "TOKEN"))
+    child_env = claude_sdk_env_options(
+        env={
+            api_key_var: "sk-explicit",
+            "ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic",
+            _LEGACY_KEY: "sk-legacy",
+        }
+    )["env"]
+    assert child_env[api_key_var] == "sk-explicit"
+    assert child_env[auth_token_var] == "sk-explicit"
+
+
+def test_provider_model_defaults_supplies_a_model_for_a_known_gateway():
+    """A gateway serving only its own models must not get the AMD Claude id."""
+    defaults = provider_model_defaults(
+        {
+            "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+            "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+            "_".join(("ANTHROPIC", "API", "KEY")): "sk-ds",
+            "_".join(("OPENAI", "API", "KEY")): "sk-ds",
+        }
+    )
+    assert defaults == {
+        "CLAUDE_MODEL": "deepseek-v4-pro",
+        "CODEX_MODEL": "deepseek-v4-pro",
+        "GEAK_CLAUDE_MODEL": "deepseek-v4-pro",
+    }
+
+
+def test_provider_model_defaults_resolves_a_retired_config_too():
+    """The legacy spelling must reach the same model, without preflight."""
+    defaults = provider_model_defaults({_LEGACY_KEY: "sk-ds"})
+    assert defaults["CLAUDE_MODEL"] == "deepseek-v4-pro"
+    assert defaults["CODEX_MODEL"] == "deepseek-v4-pro"
+
+
+def test_provider_model_defaults_never_overrides_explicit_models():
+    defaults = provider_model_defaults(
+        {
+            "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+            "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+            "CLAUDE_MODEL": "my-claude",
+            "CODEX_MODEL": "my-codex",
+        }
+    )
+    assert "CLAUDE_MODEL" not in defaults
+    assert "CODEX_MODEL" not in defaults
+    # GEAKv4 still follows the Anthropic-side model in effect.
+    assert defaults["GEAK_CLAUDE_MODEL"] == "my-claude"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        {"OPENAI_BASE_URL": "https://api.openai.com/v1"},
+        {
+            "ANTHROPIC_BASE_URL": "https://llm.amd.example/Anthropic",
+            "OPENAI_BASE_URL": "https://llm.amd.example/Unified/v1",
+        },
+        {},
+    ],
+)
+def test_provider_model_defaults_is_silent_for_unknown_gateways(env):
+    """Only hosts we know the catalog of get a model; everything else is left alone."""
+    assert provider_model_defaults(env) == {}
+
+
+def test_deepseek_compat_env_never_overrides_explicit_values():
+    updates = deepseek_compat_env(
+        {
+            _LEGACY_KEY: "deepseek-token",
+            "OPENAI_BASE_URL": "https://gateway.example/v1",
+            "_".join(("OPENAI", "API", "KEY")): "gateway-token",
+            "CLAUDE_MODEL": "claude-opus-4-8",
+        }
+    )
+    assert "OPENAI_BASE_URL" not in updates
+    assert "_".join(("OPENAI", "API", "KEY")) not in updates
+    assert "CLAUDE_MODEL" not in updates
+    assert updates["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+
+
+def test_deepseek_compat_env_leaves_a_foreign_openai_side_alone():
+    """Another gateway on the OpenAI side keeps its own key AND its own model."""
+    updates = deepseek_compat_env(
+        {
+            _LEGACY_KEY: "sk-legacy",
+            "OPENAI_BASE_URL": "https://gateway.example/v1",
+            "_".join(("OPENAI", "API", "KEY")): "sk-gateway",
+        }
+    )
+    assert "OPENAI_BASE_URL" not in updates
+    assert "_".join(("OPENAI", "API", "KEY")) not in updates
+    assert "CODEX_MODEL" not in updates
+    # The Anthropic side is still free, so it is adopted.
+    assert updates["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+
+
+def test_deepseek_compat_env_geak_model_follows_explicit_claude_model():
+    """GEAKv4 must not be pointed at a model the operator overrode."""
+    updates = deepseek_compat_env({_LEGACY_KEY: "sk-legacy", "CLAUDE_MODEL": "claude-opus-5"})
+    assert "CLAUDE_MODEL" not in updates
+    assert updates["GEAK_CLAUDE_MODEL"] == "claude-opus-5"
+
+
+def test_resolve_forge_llm_model_ignores_the_removed_forge_env():
+    """Forge reads the platform's model variables and has none of its own."""
+    env = {
+        "CLAUDE_MODEL": "claude-orchestration",
+        "FORGE_CLAUDE_MODEL": "claude-forge-only",
+        "CODEX_MODEL": "gpt-orchestration",
+        "FORGE_CODEX_MODEL": "gpt-forge-only",
+    }
+    assert resolve_forge_llm_model("claude", env=env) == "claude-orchestration"
+    assert resolve_forge_llm_model("codex", env=env) == "gpt-orchestration"
+
+
+def test_the_harness_model_comes_from_dsh_model_alone():
+    """One knob: the retired provider variable no longer names the harness's model."""
+    assert resolve_forge_llm_model("deepseek", env={"DSH_MODEL": "deepseek-v4-pro"}) == "deepseek-v4-pro"
+    assert resolve_forge_llm_model("deepseek", env={"DEEPSEEK_MODEL": "deepseek-v4-pro"}) == (
+        DEFAULT_DEEPSEEK_HARNESS_MODEL
+    )
+
+
+def test_resolve_forge_llm_model_falls_back_to_orchestration_and_default():
+    assert resolve_forge_llm_model("claude", env={"CLAUDE_MODEL": "claude-orch"}) == "claude-orch"
+    assert resolve_forge_llm_model("codex", env={}) == DEFAULT_CODEX_MODEL
+    assert resolve_forge_llm_model("claude", env={}) == DEFAULT_CLAUDE_MODEL
+    assert (
+        resolve_forge_llm_model(
+            "claude",
+            env={"CLAUDE_MODEL": "claude-orchestration"},
+            explicit="claude-payload",
+        )
+        == "claude-payload"
+    )
+
+
+def test_deepseek_compat_env_is_idempotent():
+    env = {_LEGACY_KEY: "deepseek-token"}
+    env.update(deepseek_compat_env(env))
+    assert deepseek_compat_env(env) == {}
+
+
+def test_claude_sdk_env_options_from_deepseek_key_only():
+    opts = claude_sdk_env_options(
+        model="deepseek-v4-pro",
+        env={"_".join(("DEEPSEEK", "API", "KEY")): "deepseek-token"},
+    )
+    assert opts["setting_sources"] == []
+    child_env = opts["env"]
+    assert child_env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert child_env["_".join(("ANTHROPIC", "API", "KEY"))] == "deepseek-token"
+    assert child_env["_".join(("ANTHROPIC", "AUTH", "TOKEN"))] == "deepseek-token"
+    assert child_env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
+
+
+def test_claude_sdk_env_options_never_synthesizes_api_keys_from_oauth_token():
+    """The subscription token must stay env-passthrough only."""
+    oauth_env = "_".join(("CLAUDE", "CODE", "OAUTH", "TOKEN"))
+    opts = claude_sdk_env_options(env={oauth_env: "sk-ant-oat01-fake"})
+    child_env = opts["env"]
+    assert child_env[oauth_env] == "sk-ant-oat01-fake"
+    assert "_".join(("ANTHROPIC", "API", "KEY")) not in child_env
+    assert "_".join(("ANTHROPIC", "AUTH", "TOKEN")) not in child_env
+
+
+def test_claude_sdk_env_options_isolates_settings_for_oauth_only_env():
+    """OAuth alone is a gateway signal, so the run still gets an isolated env."""
+    opts = claude_sdk_env_options(env={"_".join(("CLAUDE", "CODE", "OAUTH", "TOKEN")): "sk-ant-oat01-fake"})
+    assert opts["setting_sources"] == []
+
+
+def test_anthropic_credential_env_order_is_cli_precedence():
+    """Highest precedence first; OAuth is live only when both key vars are unset."""
+    assert ANTHROPIC_CREDENTIAL_ENV_ORDER == (
+        "_".join(("ANTHROPIC", "API", "KEY")),
+        "_".join(("ANTHROPIC", "AUTH", "TOKEN")),
+        "_".join(("CLAUDE", "CODE", "OAUTH", "TOKEN")),
+    )
+
+
+def test_claude_sdk_env_options_keeps_explicit_deepseek_base_url():
+    opts = claude_sdk_env_options(
+        model="deepseek-v4-pro",
+        env={
+            "_".join(("DEEPSEEK", "API", "KEY")): "deepseek-token",
+            "DEEPSEEK_BASE_URL": "https://deepseek.example/anthropic",
+        },
+    )
+    child_env = opts["env"]
+    assert child_env["ANTHROPIC_BASE_URL"] == "https://deepseek.example/anthropic"
+
+
+def test_claude_sdk_env_options_forwards_anthropic_custom_headers():
+    """The Claude subprocess forwards ANTHROPIC_CUSTOM_HEADERS verbatim."""
+    opts = claude_sdk_env_options(
+        env={
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic",
+            "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: operator-key",
+        }
+    )
+    headers = parse_custom_headers(opts["env"]["ANTHROPIC_CUSTOM_HEADERS"])
+    assert headers["Ocp-Apim-Subscription-Key"] == "operator-key"
+
+
+def test_claude_sdk_env_options_expands_anthropic_custom_header_reference():
+    opts = claude_sdk_env_options(
+        env={
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/anthropic",
+            "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${ANTHROPIC_API_KEY}",
+        }
+    )
+    headers = parse_custom_headers(opts["env"]["ANTHROPIC_CUSTOM_HEADERS"])
+    assert headers["Ocp-Apim-Subscription-Key"] == "ak-anthropic"
+
+
+def test_claude_sdk_env_options_no_header_auto_injection():
+    """A gateway without an explicit ANTHROPIC_CUSTOM_HEADERS gets NO auto-injected subscription header."""
+    opts = claude_sdk_env_options(
+        env={
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic",
+        }
+    )
+    headers = parse_custom_headers(opts["env"].get("ANTHROPIC_CUSTOM_HEADERS"))
+    assert "Ocp-Apim-Subscription-Key" not in headers
+
+
+def test_claude_sdk_env_options_does_not_copy_openai_custom_headers():
+    """OPENAI_CUSTOM_HEADERS is NOT copied onto the Claude (Anthropic) side; the claude path reads only ANTHROPIC_CUSTOM_HEADERS."""
+    opts = claude_sdk_env_options(
+        env={
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "ANTHROPIC_BASE_URL": "https://llm.example.invalid/anthropic",
+            "OPENAI_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: openai-key",
+        }
+    )
+    assert "ANTHROPIC_CUSTOM_HEADERS" not in opts["env"]
+
+
+# ---- client construction (get_openai_client / get_async_openai_client) ----
+class _FakeSDKClient:
+    """Stand-in for an ``openai`` SDK client class; records its kwargs."""
+
+    kind = ""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeSyncSDKClient(_FakeSDKClient):
+    kind = "OpenAI"
+
+
+class _FakeAsyncSDKClient(_FakeSDKClient):
+    kind = "AsyncOpenAI"
+
+
+def _install_fake_openai_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the lazy ``import openai`` at recording stand-ins."""
+    module = types.ModuleType("openai")
+    module.OpenAI = _FakeSyncSDKClient
+    module.AsyncOpenAI = _FakeAsyncSDKClient
+    monkeypatch.setitem(sys.modules, "openai", module)
+
+
+def test_get_openai_client_resolves_credentials_and_headers(monkeypatch):
+    _install_fake_openai_sdk(monkeypatch)
+    client = get_openai_client(
+        env={
+            _OPENAI_KEY: "openai-token",
+            "OPENAI_BASE_URL": "https://llm.example.invalid/Unified/v1",
+            "OPENAI_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ak-header",
+        }
+    )
+    assert client.kind == "OpenAI"
+    assert client.kwargs == {
+        "api_key": "openai-token",
+        "base_url": "https://llm.example.invalid/Unified/v1",
+        "default_headers": {"Ocp-Apim-Subscription-Key": "ak-header"},
+    }
+
+
+def test_get_client_omits_timeout_when_unset(monkeypatch):
+    """No ``timeout`` kwarg at all, so the SDK applies its own default."""
+    _install_fake_openai_sdk(monkeypatch)
+    assert "timeout" not in get_async_openai_client(env={_OPENAI_KEY: "tok"}).kwargs
+
+
+def test_get_client_forwards_timeout_verbatim(monkeypatch):
+    _install_fake_openai_sdk(monkeypatch)
+    sentinel = object()
+    client = get_async_openai_client(env={_OPENAI_KEY: "tok"}, timeout=sentinel)
+    assert client.kwargs["timeout"] is sentinel
+
+
+def test_get_client_is_never_cached(monkeypatch):
+    """An AsyncOpenAI's httpx pool binds to one event loop, so sharing is unsafe."""
+    _install_fake_openai_sdk(monkeypatch)
+    env = {_OPENAI_KEY: "tok"}
+    assert get_async_openai_client(env=env) is not get_async_openai_client(env=env)
+    assert get_openai_client(env=env) is not get_openai_client(env=env)
+
+
+def test_get_client_raises_clearly_without_the_openai_sdk(monkeypatch):
+    monkeypatch.setitem(sys.modules, "openai", None)
+    with pytest.raises(LLMConfigError, match="openai SDK not installed"):
+        get_async_openai_client(env={_OPENAI_KEY: "tok"})
+    with pytest.raises(LLMConfigError, match="openai SDK not installed"):
+        get_openai_client(env={_OPENAI_KEY: "tok"})
+
+
+def test_get_client_requires_some_gateway_key(monkeypatch):
+    _install_fake_openai_sdk(monkeypatch)
+    with pytest.raises(LLMConfigError, match="OPENAI_API_KEY"):
+        get_async_openai_client(env={"OPENAI_BASE_URL": "https://api.openai.com/v1"})
+
+
+# ---- Anthropic client construction ----
+class _FakeHttpxClient:
+    """Stand-in for an ``httpx`` client class; records its kwargs."""
+
+    kind = ""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeSyncHttpxClient(_FakeHttpxClient):
+    kind = "Client"
+
+
+class _FakeAsyncHttpxClient(_FakeHttpxClient):
+    kind = "AsyncClient"
+
+
+def _install_fake_httpx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the lazy ``import httpx`` at recording stand-ins."""
+    module = types.ModuleType("httpx")
+    module.Client = _FakeSyncHttpxClient
+    module.AsyncClient = _FakeAsyncHttpxClient
+    monkeypatch.setitem(sys.modules, "httpx", module)
+
+
+_ANTHROPIC_KEY = "_".join(("ANTHROPIC", "API", "KEY"))
+_ANTHROPIC_TOKEN = "_".join(("ANTHROPIC", "AUTH", "TOKEN"))
+
+
+def test_get_anthropic_client_sets_auth_version_and_base_url(monkeypatch):
+    _install_fake_httpx(monkeypatch)
+    client = get_anthropic_client(
+        env={_ANTHROPIC_KEY: "ak-anthropic", "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic/"}
+    )
+    assert client.kind == "Client"
+    # The Anthropic base URL is used as-is; only the OpenAI side derives.
+    assert client.kwargs["base_url"] == "https://llm-api.amd.com/Anthropic"
+    assert client.kwargs["headers"]["x-api-key"] == "ak-anthropic"
+    assert client.kwargs["headers"]["anthropic-version"] == DEFAULT_ANTHROPIC_VERSION
+    assert client.kwargs["headers"]["Content-Type"] == "application/json"
+
+
+def test_get_async_anthropic_client_defaults_the_public_base_url(monkeypatch):
+    _install_fake_httpx(monkeypatch)
+    client = get_async_anthropic_client(env={_ANTHROPIC_KEY: "ak-anthropic"})
+    assert client.kind == "AsyncClient"
+    assert client.kwargs["base_url"] == DEFAULT_ANTHROPIC_BASE_URL
+
+
+def test_get_anthropic_client_falls_back_to_the_auth_token(monkeypatch):
+    _install_fake_httpx(monkeypatch)
+    client = get_anthropic_client(env={_ANTHROPIC_TOKEN: "gateway-token"})
+    assert client.kwargs["headers"]["x-api-key"] == "gateway-token"
+
+
+def test_get_anthropic_client_merges_custom_gateway_headers(monkeypatch):
+    """AMD's gateway requires ANTHROPIC_CUSTOM_HEADERS; dropping them is a regression."""
+    _install_fake_httpx(monkeypatch)
+    client = get_anthropic_client(
+        env={
+            _ANTHROPIC_KEY: "ak-anthropic",
+            "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${ANTHROPIC_API_KEY}\nX-Team: hyperloom",
+        }
+    )
+    assert client.kwargs["headers"]["Ocp-Apim-Subscription-Key"] == "ak-anthropic"
+    assert client.kwargs["headers"]["X-Team"] == "hyperloom"
+
+
+def test_custom_headers_can_override_the_api_version(monkeypatch):
+    """Merged last on purpose: a gateway pinned to another version stays reachable."""
+    _install_fake_httpx(monkeypatch)
+    client = get_anthropic_client(
+        env={_ANTHROPIC_KEY: "ak-anthropic", "ANTHROPIC_CUSTOM_HEADERS": "anthropic-version: 2099-01-01"}
+    )
+    assert client.kwargs["headers"]["anthropic-version"] == "2099-01-01"
+
+
+def test_get_anthropic_client_timeout_plumbing(monkeypatch):
+    _install_fake_httpx(monkeypatch)
+    assert "timeout" not in get_anthropic_client(env={_ANTHROPIC_KEY: "k"}).kwargs
+    sentinel = object()
+    assert get_async_anthropic_client(env={_ANTHROPIC_KEY: "k"}, timeout=sentinel).kwargs["timeout"] is sentinel
+
+
+def test_get_anthropic_client_is_never_cached(monkeypatch):
+    _install_fake_httpx(monkeypatch)
+    env = {_ANTHROPIC_KEY: "k"}
+    assert get_anthropic_client(env=env) is not get_anthropic_client(env=env)
+    assert get_async_anthropic_client(env=env) is not get_async_anthropic_client(env=env)
+
+
+def test_get_anthropic_client_requires_a_key(monkeypatch):
+    _install_fake_httpx(monkeypatch)
+    with pytest.raises(LLMConfigError, match="ANTHROPIC_API_KEY"):
+        get_anthropic_client(env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"})
+
+
+def test_get_anthropic_client_raises_clearly_without_httpx(monkeypatch):
+    monkeypatch.setitem(sys.modules, "httpx", None)
+    with pytest.raises(LLMConfigError, match="httpx not installed"):
+        get_anthropic_client(env={_ANTHROPIC_KEY: "k"})
+    with pytest.raises(LLMConfigError, match="httpx not installed"):
+        get_async_anthropic_client(env={_ANTHROPIC_KEY: "k"})
+
+
+# ---- anthropic_completion / aanthropic_completion over the HTTP transport ----
+# The streamed reply itself is read in src/hyperloom_common/llm/tests/test_anthropic_messages.py.
+_MESSAGE_BODY = {
+    "content": [
+        {"type": "text", "text": "hello "},
+        {"type": "tool_use", "id": "x"},
+        {"type": "text", "text": "world"},
+    ],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 21, "output_tokens": 7},
+}
+
+
+def _events(body: dict[str, Any]) -> bytes:
+    """``body``, a whole Messages reply, as the server-sent events that stream it."""
+    events: list[dict[str, Any]] = [{"type": "message_start", "message": {"content": [], "usage": {}}}]
+    for index, block in enumerate(body["content"]):
+        text = block["type"] == "text"
+        events.append(
+            {"type": "content_block_start", "index": index, "content_block": {**block, "text": ""} if text else block}
+        )
+        if text:
+            delta = {"type": "text_delta", "text": block["text"]}
+            events.append({"type": "content_block_delta", "index": index, "delta": delta})
+    events.append({"type": "message_delta", "delta": {"stop_reason": body["stop_reason"]}, "usage": body["usage"]})
+    events.append({"type": "message_stop"})
+    return b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+
+
+class _FakeAnthropicResponse:
+    """One canned reply, streamed as the events of ``body``; a failed ``status_code`` carries ``text`` instead."""
+
+    def __init__(self, *, status_code: int = 200, body: Any = None, text: str = "") -> None:
+        self.status_code = status_code
+        self._content = text.encode() if status_code >= 400 else _events(body)
+
+    def read(self) -> bytes:
+        return self._content
+
+    async def aread(self) -> bytes:
+        return self._content
+
+    def iter_bytes(self) -> Any:
+        yield self._content
+
+    async def aiter_bytes(self) -> Any:
+        yield self._content
+
+    def __enter__(self) -> "_FakeAnthropicResponse":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    async def __aenter__(self) -> "_FakeAnthropicResponse":
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+class _FakeAnthropicTransport:
+    """Records ``/v1/messages`` streams; the reply serves ``with`` and ``async with`` alike."""
+
+    def __init__(self, response: Any = None) -> None:
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
+
+    def stream(self, method: str, path: str, *, json: Any, **_kw: Any) -> Any:
+        self.calls.append({"method": method, "path": path, "json": json})
+        return self._response
+
+
+class _FakeClosingTransport(_FakeAnthropicTransport):
+    def __enter__(self) -> Any:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeAsyncClosingTransport(_FakeAnthropicTransport):
+    async def __aenter__(self) -> Any:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _record_anthropic_client_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    seen: list[object] = []
+
+    def builder(transport: type[_FakeAnthropicTransport]) -> Any:
+        def build(*, env: Any = None, timeout: object | None = None) -> Any:
+            seen.append(timeout)
+            return transport(_FakeAnthropicResponse(body=_MESSAGE_BODY))
+
+        return build
+
+    monkeypatch.setattr(llm_config, "get_anthropic_client", builder(_FakeClosingTransport))
+    monkeypatch.setattr(llm_config, "get_async_anthropic_client", builder(_FakeAsyncClosingTransport))
+    return seen
+
+
+def test_a_one_shot_http_completion_waits_the_callers_timeout_s(monkeypatch):
+    seen = _record_anthropic_client_timeouts(monkeypatch)
+    llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(model="m", messages=[], max_tokens=16, timeout_s=60.0),
+        env={_ANTHROPIC_KEY: "k"},
+    )
+    assert seen == [60.0]
+
+
+@pytest.mark.asyncio
+async def test_an_async_one_shot_http_completion_waits_the_callers_timeout_s(monkeypatch):
+    seen = _record_anthropic_client_timeouts(monkeypatch)
+    await llm_config.aanthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(model="m", messages=[], max_tokens=16, timeout_s=60.0),
+        env={_ANTHROPIC_KEY: "k"},
+    )
+    assert seen == [60.0]
+
+
+def test_an_explicit_http_timeout_outranks_timeout_s(monkeypatch):
+    seen = _record_anthropic_client_timeouts(monkeypatch)
+    sentinel = object()
+    llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="m", messages=[], max_tokens=16, timeout=sentinel, timeout_s=60.0
+        ),
+        env={_ANTHROPIC_KEY: "k"},
+    )
+    assert seen == [sentinel]
+
+
+def test_anthropic_version_is_defined_once_in_llm_config():
+    """The header value must live here alone; four modules used to hardcode it."""
+    source = Path(llm_config.__file__).read_text(encoding="utf-8")
+    assert source.count('"2023-06-01"') == 1
+    assert DEFAULT_ANTHROPIC_VERSION == "2023-06-01"
+
+
+# ---- re-dialling a connection that never came up ----
+_PROXY_ENVS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+
+
+def _proxy_env(monkeypatch: pytest.MonkeyPatch, proxy: str | None) -> None:
+    """Leave exactly ``proxy`` in the environment, so the client's route is the one the test names."""
+    for name in _PROXY_ENVS:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    if proxy is not None:
+        monkeypatch.setenv("HTTPS_PROXY", proxy)
+
+
+def _record_dials(
+    monkeypatch: pytest.MonkeyPatch,
+    httpx: Any,
+    *,
+    failures: int,
+    failure: type[BaseException] | None = None,
+) -> list[Any]:
+    """Fail the first ``failures`` dials of a real transport, then answer; returns the requests as they arrive."""
+    dials: list[Any] = []
+    error = failure or httpx.ConnectError
+
+    def handle_request(self: Any, request: Any) -> Any:
+        dials.append(request)
+        if len(dials) <= failures:
+            raise error("connection refused", request=request)
+        return httpx.Response(200, content=_events(_MESSAGE_BODY))
+
+    async def handle_async_request(self: Any, request: Any) -> Any:
+        return handle_request(self, request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_request)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request)
+    monkeypatch.setattr(llm_config, "_ANTHROPIC_CONNECT_BACKOFF_S", 0.0)
+    return dials
+
+
+_GATEWAY_ENV = {_ANTHROPIC_KEY: "k", "ANTHROPIC_BASE_URL": "https://gw.invalid"}
+# A whole-call budget short enough that one connect timeout spends it, as a real one does when ``timeout`` is unset.
+_BUDGET_S = 0.05
+
+
+@pytest.mark.parametrize("proxy", [None, "http://proxy.invalid:8080"])
+def test_anthropic_messages_redials_a_connection_that_never_came_up(monkeypatch, proxy):
+    """``httpx`` re-dials only on its unproxied branch, so the re-dial sits here, above the route."""
+    httpx = pytest.importorskip("httpx")
+    _proxy_env(monkeypatch, proxy)
+    dials = _record_dials(monkeypatch, httpx, failures=llm_config.ANTHROPIC_CONNECT_RETRIES)
+    client = get_anthropic_client(env=_GATEWAY_ENV)
+    # The proxied client routes through its env-configured mount; the direct one has none.
+    assert bool(client._mounts) is (proxy is not None)
+    result = llm_config.anthropic_messages(client, model="claude")
+    assert result.text == "hello world"
+    assert len(dials) == llm_config.ANTHROPIC_CONNECT_RETRIES + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy", [None, "http://proxy.invalid:8080"])
+async def test_aanthropic_messages_redials_the_same_way(monkeypatch, proxy):
+    httpx = pytest.importorskip("httpx")
+    _proxy_env(monkeypatch, proxy)
+    dials = _record_dials(monkeypatch, httpx, failures=llm_config.ANTHROPIC_CONNECT_RETRIES)
+    client = get_async_anthropic_client(env=_GATEWAY_ENV)
+    assert bool(client._mounts) is (proxy is not None)
+    result = await llm_config.aanthropic_messages(client, model="claude")
+    assert result.text == "hello world"
+    assert len(dials) == llm_config.ANTHROPIC_CONNECT_RETRIES + 1
+
+
+def test_anthropic_messages_lets_the_last_connect_failure_through(monkeypatch):
+    httpx = pytest.importorskip("httpx")
+    _proxy_env(monkeypatch, None)
+    dials = _record_dials(monkeypatch, httpx, failures=llm_config.ANTHROPIC_CONNECT_RETRIES + 1)
+    with pytest.raises(httpx.ConnectError):
+        llm_config.anthropic_messages(get_anthropic_client(env=_GATEWAY_ENV), model="claude")
+    assert len(dials) == llm_config.ANTHROPIC_CONNECT_RETRIES + 1
+
+
+def test_anthropic_messages_never_redials_a_request_that_was_sent(monkeypatch):
+    """A read timeout may have reached the model; replaying it would bill and run a second completion."""
+    httpx = pytest.importorskip("httpx")
+    _proxy_env(monkeypatch, None)
+    dials = _record_dials(monkeypatch, httpx, failures=1, failure=httpx.ReadTimeout)
+    with pytest.raises(httpx.ReadTimeout):
+        llm_config.anthropic_messages(get_anthropic_client(env=_GATEWAY_ENV), model="claude")
+    assert len(dials) == 1
+
+
+def test_anthropic_messages_stops_redialling_at_its_deadline(monkeypatch):
+    """``timeout_s`` bounds the whole call: with ``timeout`` unset one connect timeout spends the budget, and a POST
+    sent after it would bill a completion the reader is already bound to drop."""
+    httpx = pytest.importorskip("httpx")
+    _proxy_env(monkeypatch, None)
+    dials: list[Any] = []
+
+    def handle_request(self: Any, request: Any) -> Any:
+        dials.append(request)
+        time.sleep(_BUDGET_S)
+        raise httpx.ConnectTimeout("connect timed out", request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_request)
+    started = time.monotonic()
+    with pytest.raises(httpx.ConnectTimeout):
+        llm_config.anthropic_completion(
+            request=llm_config.AnthropicCompletionRequest(
+                model="claude", messages=[], max_tokens=16, timeout_s=_BUDGET_S
+            ),
+            env=_GATEWAY_ENV,
+        )
+    # The connect failure reaches the caller instead of a late dial, so no second POST goes out and the backoff
+    # never runs.
+    assert len(dials) == 1
+    assert time.monotonic() - started < llm_config._ANTHROPIC_CONNECT_BACKOFF_S
+
+
+# ---- build_http_timeout ----
+def test_build_http_timeout_defaults_write_and_pool_to_read():
+    timeout = build_http_timeout(connect=3.0, read=7.0)
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (3.0, 7.0, 7.0, 7.0)
+
+
+def test_build_http_timeout_takes_explicit_write_and_pool():
+    timeout = build_http_timeout(connect=1.0, read=2.0, write=3.0, pool=4.0)
+    assert (timeout.write, timeout.pool) == (3.0, 4.0)
+
+
+def test_build_http_timeout_without_httpx_degrades_to_sdk_defaults(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "httpx", None)
+    with caplog.at_level(logging.WARNING, logger="hyperloom_common.llm.llm_config"):
+        assert build_http_timeout(connect=1.0, read=2.0) is None
+    assert "httpx unavailable" in caplog.text
+
+
+# ---- achat_completion ----
+class _StubCompletions:
+    def __init__(self, outcome: Any) -> None:
+        self._outcome = outcome
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **params: Any) -> Any:
+        self.calls.append(params)
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+
+class _StubClient:
+    def __init__(self, outcome: Any) -> None:
+        self.completions = _StubCompletions(outcome)
+        self.chat = types.SimpleNamespace(completions=self.completions)
+
+
+@pytest.mark.asyncio
+async def test_achat_completion_flattens_choice_and_keeps_usage_verbatim():
+    usage = types.SimpleNamespace(prompt_tokens=11, completion_tokens=7)
+    choice = types.SimpleNamespace(message=types.SimpleNamespace(content="hello"), finish_reason="stop")
+    client = _StubClient(types.SimpleNamespace(choices=[choice], usage=usage))
+    result = await achat_completion(client, model="m", messages=[])
+    assert (result.text, result.finish_reason) == ("hello", "stop")
+    assert result.usage is usage
+    assert client.completions.calls == [{"model": "m", "messages": []}]
+
+
+@pytest.mark.asyncio
+async def test_achat_completion_tolerates_missing_content_finish_and_usage():
+    choice = types.SimpleNamespace(message=types.SimpleNamespace(content=None))
+    client = _StubClient(types.SimpleNamespace(choices=[choice]))
+    result = await achat_completion(client, model="m")
+    assert result.text == ""
+    assert result.finish_reason is None
+    assert result.usage is None
+
+
+@pytest.mark.asyncio
+async def test_achat_completion_propagates_transport_errors():
+    """A dead gateway must reach the caller that tags it with role context."""
+    with pytest.raises(RuntimeError, match="gateway down"):
+        await achat_completion(_StubClient(RuntimeError("gateway down")), model="m")
+
+
+# ---- chat_completion ----
+class _SyncStubCompletions:
+    def __init__(self, outcome: Any) -> None:
+        self._outcome = outcome
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **params: Any) -> Any:
+        self.calls.append(params)
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+
+class _SyncStubClient:
+    def __init__(self, outcome: Any) -> None:
+        self.completions = _SyncStubCompletions(outcome)
+        self.chat = types.SimpleNamespace(completions=self.completions)
+
+
+def test_chat_completion_flattens_choice_and_keeps_usage_verbatim():
+    usage = types.SimpleNamespace(prompt_tokens=11, completion_tokens=7)
+    choice = types.SimpleNamespace(message=types.SimpleNamespace(content="hello"), finish_reason="stop")
+    client = _SyncStubClient(types.SimpleNamespace(choices=[choice], usage=usage))
+    result = chat_completion(client, model="m", messages=[])
+    assert (result.text, result.finish_reason) == ("hello", "stop")
+    assert result.usage is usage
+    assert client.completions.calls == [{"model": "m", "messages": []}]
+
+
+def test_chat_completion_tolerates_missing_content_finish_and_usage():
+    choice = types.SimpleNamespace(message=types.SimpleNamespace(content=None))
+    client = _SyncStubClient(types.SimpleNamespace(choices=[choice]))
+    result = chat_completion(client, model="m")
+    assert result.text == ""
+    assert result.finish_reason is None
+    assert result.usage is None
+
+
+def test_chat_completion_propagates_transport_errors():
+    """A dead gateway must reach the caller that tags it with role context."""
+    with pytest.raises(RuntimeError, match="gateway down"):
+        chat_completion(_SyncStubClient(RuntimeError("gateway down")), model="m")
+
+
+def test_chat_completion_does_not_request_a_stream():
+    """The non-streaming entry point must not turn into a streamed request."""
+    choice = types.SimpleNamespace(message=types.SimpleNamespace(content="x"))
+    client = _SyncStubClient(types.SimpleNamespace(choices=[choice]))
+    chat_completion(client, model="m", messages=[])
+    assert "stream" not in client.completions.calls[0]
+
+
+# ---- client-ownership guard ----
+_MIGRATED_CALL_SITES = (
+    "orchestrator/roles/codex.py",
+    "orchestrator/roles/critic_agent.py",
+    "orchestrator/scoring/proposal_scorer.py",
+)
+
+# ``a.b.create`` attribute chains that only llm_config may call directly.
+_SANCTIONED_ONLY_ENDPOINTS = ("chat.completions.create", "responses.create")
+
+
+def _call_site_trees() -> list[tuple[str, ast.Module]]:
+    root = Path(hyperloom.__file__).resolve().parent
+    return [(rel, ast.parse((root / rel).read_text(encoding="utf-8"))) for rel in _MIGRATED_CALL_SITES]
+
+
+def _dotted_attribute_chain(node: ast.AST) -> str:
+    """Render the trailing attribute chain of a call target, e.g. ``responses.create``."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join(reversed(parts))
+
+
+def test_migrated_call_sites_do_not_import_the_openai_sdk():
+    """Client ownership is llm_config's; these call sites ask it for a client."""
+    offenders: list[str] = []
+    for rel, tree in _call_site_trees():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                offenders += [f"{rel}:{node.lineno}" for a in node.names if a.name.split(".")[0] == "openai"]
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "openai":
+                offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, f"OpenAI clients must come from llm_config.get_*_openai_client(): {offenders}"
+
+
+def test_migrated_call_sites_make_no_bare_llm_api_calls():
+    """No call site may reach an LLM endpoint itself; llm_config owns every call."""
+    offenders: list[str] = []
+    for rel, tree in _call_site_trees():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _dotted_attribute_chain(node.func)
+            if any(chain.endswith(endpoint) for endpoint in _SANCTIONED_ONLY_ENDPOINTS):
+                offenders.append(f"{rel}:{node.lineno} calls .{chain}(")
+    assert not offenders, f"LLM calls must go through llm_config's entry points: {offenders}"
+
+
+# ---- anthropic_completion / aanthropic_completion: transport selection ----
+_ANTHROPIC_KEY = "_".join(("ANTHROPIC", "API", "KEY"))
+_ANTHROPIC_TOKEN = "_".join(("ANTHROPIC", "AUTH", "TOKEN"))
+_OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+_OAUTH_VALUE = "sk-ant-oat01-fake"
+
+
+class _ClosingAnthropicTransport(_FakeAnthropicTransport):
+    """Sync transport that records whether the caller closed it."""
+
+    def __init__(self, response: Any = None) -> None:
+        super().__init__(response)
+        self.closed = False
+
+    def __enter__(self) -> "_ClosingAnthropicTransport":
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        self.closed = True
+        return False
+
+
+class _ClosingAsyncAnthropicTransport(_ClosingAnthropicTransport):
+    async def __aenter__(self) -> "_ClosingAsyncAnthropicTransport":
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> bool:
+        self.closed = True
+        return False
+
+
+class _FakeOneShotClient:
+    """Stands in for the Claude CLI client; records the completion arguments."""
+
+    instances: list["_FakeOneShotClient"] = []
+
+    def __init__(
+        self,
+        timeout_s: float = 60.0,
+        env: Any = None,
+        component: str = "",
+        operation: str = "",
+    ) -> None:
+        self.timeout_s = timeout_s
+        self.env = env
+        self.component = component
+        self.operation = operation
+        self.calls: list[dict[str, Any]] = []
+        _FakeOneShotClient.instances.append(self)
+
+    def messages(self, **kwargs: Any) -> llm_config.AnthropicMessageResult:
+        self.calls.append(kwargs)
+        return llm_config.AnthropicMessageResult(
+            text="cli reply",
+            stop_reason="end_turn",
+            usage={"input_tokens": 3, "output_tokens": 2},
+        )
+
+    async def amessages(self, **kwargs: Any) -> llm_config.AnthropicMessageResult:
+        return self.messages(**kwargs)
+
+
+@pytest.fixture
+def fake_one_shot(monkeypatch: pytest.MonkeyPatch) -> type[_FakeOneShotClient]:
+    """Replace the Claude CLI client where ``_one_shot_client`` imports it."""
+    from hyperloom_common.llm import claude_oneshot
+
+    _FakeOneShotClient.instances = []
+    monkeypatch.setattr(claude_oneshot, "ClaudeOneShotClient", _FakeOneShotClient)
+    return _FakeOneShotClient
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({_ANTHROPIC_KEY: "sk-ant-key"}, llm_config.ANTHROPIC_TRANSPORT_HTTP),
+        ({_ANTHROPIC_TOKEN: "gateway-bearer"}, llm_config.ANTHROPIC_TRANSPORT_HTTP),
+        ({_OAUTH_ENV: _OAUTH_VALUE}, llm_config.ANTHROPIC_TRANSPORT_SDK),
+        # The CLI prefers a key over the subscription token, so the transport that key authenticates must win here
+        # too.
+        ({_ANTHROPIC_KEY: "sk-ant-key", _OAUTH_ENV: _OAUTH_VALUE}, llm_config.ANTHROPIC_TRANSPORT_HTTP),
+        ({}, ""),
+        ({_OAUTH_ENV: "   "}, ""),
+    ],
+)
+def test_anthropic_transport_follows_the_credential_that_can_authenticate(env, expected):
+    assert llm_config.anthropic_transport(env) == expected
+
+
+def test_anthropic_transport_ready_is_false_without_a_credential():
+    assert llm_config.anthropic_transport_ready({}) is False
+
+
+def test_anthropic_transport_ready_skips_the_sdk_probe_on_the_http_transport(monkeypatch):
+    """An API key needs no Claude CLI, so an absent SDK must not disable it."""
+    from hyperloom_common.llm import claude_oneshot
+
+    def _missing() -> None:
+        raise RuntimeError("claude_agent_sdk not installed")
+
+    monkeypatch.setattr(claude_oneshot, "ensure_available", _missing)
+    assert llm_config.anthropic_transport_ready({_ANTHROPIC_KEY: "sk-ant-key"}) is True
+
+
+def test_ensure_available_rejects_a_missing_cli_binary(monkeypatch):
+    """The SDK only spawns `claude`; an importable package with no reachable binary still cannot serve a call, and failing here beats failing at the first review."""
+    from hyperloom_common.llm import claude_oneshot
+
+    monkeypatch.setattr(claude_oneshot, "_load_sdk", lambda: types.SimpleNamespace(__file__=None))
+    monkeypatch.setattr(claude_oneshot.shutil, "which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="claude CLI is not available"):
+        claude_oneshot.ensure_available()
+
+
+def test_ensure_available_accepts_a_cli_on_path(monkeypatch):
+    from hyperloom_common.llm import claude_oneshot
+
+    monkeypatch.setattr(claude_oneshot, "_load_sdk", lambda: types.SimpleNamespace(__file__=None))
+    monkeypatch.setattr(claude_oneshot.shutil, "which", lambda _name: "/usr/bin/claude")
+
+    claude_oneshot.ensure_available()
+
+
+@pytest.mark.parametrize("binary_name", ["claude", "claude.exe"])
+def test_ensure_available_accepts_either_bundled_binary_name(monkeypatch, tmp_path, binary_name):
+    """The SDK ships the binary under a platform-dependent name."""
+    from hyperloom_common.llm import claude_oneshot
+
+    bundled = tmp_path / "_bundled"
+    bundled.mkdir()
+    (bundled / ".gitignore").write_text("*\n", encoding="utf-8")
+    (bundled / binary_name).write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_sdk = types.SimpleNamespace(__file__=str(tmp_path / "__init__.py"))
+    monkeypatch.setattr(claude_oneshot, "_load_sdk", lambda: fake_sdk)
+    monkeypatch.setattr(claude_oneshot.shutil, "which", lambda _name: None)
+
+    claude_oneshot.ensure_available()
+    assert claude_oneshot._locate_cli(fake_sdk) == str(bundled / binary_name)
+
+
+def test_ensure_available_ignores_non_binary_bundled_entries(monkeypatch, tmp_path):
+    """A bundle carrying only its .gitignore is not a usable transport."""
+    from hyperloom_common.llm import claude_oneshot
+
+    bundled = tmp_path / "_bundled"
+    bundled.mkdir()
+    (bundled / ".gitignore").write_text("*\n", encoding="utf-8")
+    monkeypatch.setattr(
+        claude_oneshot, "_load_sdk", lambda: types.SimpleNamespace(__file__=str(tmp_path / "__init__.py"))
+    )
+    monkeypatch.setattr(claude_oneshot.shutil, "which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="claude CLI is not available"):
+        claude_oneshot.ensure_available()
+
+
+@pytest.mark.parametrize(
+    ("sdk_error", "expected"),
+    [(None, True), (RuntimeError("claude_agent_sdk not installed"), False)],
+)
+def test_anthropic_transport_ready_probes_the_sdk_for_a_subscription_token(monkeypatch, sdk_error, expected):
+    from hyperloom_common.llm import claude_oneshot
+
+    def _probe() -> None:
+        if sdk_error is not None:
+            raise sdk_error
+
+    monkeypatch.setattr(claude_oneshot, "ensure_available", _probe)
+    assert llm_config.anthropic_transport_ready({_OAUTH_ENV: _OAUTH_VALUE}) is expected
+
+
+def test_anthropic_completion_posts_to_the_messages_api_when_a_key_is_configured(monkeypatch):
+    client = _ClosingAnthropicTransport(_FakeAnthropicResponse(body=_MESSAGE_BODY))
+    monkeypatch.setattr(llm_config, "get_anthropic_client", lambda **_kw: client)
+
+    result = llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=64, system="sys"
+        ),
+        env={_ANTHROPIC_KEY: "sk-ant-key"},
+    )
+
+    assert result.text == "hello world"
+    assert client.calls[0]["path"] == "/v1/messages"
+    assert client.calls[0]["json"] == {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "system": "sys",
+        "stream": True,
+    }
+    assert client.closed, "the HTTP client must be closed once the completion returns"
+
+
+def test_anthropic_completion_omits_an_absent_system_prompt(monkeypatch):
+    client = _ClosingAnthropicTransport(_FakeAnthropicResponse(body=_MESSAGE_BODY))
+    monkeypatch.setattr(llm_config, "get_anthropic_client", lambda **_kw: client)
+
+    llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+        ),
+        env={_ANTHROPIC_KEY: "sk-ant-key"},
+    )
+
+    assert "system" not in client.calls[0]["json"]
+
+
+def test_anthropic_completion_drives_the_claude_cli_for_a_subscription_token(monkeypatch, fake_one_shot):
+    def _refuse(**_kw: Any) -> Any:
+        raise AssertionError("a subscription token must not reach the Messages API")
+
+    monkeypatch.setattr(llm_config, "get_anthropic_client", _refuse)
+
+    result = llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            system="sys",
+            timeout_s=12.0,
+        ),
+        env={_OAUTH_ENV: _OAUTH_VALUE},
+    )
+
+    assert result.text == "cli reply"
+    assert result.stop_reason == "end_turn"
+    client = fake_one_shot.instances[0]
+    assert client.timeout_s == 12.0
+    assert client.calls[0] == {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": "sys",
+        "max_tokens": 64,
+    }
+
+
+def test_anthropic_completion_hands_the_cli_the_caller_env(fake_one_shot):
+    """The CLI resolves its own credential from the environment it is given, so an explicit mapping must reach it instead of being dropped for the ambient one — otherwise a caller that resolved credentials from provider-specific variables silently authenticates as something else."""
+    caller_env = {_OAUTH_ENV: _OAUTH_VALUE, "ANTHROPIC_BASE_URL": "https://gw.example"}
+
+    llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+        ),
+        env=caller_env,
+    )
+
+    assert fake_one_shot.instances[0].env == caller_env
+
+
+@pytest.mark.asyncio
+async def test_aanthropic_completion_hands_the_cli_the_caller_env(fake_one_shot):
+    caller_env = {_OAUTH_ENV: _OAUTH_VALUE}
+
+    await llm_config.aanthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+        ),
+        env=caller_env,
+    )
+
+    assert fake_one_shot.instances[0].env == caller_env
+
+
+def test_anthropic_completion_keeps_the_cli_default_budget_when_unset(fake_one_shot):
+    llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+        ),
+        env={_OAUTH_ENV: _OAUTH_VALUE},
+    )
+    assert fake_one_shot.instances[0].timeout_s == 60.0
+
+
+def test_anthropic_completion_raises_when_no_credential_is_configured():
+    with pytest.raises(LLMConfigError) as excinfo:
+        llm_config.anthropic_completion(
+            request=llm_config.AnthropicCompletionRequest(
+                model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+            ),
+            env={},
+        )
+    message = str(excinfo.value)
+    for name in ANTHROPIC_CREDENTIAL_ENV_ORDER:
+        assert name in message, f"the error must name every credential form: {name}"
+
+
+@pytest.mark.asyncio
+async def test_aanthropic_completion_posts_to_the_messages_api_and_closes(monkeypatch):
+    client = _ClosingAsyncAnthropicTransport(_FakeAnthropicResponse(body=_MESSAGE_BODY))
+    monkeypatch.setattr(llm_config, "get_async_anthropic_client", lambda **_kw: client)
+
+    result = await llm_config.aanthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=64
+        ),
+        env={_ANTHROPIC_KEY: "sk-ant-key"},
+    )
+
+    assert result.text == "hello world"
+    assert client.calls[0]["path"] == "/v1/messages"
+    assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_aanthropic_completion_drives_the_claude_cli_for_a_subscription_token(monkeypatch, fake_one_shot):
+    def _refuse(**_kw: Any) -> Any:
+        raise AssertionError("a subscription token must not reach the Messages API")
+
+    monkeypatch.setattr(llm_config, "get_async_anthropic_client", _refuse)
+
+    result = await llm_config.aanthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=64
+        ),
+        env={_OAUTH_ENV: _OAUTH_VALUE},
+    )
+
+    assert result.text == "cli reply"
+    assert fake_one_shot.instances[0].calls[0]["max_tokens"] == 64
+
+
+@pytest.mark.asyncio
+async def test_aanthropic_completion_raises_when_no_credential_is_configured():
+    with pytest.raises(LLMConfigError):
+        await llm_config.aanthropic_completion(
+            request=llm_config.AnthropicCompletionRequest(
+                model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+            ),
+            env={},
+        )
+
+
+def test_anthropic_completion_reads_the_ambient_environment_by_default(monkeypatch, fake_one_shot):
+    for name in ANTHROPIC_CREDENTIAL_ENV_ORDER:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(_OAUTH_ENV, _OAUTH_VALUE)
+
+    result = llm_config.anthropic_completion(
+        request=llm_config.AnthropicCompletionRequest(
+            model="claude-opus-5", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+        )
+    )
+
+    assert result.text == "cli reply"
+
+
+def test_claude_sdk_env_options_disables_advisor_tool_by_default():
+    """Claude Code's advisor-tool beta header (rejected by strict gateways) is disabled by default; an operator preset is preserved."""
+    opts = claude_sdk_env_options(env={"_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic"})
+    assert opts["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+
+    preset = claude_sdk_env_options(
+        env={
+            "_".join(("ANTHROPIC", "API", "KEY")): "ak-anthropic",
+            "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
+        }
+    )
+    assert preset["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "0"

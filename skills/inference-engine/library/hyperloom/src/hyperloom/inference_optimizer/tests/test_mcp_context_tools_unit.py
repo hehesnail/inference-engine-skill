@@ -1,0 +1,269 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the in-process context-pull MCP tool surface."""
+
+from __future__ import annotations
+
+import json
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from hyperloom.orchestrator.roles import mcp_context_tools as mct
+from hyperloom.orchestrator.roles import mcp_sdk
+
+
+def _shared_state():
+    """Build a fake SharedState exposing the to_*_summary projections."""
+    return SimpleNamespace(
+        to_mission_summary=lambda: "mission",
+        to_prompt_summary=lambda: "prompt",
+        to_gaps_summary=lambda max_attempts=0: "gaps",
+        to_warm_start_summary=lambda: "warm",
+        to_proposal_scores_summary=lambda: "scores",
+        to_intervention_mix_summary=lambda: "mix",
+        to_policy_denial_summary=lambda top_k=6: f"denials({top_k})",
+        failures=[],
+        find_failure=lambda fid: None,
+        failures_for_task=lambda tid: [],
+    )
+
+
+def _provider(shared_state, **readers):
+    """Build a ContextProvider whose readers are empty stubs unless overridden."""
+    stubs = {
+        "inbox_reader": lambda since_seq: "",
+        "analysis_reader": lambda: "",
+        "recent_outcomes_reader": lambda top_k: "",
+        "running_tasks_reader": lambda: "",
+        "reference_reader": lambda name: "",
+    }
+    return mct.ContextProvider(shared_state=shared_state, **{**stubs, **readers})
+
+
+def test_qualified():
+    assert mct.qualified_context_tool_name("get_gaps") == "mcp__inference_optimizer_context__get_gaps"
+    with pytest.raises(KeyError):
+        mct.qualified_context_tool_name("foo")
+
+
+def test_provider_projections():
+    p = _provider(shared_state=_shared_state())
+    assert p.mission_status() == "mission"
+    assert p.shared_state_summary() == "prompt"
+    assert p.gaps() == "gaps"
+    assert p.warm_start() == "warm"
+    assert p.proposal_scores() == "scores"
+    assert p.intervention_mix() == "mix"
+
+
+def test_safe_handles_exception():
+    def boom():
+        raise RuntimeError("x")
+
+    p = _provider(shared_state=SimpleNamespace())
+    with pytest.raises(RuntimeError, match="x"):
+        p._safe(boom, "lbl")
+
+
+def test_safe_empty_marker():
+    p = _provider(shared_state=SimpleNamespace())
+    assert p._safe(lambda: "", "lbl") == "(lbl: empty)"
+    assert p._safe(lambda: None, "lbl") == "(lbl: empty)"
+
+
+def test_why_denied_via_shared_state():
+    p = _provider(shared_state=_shared_state())
+    assert p.why_denied(top_k=3) == "denials(3)"
+
+
+def test_analysis_md_wired():
+    p = _provider(shared_state=_shared_state(), analysis_reader=lambda: "md")
+    assert p.analysis_md() == "md"
+
+
+def test_runtime_findings_reads_current_best_slot(tmp_path):
+    slot = tmp_path / "variant_00_v"
+    slot.mkdir()
+    (slot / "runtime_findings.json").write_text(
+        json.dumps({"framework": "vllm", "log_path": "/s/server.log", "findings": []}), encoding="utf-8"
+    )
+    state = SimpleNamespace(current_best_measurement={"launch_evidence_path": str(slot / "launch_evidence.json")})
+    p = _provider(shared_state=state)
+
+    assert p.runtime_findings() == "runtime findings for /s/server.log [vllm]"
+    assert "get_runtime_findings" in mct.CONTEXT_TOOL_NAMES
+
+
+def test_tool_name_tuples():
+    assert "get_mission_status" in mct.CONTEXT_TOOL_NAMES
+    assert mct.CONTEXT_TOOL_QUALIFIED_NAMES[0].startswith("mcp__")
+    assert len(mct.CONTEXT_TOOL_NAMES) == len(mct.CONTEXT_TOOL_SPECS)
+
+
+# ---- sdk resolution ----
+
+
+def test_resolve_sdk_explicit():
+    sentinel = object()
+    assert mcp_sdk._resolve_sdk(sentinel) is sentinel
+
+
+def test_resolve_sdk_import_error(monkeypatch):
+    def boom(_name):
+        raise ImportError("no sdk")
+
+    monkeypatch.setattr(mcp_sdk.importlib, "import_module", boom)
+    assert mcp_sdk._resolve_sdk(None) is None
+
+
+# ---- _make_handler ----
+
+
+async def test_make_handler_success():
+    p = _provider(shared_state=_shared_state())
+    handler = mct._make_handler(p, "mission_status")
+    out = await handler({})
+    assert out["content"][0]["text"] == "mission"
+
+
+async def test_make_handler_forwards_kwargs():
+    p = _provider(shared_state=_shared_state())
+    handler = mct._make_handler(p, "why_denied")
+    out = await handler({"top_k": 2})
+    assert out["content"][0]["text"] == "denials(2)"
+
+
+async def test_make_handler_forwards_since_seq():
+    p = _provider(shared_state=_shared_state(), inbox_reader=lambda s: f"inbox({s})")
+    handler = mct._make_handler(p, "inbox")
+    out = await handler({"since_seq": 9})
+    assert out["content"][0]["text"] == "inbox(9)"
+
+
+async def test_make_handler_non_str_result():
+    provider = SimpleNamespace(foo=lambda **k: {"a": 1})
+    handler = mct._make_handler(provider, "foo")
+    out = await handler({})
+    assert json.loads(out["content"][0]["text"]) == {"a": 1}
+
+
+async def test_make_handler_exception():
+    def boom(**k):
+        raise RuntimeError("nope")
+
+    provider = SimpleNamespace(foo=boom)
+    handler = mct._make_handler(provider, "foo")
+    out = await handler({})
+    assert out["is_error"] is True
+
+
+async def test_read_projection_stays_on_the_calling_thread():
+    owner_thread = threading.get_ident()
+    seen = []
+
+    def read():
+        seen.append(threading.get_ident())
+        return "mission"
+
+    p = _provider(shared_state=SimpleNamespace(to_mission_summary=read))
+    out = await mct._make_handler(p, "mission_status")({})
+    assert seen == [owner_thread]
+    assert out == {"content": [{"type": "text", "text": "mission"}]}
+
+
+# ---- build_context_tools_server ----
+
+
+def test_build_server_unavailable_without_factories():
+    p = _provider(shared_state=_shared_state())
+    assert mct.build_context_tools_server(p, sdk_module=object()) is None
+
+
+def test_build_server_with_fake_factories():
+    p = _provider(shared_state=_shared_state())
+    created = {}
+
+    def tool_factory(name, desc, schema):
+        def decorator(handler):
+            return (name, handler)
+
+        return decorator
+
+    def server_factory(name, version, tools):
+        created["name"] = name
+        created["tools"] = tools
+        return "SERVER"
+
+    out = mct.build_context_tools_server(
+        p,
+        tool_factory=tool_factory,
+        server_factory=server_factory,
+    )
+    assert out == "SERVER"
+    assert created["name"] == mct.MCP_SERVER_NAME
+    assert len(created["tools"]) == len(mct.CONTEXT_TOOL_SPECS)
+
+
+def test_spec_methods_all_exist_on_provider():
+    """Every CONTEXT_TOOL_SPECS entry must name a real ContextProvider method."""
+    for _, _, _, method_name in mct.CONTEXT_TOOL_SPECS:
+        assert callable(getattr(mct.ContextProvider, method_name, None)), (
+            f"ContextProvider missing method {method_name!r}"
+        )
+
+
+def test_get_failure_not_found_points_at_the_disk_mirror():
+    """An evicted packet is still reachable, so the miss must say where."""
+    p = _provider(shared_state=_shared_state())
+    out = p.get_failure("fail.t1.abc")
+    assert "reports/failures/fail.t1.abc.json" in out
+
+
+def test_get_failure_returns_json():
+    import json
+
+    fe = {"failure_id": "fail.t1.abc", "task_id": "t1", "error_class": "x"}
+    ss = _shared_state()
+    ss.find_failure = lambda fid: fe if fid == "fail.t1.abc" else None
+    p = _provider(shared_state=ss)
+    out = p.get_failure("fail.t1.abc")
+    data = json.loads(out)
+    assert data["failure_id"] == "fail.t1.abc"
+
+
+def test_get_failure_requires_failure_id():
+    p = _provider(shared_state=_shared_state())
+    out = p.get_failure("")
+    assert "required" in out
+
+
+def test_get_variant_failures_empty():
+    p = _provider(shared_state=_shared_state())
+    out = p.get_variant_failures()
+    assert "no failure" in out
+
+
+def test_get_variant_failures_returns_entries():
+    import json
+
+    fe1 = {"failure_id": "fail.t1.a", "task_id": "t1"}
+    fe2 = {"failure_id": "fail.t1.b", "task_id": "t1"}
+    ss = _shared_state()
+    ss.failures = [fe1, fe2]
+    ss.failures_for_task = lambda tid: [fe for fe in [fe1, fe2] if fe["task_id"] == tid]
+    p = _provider(shared_state=ss)
+    out = p.get_variant_failures(task_id="t1")
+    lines = [l for l in out.splitlines() if l.strip()]
+    assert len(lines) == 2
+    ids = {json.loads(l)["failure_id"] for l in lines}
+    assert ids == {"fail.t1.a", "fail.t1.b"}
+
+
+async def test_make_handler_forwards_failure_id():
+    p = _provider(shared_state=_shared_state())
+    handler = mct._make_handler(p, "get_failure")
+    out = await handler({"failure_id": "fail.t1.abc"})
+    assert "fail.t1.abc" in out["content"][0]["text"]

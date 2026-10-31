@@ -1,0 +1,1000 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""PRELUDE-bootstrap analysis-task enqueue tests (kind/idempotency/benchmark-script wiring of ``enqueue_internal_analysis_task``)."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import hyperloom.orchestrator.kernel.campaign_baseline as campaign_baseline
+
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.state.shared_state import SharedState
+
+
+# Minimal SharedState + TaskRegistry doubles.
+@dataclass
+class _BareState:
+    baseline_tput: float = 100.0
+    cumulative_gain_validated: float = 0.0
+    last_roofline_tput: float = 0.0
+    auto_roofline_pending_task_id: str = ""
+    enable_roofline: bool = True
+    current_best: dict[str, Any] = field(default_factory=dict)
+    last_baseline: dict[str, Any] = field(default_factory=dict)
+    roofline_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    kernel_optimizer: str = "native"
+    phase_history: list[dict[str, Any]] = field(default_factory=list)
+
+    def save(self, _session_dir: Path | None) -> None:
+        pass
+
+
+class _StubTaskRegistry:
+    def __init__(self) -> None:
+        self._tasks: dict[str, Any] = {}
+        self._by_idem: dict[str, Any] = {}
+
+    async def create_or_return_existing(self, spec):
+        existing = self._by_idem.get(spec.idempotency_key)
+        if existing is not None:
+            return existing, True
+        import uuid as _uuid
+        from hyperloom.orchestrator.state.task_registry import Task
+
+        task = Task(
+            task_id=_uuid.uuid4().hex,
+            kind=spec.kind,
+            state="queued",
+            params=dict(spec.params),
+            idempotency_key=spec.idempotency_key,
+        )
+        self._tasks[task.task_id] = task  # type: ignore[assignment]
+        self._by_idem[spec.idempotency_key] = task  # type: ignore[assignment]
+        return task, False
+
+    async def get(self, task_id: str):
+        return self._tasks[task_id]
+
+
+@pytest.fixture
+def coord(tmp_path: Path, monkeypatch) -> Coordinator:
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        kernel_optimizer="forge",
+        phase="PRELUDE",
+    )
+    c.tasks = _StubTaskRegistry()
+    c.knowledge_plane = None
+    c._run_deadline = None
+    c._run_started_monotonic = None
+
+    # KERNEL entry ends by handing rewrite control to a controller subprocess.
+    async def _skip_controller(
+        _handoff_dir: Path,
+        _output_dir: Path,
+        _baseline_pins: dict[str, str] | None = None,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(c.phase_kernel, "_run_kernel_rewrite_controller", _skip_controller)
+    return c
+
+
+def test_prelude_initial_roofline_task_contract(coord: Coordinator):
+    """The PRELUDE-bootstrap roofline represents baseline, not current_best."""
+    coord.shared_state.current_best = {
+        "extra_server_args": "--tp 8 --enable-mla",
+        "extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "1"},
+        "remove_args": ["--old-backend"],
+        "unset_envs": ["OLD_BACKEND"],
+        "args_mode": "replace",
+    }
+    coord.shared_state.baseline_benchmark_script = "magpie_serving_bench.sh"
+
+    task = asyncio.run(
+        coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial"),
+    )
+
+    assert task.kind == "roofline"
+    assert task.idempotency_key == "internal-analysis-prelude_initial"
+    assert task.params["reason"] == "prelude_initial"
+    assert task.params["source"] == "coordinator_internal"
+    assert "base_extra_args" not in task.params
+    assert task.params["benchmark_script"] == "magpie_serving_bench.sh"
+
+
+def test_prelude_initial_roofline_uses_baseline_server_args(
+    coord: Coordinator,
+    monkeypatch,
+):
+    """PRELUDE roofline injects baseline's own server args, never current_best's."""
+    coord.shared_state.current_best = {
+        "extra_server_args": "--enable-torch-compile --quantization fp8",
+    }
+    import hyperloom.orchestrator.phases.prelude as prelude
+
+    monkeypatch.setattr(
+        prelude,
+        "read_baseline_server_args",
+        lambda _state: "--attention-backend AITER",
+    )
+
+    task = asyncio.run(
+        coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial"),
+    )
+
+    assert task.params["base_extra_args"] == "--attention-backend AITER"
+    assert "--enable-torch-compile" not in task.params["base_extra_args"]
+    assert "fp8" not in task.params["base_extra_args"]
+
+
+def _anchor_baseline_yaml(state: SharedState, tmp_path: Path, args: str) -> None:
+    cfg = tmp_path / "baseline_anchor.yaml"
+    cfg.write_text(f"benchmark:\n  envs:\n    EXTRA_SGLANG_ARGS: '{args}'\n", encoding="utf-8")
+    state.baseline_config_path = str(cfg)
+
+
+def test_prelude_initial_roofline_boots_the_anchor_being_promoted(coord: Coordinator, tmp_path: Path):
+    """Promotion enqueues this roofline before ``last_baseline`` records the anchor, which still names the failed try."""
+    state = coord.shared_state
+    failed = tmp_path / "failed.yaml"
+    failed.write_text("benchmark:\n  envs:\n    EXTRA_SGLANG_ARGS: '--context-length 6144'\n", encoding="utf-8")
+    state.last_baseline = {"status": "failed", "extras": {"materialized_config": str(failed)}}
+    _anchor_baseline_yaml(state, tmp_path, "--dsa-decode-backend tilelang --context-length 6144")
+
+    task = asyncio.run(coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial"))
+
+    assert task.params["base_extra_args"] == "--dsa-decode-backend tilelang --context-length 6144"
+
+
+@pytest.mark.parametrize(
+    ("current_best", "expected"),
+    [
+        ({"action": "baseline", "tput": 100.0}, "--dsa-decode-backend tilelang --context-length 6144"),
+        (
+            {
+                "action": "explore",
+                "tput": 110.0,
+                "extra_server_args": "--context-length 8192 --chunked-prefill-size 8192",
+            },
+            "--dsa-decode-backend tilelang --context-length 6144 --context-length 8192 --chunked-prefill-size 8192",
+        ),
+        (
+            {
+                "action": "explore",
+                "extra_server_args": "--chunked-prefill-size 8192",
+                "remove_args": ["--context-length"],
+            },
+            "--dsa-decode-backend tilelang --chunked-prefill-size 8192",
+        ),
+        (
+            {"action": "explore", "extra_server_args": "--tp 2", "args_mode": "replace"},
+            "--tp 2",
+        ),
+    ],
+    ids=["baseline", "delta-overrides", "removal", "replace-snapshot"],
+)
+def test_later_roofline_layers_the_stack_over_the_baseline_args(
+    coord: Coordinator, tmp_path: Path, current_best: dict[str, Any], expected: str
+):
+    """The profiler boots from the benchmark config, so a stack delta alone drops the baseline's own launch flags."""
+    _anchor_baseline_yaml(coord.shared_state, tmp_path, "--dsa-decode-backend tilelang --context-length 6144")
+    coord.shared_state.current_best = current_best
+
+    task = asyncio.run(coord.phase_prelude.enqueue_internal_analysis_task(reason="cycle_start"))
+
+    assert task.params["base_extra_args"] == expected
+
+
+def test_prelude_initial_roofline_boots_the_configuration_enablement_established(coord: Coordinator, tmp_path: Path):
+    """The baseline arm after a bring-up is the enablement-accepted launch; without it the server hits the old wall."""
+    launch_config = tmp_path / "launch_config.yaml"
+    coord.shared_state.enablement.accepted_config_path = str(launch_config)
+    coord.shared_state.enablement.record_accepted_config(
+        {
+            "extra_envs": {"SGLANG_DSA_KPOOL_HIP_RECENCY_FALLBACK": "1"},
+            "extra_server_args": "--dsa-decode-backend triton",
+        },
+        source="kept_bench",
+    )
+    coord.shared_state.current_best = {"extra_envs": {"SGLANG_LATER_KEEP": "1"}}
+
+    task = asyncio.run(coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial"))
+
+    assert task.params["config_path"] == str(launch_config)
+    assert task.params["extra_envs"] == {"SGLANG_DSA_KPOOL_HIP_RECENCY_FALLBACK": "1"}
+    assert task.params["extra_server_args"] == "--dsa-decode-backend triton"
+    assert "base_extra_envs" not in task.params
+
+
+@pytest.mark.asyncio
+async def test_prelude_initial_roofline_is_idempotent(coord: Coordinator):
+    """A second call with the same reason returns the same task (no double-enqueue on resume)."""
+    first = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+    second = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+    assert first.task_id == second.task_id
+    assert len(coord.tasks._tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_distinct_reasons_produce_distinct_tasks(coord: Coordinator):
+    """A watermark-driven roofline is a separate task; the idempotency key is reason-scoped."""
+    prelude = await coord.phase_prelude.enqueue_internal_analysis_task(
+        reason="prelude_initial",
+    )
+    watermark = await coord.phase_prelude.enqueue_internal_analysis_task(
+        reason="explore_keep_watermark",
+    )
+    assert prelude.task_id != watermark.task_id
+    assert "internal-analysis-prelude_initial" in coord.tasks._by_idem
+    assert "internal-analysis-explore_keep_watermark" in coord.tasks._by_idem
+
+
+@pytest.mark.asyncio
+async def test_failed_roofline_does_not_dedup_away_the_retry(coord: Coordinator):
+    """The whole blackout, stated directly."""
+    first = await coord.phase_prelude.enqueue_internal_analysis_task(
+        reason="integrate_keep_watermark",
+    )
+
+    coord.shared_state.roofline_failure_streak = 1
+    retry = await coord.phase_prelude.enqueue_internal_analysis_task(
+        reason="integrate_keep_watermark",
+    )
+
+    assert retry.task_id != first.task_id
+    assert len(coord.tasks._tasks) == 2
+
+
+@pytest.mark.asyncio
+async def test_each_further_failure_earns_its_own_attempt(coord: Coordinator):
+    """Two failures in a row are two distinct retries, not one repeated."""
+    seen = set()
+    for streak in (0, 1, 2):
+        coord.shared_state.roofline_failure_streak = streak
+        task = await coord.phase_prelude.enqueue_internal_analysis_task(
+            reason="integrate_keep_watermark",
+        )
+        seen.add(task.task_id)
+
+    assert len(seen) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_roofline_that_worked_is_never_re_run(coord: Coordinator):
+    """The streak resets to zero on a successful snapshot, so success collapses back onto the original key and stays idempotent across resumes."""
+    coord.shared_state.roofline_failure_streak = 0
+    first = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+    second = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+
+    assert first.task_id == second.task_id
+    assert first.idempotency_key == "internal-analysis-prelude_initial"
+
+
+@pytest.mark.asyncio
+async def test_profile_kind_keeps_the_plain_key(coord: Coordinator):
+    """Only roofline retries; the profile kind has no failure streak to spend."""
+    coord.shared_state.enable_roofline = False
+    coord.shared_state.roofline_failure_streak = 2
+    task = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+
+    assert task.kind == "profile"
+    assert task.idempotency_key == "internal-analysis-prelude_initial"
+
+
+@pytest.mark.parametrize(
+    "named_state,reopens",
+    [
+        ("succeeded", True),
+        ("cancelled", True),
+        # A watchdog-reclaimed roofline reports no result, so the gate release is the only thing that can ever clear
+        # the marker it left.
+        ("failed", True),
+        ("running", False),
+        ("queued", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_watermark_gate_reopens_exactly_when_the_roofline_it_names_finished(
+    coord: Coordinator,
+    named_state: str,
+    reopens: bool,
+):
+    """The gate exists so two rooflines never run at once, so it must hold for every live state and release for every finished one."""
+    state = coord.shared_state
+    state.baseline_tput = 100.0
+    state.cumulative_gain_validated = 50.0
+    state.last_roofline_tput = 0.0
+
+    named = await coord.phase_prelude.enqueue_internal_analysis_task(
+        reason="integrate_keep_watermark",
+    )
+    coord.tasks._tasks[named.task_id].state = named_state
+    state.auto_roofline_pending_task_id = named.task_id
+    state.roofline_failure_streak = 1  # its trace analysis failed
+    assert coord.phase_kernel._needs_roofline_for_watermark() is False
+
+    enqueued = await coord.phase_kernel.maybe_enqueue_watermark_roofline(
+        reason="integrate_keep_watermark",
+    )
+
+    assert enqueued is reopens
+    assert (state.auto_roofline_pending_task_id != named.task_id) is reopens
+
+
+@pytest.mark.asyncio
+async def test_a_second_watermark_crossing_in_a_cycle_runs_a_fresh_roofline(coord: Coordinator):
+    """Each crossing shares its reason; resolving the second onto the first's finished task left KERNEL working from
+    an analysis of a stack the session had already left behind.
+    """
+    state = coord.shared_state
+    state.baseline_tput = 100.0
+    state.auto_roofline_pending_task_id = ""
+    state.last_roofline_tput = 100.0
+    state.cumulative_gain_validated = 20.0
+
+    assert await coord.phase_kernel.maybe_enqueue_watermark_roofline(reason="explore_keep_watermark") is True
+    first = state.auto_roofline_pending_task_id
+    coord.tasks._tasks[first].state = "succeeded"
+    state.last_roofline_tput = 120.0
+    state.cumulative_gain_validated = 150.0
+
+    assert await coord.phase_kernel.maybe_enqueue_watermark_roofline(reason="explore_keep_watermark") is True
+    second = state.auto_roofline_pending_task_id
+    assert second != first
+
+    state.auto_roofline_pending_task_id = ""
+    assert await coord.phase_kernel.maybe_enqueue_watermark_roofline(reason="explore_keep_watermark") is True
+    assert state.auto_roofline_pending_task_id == second
+
+
+def test_watermark_stops_re_arming_once_retries_are_spent(coord: Coordinator):
+    """A roofline leg costs the better part of an hour, so a collector that is broken rather than flaky must not be allowed to spend the session on it."""
+    from hyperloom.orchestrator.phases.kernel import MAX_ROOFLINE_FAILURE_RETRIES
+
+    state = coord.shared_state
+    state.baseline_tput = 100.0
+    state.cumulative_gain_validated = 50.0  # cur = 150, well over the watermark
+    state.last_roofline_tput = 0.0
+    state.auto_roofline_pending_task_id = ""
+
+    state.roofline_failure_streak = MAX_ROOFLINE_FAILURE_RETRIES
+    assert coord.phase_kernel._needs_roofline_for_watermark() is True
+
+    state.roofline_failure_streak = MAX_ROOFLINE_FAILURE_RETRIES + 1
+    assert coord.phase_kernel._needs_roofline_for_watermark() is False
+
+
+@pytest.mark.asyncio
+async def test_a_condemned_stack_enqueues_no_analysis_at_all(coord: Coordinator):
+    """``roofline_failure_streak`` only bounds the watermark path, so a stack that can never produce a GPU trace has
+    to be stopped here instead -- cycle_start and the KERNEL re-profile do not pass through that counter.
+    """
+    coord.shared_state.gpu_trace_unsupported_reason = "no GPU kernels on this stack"
+
+    for reason in ("prelude_initial", "cycle_start", "kernel_entry_g1_abc", "close_post_opt"):
+        assert await coord.phase_prelude.enqueue_internal_analysis_task(reason=reason) is None
+
+    assert coord.tasks._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_watermark_gate_closes_on_a_condemned_stack(coord: Coordinator):
+    """The watermark gate is consulted before the enqueue, so it must agree rather than arm a task that is dropped."""
+    state = coord.shared_state
+    state.baseline_tput = 100.0
+    state.cumulative_gain_validated = 50.0
+    state.last_roofline_tput = 0.0
+    state.auto_roofline_pending_task_id = ""
+    state.roofline_failure_streak = 1  # anchors on baseline_tput, which is what arms the gate
+    assert coord.phase_kernel._needs_roofline_for_watermark() is True
+
+    state.gpu_trace_unsupported_reason = "no GPU kernels on this stack"
+
+    assert coord.phase_kernel._needs_roofline_for_watermark() is False
+    assert await coord.phase_kernel.maybe_enqueue_watermark_roofline(reason="integrate_keep_watermark") is False
+
+
+def test_watermark_roofline_inherits_current_best_args(coord: Coordinator):
+    """Watermark roofline still profiles the optimized current_best config."""
+    coord.shared_state.current_best = {
+        "extra_server_args": "--tp 8 --enable-mla",
+        "extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "1"},
+        "remove_args": ["--old-backend"],
+        "unset_envs": ["OLD_BACKEND"],
+        "args_mode": "replace",
+    }
+
+    task = asyncio.run(
+        coord.phase_prelude.enqueue_internal_analysis_task(reason="explore_keep_watermark"),
+    )
+
+    assert task.params["reason"] == "explore_keep_watermark"
+    assert task.params["base_extra_args"] == "--tp 8 --enable-mla"
+    assert task.params["base_extra_envs"] == {"VLLM_ROCM_USE_AITER_LINEAR": "1"}
+    assert task.params["base_remove_args"] == ["--old-backend"]
+    assert task.params["base_unset_envs"] == ["OLD_BACKEND"]
+    assert task.params["base_args_mode"] == "replace"
+
+
+@pytest.mark.asyncio
+async def test_enable_roofline_false_picks_profile_kind(coord: Coordinator):
+    """When ``enable_roofline`` is False, the task switches kind to ``profile`` keeping the reason-scoped key."""
+    coord.shared_state.enable_roofline = False
+    task = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+    assert task.kind == "profile"
+    assert task.idempotency_key == "internal-analysis-prelude_initial"
+
+
+class _StubSub:
+    """Records tasks handed to ``execute_covered``; optionally lands a fresh snapshot to simulate a completed reprofile."""
+
+    def __init__(self, state: Any = None, landed_tput: float | None = None) -> None:
+        self.tasks_run: list[Any] = []
+        self._state = state
+        self._landed_tput = landed_tput
+
+    async def execute_covered(self, task: Any) -> dict[str, Any]:
+        self.tasks_run.append(task)
+        if self._state is not None and self._landed_tput is not None:
+            self._state.roofline_snapshots.append(
+                {"achieved_tok_per_sec": self._landed_tput},
+            )
+        return {}
+
+
+def _kernel_agent_ctx() -> Any:
+    return SimpleNamespace(task=SimpleNamespace(params={"from_phase": "FRAMEWORK_AGENT"}))
+
+
+@pytest.mark.asyncio
+async def test_kernel_agent_reprofiles_on_change(coord: Coordinator, monkeypatch):
+    """The kernel_agent task (no-GEMM path) reprofiles under its own lease when projected tput (120) diverges from the last measured trace (100), anchoring on the new snapshot."""
+    coord.shared_state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    coord.sub = _StubSub(coord.shared_state, landed_tput=120.0)
+    monkeypatch.setattr(coord.phase_kernel, "geak_enabled", lambda: False)
+    monkeypatch.setattr(coord.phase_kernel, "_gemm_tuning_required_before_kernel_opt", lambda: False)
+    coord.shared_state.cumulative_gain_validated = 20.0  # cur = 100 * 1.20 = 120
+
+    await coord.phase_kernel.run_agent(_kernel_agent_ctx())
+
+    assert len(coord.sub.tasks_run) == 1
+    # The reason carries a profile fingerprint suffix so repeated kernel entries at the same gain stack are
+    # distinguishable in the task log.
+    assert coord.sub.tasks_run[0].params["reason"].startswith("kernel_entry_g0_")
+    assert coord.shared_state.last_roofline_tput == 120.0
+
+
+@pytest.mark.asyncio
+async def test_kernel_agent_skips_gemm_but_still_runs_fusion(coord: Coordinator, monkeypatch):
+    """Disabling GEMM tuning must not disable the independently gated fusion stage."""
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_SKIP_GEMM_TUNING", "1")
+    monkeypatch.setattr(coord.phase_kernel, "geak_enabled", lambda: False)
+    monkeypatch.setattr(coord.phase_kernel, "_fusion_required_before_kernel_opt", lambda: True)
+    assert coord.phase_kernel._gemm_tuning_required_before_kernel_opt() is False
+
+    fusion_calls = 0
+
+    async def _run_fusion() -> None:
+        nonlocal fusion_calls
+        fusion_calls += 1
+
+    async def _skip_reprofile() -> None:
+        return None
+
+    monkeypatch.setattr(coord.phase_kernel, "_run_forge_fusion", _run_fusion)
+    monkeypatch.setattr(coord.phase_kernel, "_maybe_reprofile_for_kernel", _skip_reprofile)
+
+    await coord.phase_kernel.run_agent(_kernel_agent_ctx())
+
+    assert fusion_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_does_not_launch_the_controller_without_a_handoff(
+    coord: Coordinator,
+    monkeypatch,
+) -> None:
+    import hyperloom.orchestrator.kernel.forge_handoff as forge_handoff
+
+    async def _skip() -> None:
+        return None
+
+    launched: list[Path] = []
+
+    async def _controller(handoff_dir: Path, output_dir: Path, baseline_pins: dict[str, str] | None = None) -> None:
+        launched.append(handoff_dir)
+
+    def _unwritable(*_args: Any, **_kwargs: Any) -> Path:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(campaign_baseline, "seal_campaign_baseline", lambda _state, **_kwargs: {})
+    monkeypatch.setattr(forge_handoff, "write_forge_handoff", _unwritable)
+    monkeypatch.setattr(coord.phase_kernel, "_maybe_reprofile_for_kernel", _skip)
+    monkeypatch.setattr(coord.phase_kernel, "_maybe_run_forge_fusion_before_kernel_opt", _skip)
+    monkeypatch.setattr(coord.phase_kernel, "_run_kernel_rewrite_controller", _controller)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        await coord.phase_kernel._finish_kernel_entry()
+    assert launched == []
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_always_hands_rewrite_control_to_controller(
+    coord: Coordinator,
+    monkeypatch,
+) -> None:
+    """Entry writes a handoff and delegates, with no candidate gate in between."""
+
+    async def _skip() -> None:
+        return None
+
+    handed_off: list[tuple[Path, Path]] = []
+    pins_seen: list[dict[str, str]] = []
+
+    async def _controller(
+        handoff_dir: Path,
+        output_dir: Path,
+        baseline_pins: dict[str, str] | None = None,
+    ) -> None:
+        handed_off.append((handoff_dir, output_dir))
+        pins_seen.append(dict(baseline_pins or {}))
+
+    # Sealing commits, and it finds its repositories from the interpreter, so it
+    # would reach whatever framework this host has installed.
+    sealed = campaign_baseline.RepoBaseline(commit="a" * 40)
+    monkeypatch.setattr(
+        campaign_baseline,
+        "seal_campaign_baseline",
+        lambda _state, **_kwargs: {"/repo": sealed},
+    )
+    monkeypatch.setattr(coord.phase_kernel, "_maybe_reprofile_for_kernel", _skip)
+    monkeypatch.setattr(coord.phase_kernel, "_maybe_run_forge_fusion_before_kernel_opt", _skip)
+    monkeypatch.setattr(coord.phase_kernel, "_run_kernel_rewrite_controller", _controller)
+
+    await coord.phase_kernel._finish_kernel_entry()
+    await coord.phase_kernel._finish_kernel_entry()
+
+    attempt_root = coord.session_dir / "kernel-agent" / "forge" / "cycle-0"
+    # Each entry gets its own attempt directory: the controller refuses an output root it has already initialized, so
+    # re-entry cannot reuse the first one.
+    assert handed_off == [
+        (attempt_root / "attempt-0" / "handoff", attempt_root / "attempt-0"),
+        (attempt_root / "attempt-1" / "handoff", attempt_root / "attempt-1"),
+    ]
+    # The base each repository was sealed at travels with the handoff, because
+    # reclaiming a repository after a killed controller needs to know it.
+    assert pins_seen == [{"/repo": sealed}, {"/repo": sealed}]
+    for handoff_dir, _output_dir in handed_off:
+        assert (handoff_dir / "workload.md").is_file()
+        assert (handoff_dir / "serving-context.md").is_file()
+        assert (handoff_dir / "trace-evidence.md").is_file()
+
+
+def test_a_trace_recorded_with_task_params_is_not_stale(coord: Coordinator):
+    """The two writers of ``last_profile_workload`` disagree by construction."""
+    state = coord.shared_state
+    state.current_best = {
+        "extra_server_args": "--block-size 128 --enable-expert-parallel",
+        "extra_envs": {"VLLM_ROCM_USE_AITER": "1"},
+    }
+    state.last_profile_status = "succeeded"
+    state.last_profile_workload = state.profile_workload_context(
+        {
+            "base_extra_args": "--block-size 128 --enable-expert-parallel",
+            "base_extra_envs": {"VLLM_ROCM_USE_AITER": "1"},
+        }
+    )
+    # The record and a freshly built context differ, exactly as in production.
+    assert state.last_profile_workload != state.profile_workload_context()
+
+    assert coord.phase_kernel._profile_workload_changed() is False
+
+
+def test_a_trace_of_a_different_workload_is_still_stale(coord: Coordinator):
+    """Only the parameterization is forgiven; the workload itself still counts."""
+    state = coord.shared_state
+    state.last_profile_status = "succeeded"
+    state.last_profile_workload = state.profile_workload_context()
+    assert coord.phase_kernel._profile_workload_changed() is False
+
+    state.isl = int(state.isl or 0) + 4096
+
+    assert coord.phase_kernel._profile_workload_changed() is True
+
+
+def _recorded_under(state, *, server_args: str, envs: dict) -> None:
+    """Record a profile the way the roofline path does: with the task params."""
+    state.current_best = {"extra_server_args": server_args, "extra_envs": dict(envs)}
+    state.last_profile_status = "succeeded"
+    state.last_profile_workload = state.profile_workload_context(
+        {"base_extra_args": server_args, "base_extra_envs": dict(envs)}
+    )
+
+
+def _reprofiles(coord: Coordinator) -> bool:
+    """Whether the two staleness checks together call for a re-profile."""
+    phase = coord.phase_kernel
+    signature = phase._current_profile_config_signature()
+    return phase._profile_config_changed(signature) or phase._profile_workload_changed()
+
+
+_BASE_ARGS = "--block-size 128 --enable-expert-parallel"
+_BASE_ENVS = {"VLLM_ROCM_USE_AITER": "1"}
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate", "expected"),
+    [
+        ("nothing moved", lambda s: None, False),
+        (
+            "explore added a server arg",
+            lambda s: s.current_best.__setitem__("extra_server_args", _BASE_ARGS + " --max-num-batched-tokens 16384"),
+            True,
+        ),
+        (
+            "explore added an env",
+            lambda s: s.current_best.__setitem__("extra_envs", {**_BASE_ENVS, "VLLM_ROCM_USE_AITER_MOE": "1"}),
+            True,
+        ),
+        (
+            "an env changed value",
+            lambda s: s.current_best.__setitem__("extra_envs", {**_BASE_ENVS, "VLLM_ROCM_USE_AITER": "0"}),
+            True,
+        ),
+        ("the workload changed", lambda s: setattr(s, "isl", int(s.isl or 0) + 4096), True),
+    ],
+)
+def test_serving_config_changes_still_force_a_reprofile(coord: Coordinator, label, mutate, expected):
+    """Forgiving the parameterization must not forgive a real config change."""
+    state = coord.shared_state
+    _recorded_under(state, server_args=_BASE_ARGS, envs=_BASE_ENVS)
+    assert _reprofiles(coord) is False, "the recorded trace starts fresh"
+
+    mutate(state)
+
+    assert _reprofiles(coord) is expected, label
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofile_skips_when_unchanged(coord: Coordinator):
+    """Projected tput matching the last measured trace (cur == measured) skips the reprofile."""
+    coord.shared_state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    coord.sub = _StubSub(coord.shared_state)
+    coord.shared_state.cumulative_gain_validated = 0.0  # cur = 100 == measured
+    coord.shared_state.last_profile_workload = coord.shared_state.current_profile_workload_context()
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert coord.sub.tasks_run == []
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofiles_legacy_trace_without_runtime_fingerprint(
+    coord: Coordinator,
+):
+    """A pre-upgrade trace without runtime metadata is stale and must be refreshed."""
+    coord.shared_state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    coord.shared_state.cumulative_gain_validated = 0.0
+    coord.shared_state.last_profile_workload = {}
+    coord.sub = _StubSub(coord.shared_state, landed_tput=100.0)
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert len(coord.sub.tasks_run) == 1
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofiles_when_backend_context_changes(coord: Coordinator):
+    """A backend/env change invalidates the prior trace even when throughput is unchanged."""
+    state = coord.shared_state
+    state.framework = "vllm"
+    state.precision = "fp8"
+    state.model_path = "/models/qwen"
+    state.tp = 1
+    state.conc = 64
+    state.isl = 1024
+    state.osl = 1024
+    state.max_model_len = 4096
+    state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    state.cumulative_gain_validated = 0.0
+    state.last_profile_workload = state.profile_workload_context(
+        {"base_extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "0"}}
+    )
+    state.current_best = {
+        "extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "1"},
+    }
+    coord.sub = _StubSub(state, landed_tput=100.0)
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert len(coord.sub.tasks_run) == 1
+    assert coord.sub.tasks_run[0].params["base_extra_envs"] == {"VLLM_ROCM_USE_AITER_LINEAR": "1"}
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofile_runs_without_measured_trace(coord: Coordinator):
+    """No measured trace yet (no snapshot) but a non-zero projected gain still reprofiles so GEAK gets a real trace."""
+    coord.shared_state.roofline_snapshots = []
+    coord.sub = _StubSub(coord.shared_state, landed_tput=150.0)
+    coord.shared_state.cumulative_gain_validated = 50.0  # cur = 150
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert len(coord.sub.tasks_run) == 1
+    assert coord.shared_state.last_roofline_tput == 150.0
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofile_the_phase_cannot_fit_does_not_start(coord: Coordinator, monkeypatch):
+    """A reprofile priced above what is left of the KERNEL budget is skipped; the phase keeps the trace it has."""
+    from hyperloom.orchestrator.phases import machine_state
+
+    state = coord.shared_state
+    state.phase = "KERNEL_AGENT"
+    state.baseline_runtime_sec = 600.0
+    monkeypatch.setattr(machine_state, "phase_budget_remaining_seconds", lambda _state, **_kw: 60.0)
+    state.roofline_snapshots = []
+    state.cumulative_gain_validated = 50.0
+    coord.sub = _StubSub(state, landed_tput=150.0)
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert coord.sub.tasks_run == []
+    assert state.last_roofline_tput != 150.0
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofile_swallows_failure(coord: Coordinator):
+    """A reprofile failure is best-effort: it never propagates and the anchor is left untouched."""
+
+    class _RaisingSub:
+        async def execute_covered(self, _task: Any) -> dict[str, Any]:
+            raise RuntimeError("profile crashed")
+
+    coord.shared_state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    coord.sub = _RaisingSub()
+    coord.shared_state.last_roofline_tput = 100.0
+    coord.shared_state.cumulative_gain_validated = 20.0  # cur = 120 != measured 100 → triggers
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()  # must not raise
+
+    assert coord.shared_state.last_roofline_tput == 100.0
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofiles_when_workload_changed_at_same_tput(
+    coord: Coordinator,
+):
+    coord.shared_state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    coord.shared_state.conc = 64
+    coord.shared_state.last_profile_status = "succeeded"
+    coord.shared_state.last_profile_workload = coord.shared_state.profile_workload_context()
+    coord.shared_state.conc = 128
+    coord.sub = _StubSub(coord.shared_state, landed_tput=100.0)
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert len(coord.sub.tasks_run) == 1
+    assert coord.shared_state.last_profile_workload["conc"] == 128
+
+
+@pytest.mark.asyncio
+async def test_kernel_entry_reprofiles_when_backend_config_changed_at_same_tput(
+    coord: Coordinator,
+):
+    coord.shared_state.roofline_snapshots = [{"achieved_tok_per_sec": 100.0}]
+    # The latest trace was profiled under a different backend (triton), recorded in
+    # last_profile_workload['serving_config'] exactly as the roofline executor writes it. last_profile_args stays the
+    # plain-args field it is elsewhere.
+    coord.shared_state.last_profile_status = "succeeded"
+    coord.shared_state.last_profile_workload = {
+        "framework": "sglang",
+        "precision": "fp8",
+        "model_path": "/models/qwen",
+        "tp": 1,
+        "conc": 64,
+        "isl": 1024,
+        "osl": 1024,
+        "max_model_len": 4096,
+        "serving_config": {
+            "engine": "",
+            "extra_server_args": "--attention-backend triton",
+            "extra_envs": {},
+        },
+    }
+    coord.shared_state.current_best = {
+        "extra_server_args": "--attention-backend aiter",
+        "extra_envs": {"AITER_CONFIG_DENSE": "/tmp/dense.csv"},
+    }
+    coord.sub = _StubSub(coord.shared_state, landed_tput=100.0)
+
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+
+    assert len(coord.sub.tasks_run) == 1
+    # After the reprofile the recorded workload reflects the current config (aiter + the new env), so the next entry
+    # sees no config change.
+    assert (
+        coord.shared_state.last_profile_workload["serving_config"]["extra_envs"]["AITER_CONFIG_DENSE"]
+        == "/tmp/dense.csv"
+    )
+
+    coord.sub = _StubSub(coord.shared_state)
+    await coord.phase_kernel._maybe_reprofile_for_kernel()
+    assert coord.sub.tasks_run == []
+
+
+class _LatchBus:
+    """Collects bus messages so the nomination entry can run to completion."""
+
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    async def append_and_seq(self, message: Any) -> None:
+        self.sent.append(message)
+
+
+async def _latch_after(coord: Coordinator, monkeypatch, handler) -> Any:
+    """Run the nomination entry with ``handler`` and return the latch marker."""
+    import hyperloom.orchestrator.kernel.request_handlers as krh
+
+    coord.shared_state.last_trace_analyze = {"candidates_path": "/tmp/kernel_candidates.json"}
+    coord.shared_state.kernel_auto_pass_cycle = None
+    monkeypatch.setattr(krh, "run_optimization_handler", handler)
+    coord.phase_kernel.bus = _LatchBus()
+
+    await coord.phase_kernel._run_kernel_opt_nomination()
+
+    return coord.shared_state.kernel_auto_pass_cycle
+
+
+def test_roofline_watermark_ratio():
+    from hyperloom.orchestrator.phases.kernel import ROOFLINE_WATERMARK_RATIO
+
+    assert ROOFLINE_WATERMARK_RATIO == 1.10
+
+
+_TRACE = "/runs/roofline/t/torch_trace/rank0.trace.json.gz"
+_PROFILED = {"status": "succeeded", "main_trace_path": _TRACE, "workspace": "/runs/roofline/t"}
+_ANALYSED = {"status": "ok", "hot_kernels": [], "trace_health_warnings": []}
+_SPLIT_FAILED = {
+    "status": "failed",
+    "error": "RuntimeError: trace_split_no_steady_state: TraceLens splitter produced no steady-state chunks; "
+    "refusing to run TraceLens analysis on the raw trace",
+}
+_ANALYSIS_TIMED_OUT = {
+    "status": "failed",
+    "error_class": "subprocess_timeout",
+    "error": "TimeoutExpired after 3600s: python tracelens_analysis.py",
+}
+_NO_TRACE_FILES = {
+    "status": "failed",
+    "error_class": "no_trace_files",
+    "error": "no .trace.json.gz or capture sidecar under /runs/roofline/t",
+}
+_TRANSIENT = {
+    "status": "failed",
+    "error_class": "tool_output_unparseable",
+    "error": "tool exited rc=1 but its stdout held no JSON object",
+}
+
+#: (profile result, trace analysis result) of a roofline whose failure recurs on the same configuration.
+_DETERMINISTIC_FAILURES = {
+    "trace_split_no_steady_state": (_PROFILED, _SPLIT_FAILED),
+    "analysis_timeout": (_PROFILED, _ANALYSIS_TIMED_OUT),
+}
+
+
+async def _run_roofline(coord: Coordinator, task: Any, profiled: dict, analysed: dict) -> dict:
+    """Run the real roofline executor on ``task`` with its profile and trace-analysis sub-steps stubbed."""
+    from unittest.mock import patch
+
+    from hyperloom.orchestrator.actions.executors.roofline import RooflineExecutor
+    from hyperloom.orchestrator.loop.sub_agent_runner import RunnerContext
+
+    async def _profile(_ctx: Any) -> dict:
+        return dict(profiled)
+
+    async def _analyse(_payload: dict, *, session_dir: Path) -> dict:
+        return dict(analysed)
+
+    ctx = RunnerContext(task=task, lease=None, extra={"session_dir": str(coord.session_dir)})
+    with (
+        patch("hyperloom.orchestrator.actions.executors.profile.profile_executor", new=_profile),
+        patch("hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler", new=_analyse),
+    ):
+        return await RooflineExecutor(shared_state=coord.shared_state)(ctx)
+
+
+def _past_the_watermark(state: SharedState) -> None:
+    """Arm the watermark gate the way a failed first roofline leaves it."""
+    state.baseline_tput = 100.0
+    state.cumulative_gain_validated = 50.0
+    state.last_roofline_tput = 0.0
+    state.auto_roofline_pending_task_id = ""
+    state.roofline_failure_streak = 1
+
+
+async def _fail_prelude_roofline(coord: Coordinator, profiled: dict, analysed: dict) -> None:
+    task = await coord.phase_prelude.enqueue_internal_analysis_task(reason="prelude_initial")
+    result = await _run_roofline(coord, task, profiled, analysed)
+    assert result["status"] == "failed"
+
+
+@pytest.mark.parametrize("failure", sorted(_DETERMINISTIC_FAILURES))
+@pytest.mark.asyncio
+async def test_a_deterministic_roofline_failure_is_not_re_run_on_the_same_recipe(coord: Coordinator, failure: str):
+    """The cycle-start re-arm re-ran a roofline that had failed on the same launch configuration, holding the GPU
+    lanes for another hour to fail the same way.
+    """
+    state = coord.shared_state
+    state.current_best = {"action": "baseline", "tput": 100.0}
+    await _fail_prelude_roofline(coord, *_DETERMINISTIC_FAILURES[failure])
+
+    for reason in ("cycle_start", "close_post_opt", "kernel_entry_g0_abc"):
+        assert await coord.phase_prelude.enqueue_internal_analysis_task(reason=reason) is None, reason
+    _past_the_watermark(state)
+    assert await coord.phase_kernel.maybe_enqueue_watermark_roofline(reason="integrate_keep_watermark") is False
+
+    dropped = state.phase_history[-1]["evidence"]
+    assert dropped["arm"] == "internal_analysis"
+    assert dropped["repeated_failure"]["failure"] == failure
+
+
+@pytest.mark.asyncio
+async def test_a_keep_re_arms_the_roofline_that_failed(coord: Coordinator):
+    """A new recipe is a new input: the failure on the old one says nothing about it."""
+    state = coord.shared_state
+    state.current_best = {"action": "baseline", "tput": 100.0}
+    await _fail_prelude_roofline(coord, _PROFILED, _SPLIT_FAILED)
+
+    state.current_best = {"action": "explore", "tput": 110.0, "extra_server_args": "--chunked-prefill-size 8192"}
+    state.working_recipe_generation += 1
+
+    task = await coord.phase_prelude.enqueue_internal_analysis_task(reason="cycle_start")
+    assert task is not None
+    assert task.params["base_extra_args"] == "--chunked-prefill-size 8192"
+
+
+@pytest.mark.parametrize(
+    ("profiled", "analysed"),
+    [(_PROFILED, _TRANSIENT), (_NO_TRACE_FILES, _ANALYSED)],
+    ids=["analysis-tool-error", "no-trace-files"],
+)
+@pytest.mark.asyncio
+async def test_a_transient_roofline_failure_keeps_the_streak_retry(coord: Coordinator, profiled: dict, analysed: dict):
+    """Only a failure that recurs on the same input is remembered; anything else retries within the existing cap.
+
+    A profile with no trace files is not proof of a recurring failure: a server that failed to boot reports the same
+    ``no_trace_files``.
+    """
+    state = coord.shared_state
+    state.current_best = {"action": "baseline", "tput": 100.0}
+    await _fail_prelude_roofline(coord, profiled, analysed)
+
+    assert await coord.phase_prelude.enqueue_internal_analysis_task(reason="cycle_start") is not None
+    _past_the_watermark(state)
+    assert await coord.phase_kernel.maybe_enqueue_watermark_roofline(reason="integrate_keep_watermark") is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_baseline_arm_does_not_block_a_current_best_that_moved_off_it(coord: Coordinator):
+    """PRELUDE profiles the baseline's own arguments; once a warm-replay KEEP moved current_best, its failure is not
+    the failure of the configuration the later re-arms profile.
+    """
+    state = coord.shared_state
+    state.current_best = {"action": "replay_warm_recipe", "tput": 120.0, "extra_server_args": "--enable-dp-attention"}
+    state.working_recipe_generation = 1
+    await _fail_prelude_roofline(coord, _PROFILED, _SPLIT_FAILED)
+
+    assert await coord.phase_prelude.enqueue_internal_analysis_task(reason="cycle_start") is not None

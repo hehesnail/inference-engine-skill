@@ -1,0 +1,209 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""AgentX switch (``HYPERLOOM_AGENTX``) materialization tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+import yaml
+
+from hyperloom.orchestrator.actions.executors import _workload_envs as we
+
+_AGENTX_ENV_KEYS = (
+    "HYPERLOOM_AGENTX",
+    "HYPERLOOM_AGENTIC_BACKEND",
+    "AGENTX_DATASET",
+    "AGENTX_CANONICAL_DATASET",
+    "AGENTX_WARMUP_GRACE_PERIOD",
+    "AGENTX_WARMUP_GRACE_CONC",
+    "INFERENCE_OPTIMIZER_EXTRA_ENV",
+    "AGENTX_MAX_CTX",
+    "AGENTX_NUM_ENTRIES",
+    "AGENTX_WARMUP_DURATION",
+    "AGENTX_NUM_WARMUP_SESSIONS",
+    "AGENTX_KEEP_SERVER",
+    "AIPERF_BIN",
+    "WEKA_LOADER_OVERRIDE",
+    "RUN_EVAL",
+    "MODEL_PATH",
+    "PORT",
+    "MLPERF_AGENTIC_FLOW",
+    "AGENTIC_NUM_TRAJECTORIES",
+    "AGENTIC_DATASET_PATH",
+    "MLPERF_TOKENIZER_DIR",
+)
+
+
+def _clear_env(monkeypatch):
+    for k in _AGENTX_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+
+
+def _write(path, **bench_extra):
+    bench = {"framework": "vllm", "model": "/m", "envs": {}}
+    bench.update(bench_extra)
+    path.write_text(yaml.safe_dump({"benchmark": bench}), encoding="utf-8")
+    return path
+
+
+def _materialize(src, out, **kw):
+    res = we.materialize_config_with_envs(src, out, **kw)
+    return yaml.safe_load(res.read_text())["benchmark"]
+
+
+# ── OFF path: zero regression ────────────────────────────────────────────────
+def test_switch_off_keeps_synthetic_script(tmp_path, monkeypatch):
+    _clear_env(monkeypatch)
+    src = _write(tmp_path / "base.yaml")
+    bench = _materialize(src, tmp_path / "out", target=we.BenchmarkTarget(gpu_type="mi300x", model_path="/m"))
+    assert bench["benchmark_script"] == "vllm_mi300x.sh"
+    assert not any(k.startswith("AGENTX") for k in bench.get("envs", {}))
+
+
+def test_switch_off_no_agentx_leakage(tmp_path, monkeypatch):
+    """OFF output must carry no trace of the AgentX feature."""
+    _clear_env(monkeypatch)
+    src = _write(tmp_path / "base.yaml")
+    bench = _materialize(src, tmp_path / "out", target=we.BenchmarkTarget(gpu_type="mi300x", model_path="/m"))
+    dumped = yaml.safe_dump(bench).lower()
+    assert "aiperf" not in dumped
+    assert "agentx" not in dumped
+    assert bench["benchmark_script"] == "vllm_mi300x.sh"
+
+
+# ── ON path: authoritative overwrite + env injection ─────────────────────────
+
+
+def _pin_extra_env(monkeypatch, **pins):
+    """Pin as ``_export_operator_launch_shape`` does: each name in the environment, plus the handoff blob."""
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_EXTRA_ENV", json.dumps(pins))
+    for name, value in pins.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_switch_off_omits_workload_spec(tmp_path, monkeypatch):
+    _clear_env(monkeypatch)
+    src = _write(tmp_path / "base.yaml")
+    bench = _materialize(src, tmp_path / "out", target=we.BenchmarkTarget(gpu_type="mi300x", model_path="/m"))
+    assert "workload_spec" not in bench
+
+
+# ── A3: parsing ──────────────────────────────────────────────────────────────
+
+
+# ── Regression: the shared grid/baseline/profile rebuild path (E1 bug) ────────
+
+
+def test_runtime_overrides_off_keeps_synthetic(monkeypatch):
+    _clear_env(monkeypatch)  # HYPERLOOM_AGENTX cleared => OFF
+    from hyperloom.orchestrator.actions.executors._benchmark_runtime import (
+        apply_runtime_benchmark_overrides,
+    )
+
+    bench = {"framework": "vllm"}
+    apply_runtime_benchmark_overrides(bench, model_path="/m", gpu_type="mi300x")
+    assert bench["benchmark_script"] == "vllm_mi300x.sh"
+
+
+# ── A2: OFF path never imports the agentx package (lazy-import guarantee) ─────
+_PROBE_OFF = """
+import sys
+from pathlib import Path
+from hyperloom.orchestrator.actions.executors import _grid_runner  # noqa: F401
+from hyperloom.common.perf_metric import agentx_enabled
+from hyperloom.orchestrator.actions.executors import _workload_envs as we
+
+assert not agentx_enabled()
+we.materialize_config_with_envs(
+    Path(sys.argv[1]), Path(sys.argv[2]), target=we.BenchmarkTarget(gpu_type="mi300x", model_path="/m")
+)
+leaked = [m for m in sys.modules if m.startswith("hyperloom.inference_optimizer.agentx")]
+assert not leaked, "agentx package imported on OFF path: %r" % (leaked,)
+print("OFF_OK")
+"""
+
+
+def test_agentx_package_not_imported_on_off_path(tmp_path):
+    """A2: the default (OFF) benchmark path must never import the agentx package."""
+    src = tmp_path / "base.yaml"
+    out = tmp_path / "out"
+    src.write_text("benchmark:\n  framework: vllm\n  model: /m\n  envs: {}\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("HYPERLOOM_AGENTX", "AGENTX_", "AIPERF"))}
+    r = subprocess.run(
+        [sys.executable, "-c", _PROBE_OFF, str(src), str(out)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, "stdout=%s\nstderr=%s" % (r.stdout, r.stderr)
+    assert "OFF_OK" in r.stdout
+
+
+_PROBE_CONTRAST = """
+import sys
+
+assert not any(m.startswith("hyperloom.inference_optimizer.agentx") for m in sys.modules)
+from hyperloom.inference_optimizer.agentx.runtime import maybe_prepare_agentx  # noqa: F401
+
+assert any(m.startswith("hyperloom.inference_optimizer.agentx") for m in sys.modules)
+print("CONTRAST_OK")
+"""
+
+
+def test_agentx_package_importable_contrast():
+    """Contrast: the agentx package is real and importable (the ON _grid_runner branch does exactly this lazy import), so the OFF assertion is not vacuous."""
+    r = subprocess.run(
+        [sys.executable, "-c", _PROBE_CONTRAST],
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, "stdout=%s\nstderr=%s" % (r.stdout, r.stderr)
+    assert "CONTRAST_OK" in r.stdout
+
+
+# ── Finding 1: framework injected so the wrapper delegates to the right builtin ─
+
+
+def test_switch_on_mlperf_backend_pins_client_and_port(tmp_path, monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("HYPERLOOM_AGENTX", "1")
+    monkeypatch.setenv("HYPERLOOM_AGENTIC_BACKEND", "mlperf")
+    monkeypatch.setenv("CONC", "16")
+    src = _write(tmp_path / "base.yaml", framework="sglang")
+    bench = _materialize(src, tmp_path / "out", target=we.BenchmarkTarget(gpu_type="mi355x", model_path="/m"))
+    assert bench["benchmark_script"] == "mlperf_agentic_client.sh"
+    spec = bench.get("workload_spec") or {}
+    assert spec.get("client") == "mlperf"
+    assert spec.get("corpus") == "agentic_combined_v6"
+    assert spec.get("num_entries") == 150
+    assert spec.get("flow") == "smoke_test"
+    assert bench["envs"]["PORT"] == "30000"
+    assert bench["envs"]["HYPERLOOM_AGENTIC_BACKEND"] == "mlperf"
+    assert bench["envs"]["AGENTIC_CONCURRENCY"] == "16"
+    assert bench["envs"]["MLPERF_AGENTIC_MODEL"] == "kimi-k3"
+    # Settled here once; the client requires them rather than defaulting its own.
+    assert bench["envs"]["MLPERF_AGENTIC_FLOW"] == "smoke_test"
+    assert bench["envs"]["AGENTIC_NUM_TRAJECTORIES"] == "150"
+    assert "--served-model-name kimi-k3" in bench["envs"]["EXTRA_SGLANG_ARGS"]
+
+
+def test_mlperf_concurrency_follows_the_round_not_the_baseline(tmp_path, monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("HYPERLOOM_AGENTX", "1")
+    monkeypatch.setenv("HYPERLOOM_AGENTIC_BACKEND", "mlperf")
+    monkeypatch.setenv("AGENTIC_CONCURRENCY", "16")
+    src = _write(
+        tmp_path / "base.yaml",
+        framework="sglang",
+        envs={"CONC": 4, "AGENTIC_CONCURRENCY": "16"},
+    )
+    bench = _materialize(
+        src, tmp_path / "out", target=we.BenchmarkTarget(gpu_type="mi355x", model_path="/models/kimi-k3")
+    )
+    assert bench["envs"]["AGENTIC_CONCURRENCY"] == "4"

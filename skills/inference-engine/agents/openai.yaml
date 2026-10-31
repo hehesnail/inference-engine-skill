@@ -1,0 +1,4 @@
+interface:
+  display_name: "推理引擎工作台"
+  short_description: "推理引擎与 GPU kernel 开发、接线、排障、评测和性能分析"
+  default_prompt: "使用 $inference-engine，基于实际版本和当前任务目标完成推理引擎分析、实现或优化，并给出相应证据。"

@@ -1,0 +1,253 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Per-phase time accounting across macro-cycle re-entries."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+
+from hyperloom.orchestrator.phases import machine_state as ps
+from hyperloom.orchestrator.state.shared_state import SharedState
+
+
+SESSION_MINUTES = 24 * 60
+KERNEL_PCT = 0.15
+# Three entries of 3h each.
+ENTRY_SEC = 3 * 3600.0
+# Interleaved SWEEP segment, so KERNEL's total can never be confused with plain wall-clock elapsed since its first
+# entry.
+GAP_SEC = 600.0
+# A real epoch: zero reads as "phase not entered yet" throughout the machine.
+T0 = 1_700_000_000.0
+T0_ISO = "2023-11-14T22:13:20+00:00"
+
+# A 3h session that stopped half an hour into PRELUDE and was resumed 3 days later: long enough that charging the gap
+# to PRELUDE dwarfs the whole budget.
+RESUMED_SESSION_MINUTES = 180
+PRELUDE_LEG_SEC = 1800.0
+IDLE_GAP_SEC = 3 * 24 * 3600.0
+RESUME_UNIX = T0 + PRELUDE_LEG_SEC + IDLE_GAP_SEC
+# What the resumed leg has run by the time the guards are asked.
+NEW_LEG_SEC = 120.0
+
+
+def _iso(at_unix: float) -> str:
+    return datetime.fromtimestamp(at_unix, tz=timezone.utc).isoformat()
+
+
+def _kernel_state() -> SharedState:
+    state = SharedState()
+    state.max_minutes = SESSION_MINUTES
+    state.phase_budget_pct = {ps.PHASE_KERNEL_AGENT: KERNEL_PCT}
+    return state
+
+
+def _enter(state: SharedState, phase: str, at_unix: float) -> None:
+    ps.record_phase_transition(
+        state,
+        to_phase=phase,
+        reason="phase_entered",
+        evidence={},
+        at=ps.PhaseClock(ts="2026-05-19T00:00:00+00:00", ts_unix=at_unix),
+    )
+
+
+def _three_kernel_entries(state: SharedState) -> float:
+    """Run KERNEL -> SWEEP three times; return the unix time after the third exit."""
+    now = T0
+    for _ in range(3):
+        _enter(state, ps.PHASE_KERNEL_AGENT, now)
+        now += ENTRY_SEC
+        _enter(state, ps.PHASE_SWEEP, now)
+        now += GAP_SEC
+    return now
+
+
+def test_cumulative_time_sums_every_entry():
+    state = _kernel_state()
+    now = T0
+    for entry in range(3):
+        _enter(state, ps.PHASE_KERNEL_AGENT, now)
+        exit_at = now + ENTRY_SEC
+        assert ps.phase_elapsed_seconds(state, now_unix=exit_at) == ENTRY_SEC
+        assert ps.phase_cumulative_seconds(state, now_unix=exit_at) == pytest.approx(ENTRY_SEC * (entry + 1))
+        _enter(state, ps.PHASE_SWEEP, exit_at)
+        now = exit_at + GAP_SEC
+
+    assert ps.phase_cumulative_seconds(
+        state,
+        phase=ps.PHASE_KERNEL_AGENT,
+        now_unix=now,
+    ) == pytest.approx(3 * ENTRY_SEC)
+
+    _enter(state, ps.PHASE_KERNEL_AGENT, now)
+    assert ps.phase_elapsed_seconds(state, now_unix=now) == 0.0
+
+
+def test_per_entry_elapsed_keeps_its_meaning():
+    # phase_elapsed_seconds feeds renderers and "time in the current phase" evidence; the cumulative fix must not
+    # change what it reports.
+    state = _kernel_state()
+    now = _three_kernel_entries(state)
+    _enter(state, ps.PHASE_KERNEL_AGENT, now)
+    live = now + 1800.0
+    assert ps.phase_elapsed_seconds(state, now_unix=live) == 1800.0
+    assert ps.phase_cumulative_seconds(state, now_unix=live) == pytest.approx(3 * ENTRY_SEC + 1800.0)
+
+
+def test_phase_budget_remaining_charges_only_the_current_entry():
+    state = _kernel_state()
+    state.start_ts = T0_ISO
+    now = _three_kernel_entries(state)
+    _enter(state, ps.PHASE_KERNEL_AGENT, now)
+
+    total = ps._phase_budget_total_seconds(state, now_unix=now)
+    assert total is not None and total > 0.0
+    # Charge-back already pays for the three banked entries via a smaller `total`, not via a second subtraction on top
+    # of it.
+    assert ps.phase_elapsed_seconds(state, now_unix=now) == 0.0
+    assert ps.phase_budget_remaining_seconds(state, now_unix=now) == pytest.approx(total)
+
+    mid = now + 900.0
+    assert ps.phase_budget_remaining_seconds(state, now_unix=mid) == pytest.approx(
+        ps._phase_budget_total_seconds(state, now_unix=mid) - 900.0
+    )
+
+
+def test_a_macro_cycle_reentry_gets_budget_while_the_session_has_time_left():
+    # An 18h --no-kernel session: FRAMEWORK_AGENT spent 27567s in cycle 0, then cycle_reloop re-entered it with 27584s
+    # of session left.
+    state = SharedState()
+    state.max_minutes = 18 * 60.0
+    state.start_ts = T0_ISO
+    state.phase_budget_pct = {
+        ps.PHASE_PRELUDE: 0.03,
+        ps.PHASE_FRAMEWORK_AGENT: 0.80,
+        ps.PHASE_KERNEL_AGENT: 0.0,
+        ps.PHASE_SWEEP: 0.10555555555555557,
+        ps.PHASE_CLOSE: 0.02,
+    }
+
+    now = T0
+    _enter(state, ps.PHASE_PRELUDE, now)
+    now += 9579.0
+    _enter(state, ps.PHASE_FRAMEWORK_AGENT, now)
+    now += 27567.0
+    _enter(state, ps.PHASE_SWEEP, now)
+    now += 67.0
+    _enter(state, ps.PHASE_FRAMEWORK_AGENT, now)
+
+    assert ps.session_remaining_seconds(state, now_unix=now) > 7 * 3600.0
+    assert ps.phase_budget_remaining_seconds(state, now_unix=now) > 6 * 3600.0
+    assert ps.compute_next_phase(state, now_unix=now) is None
+
+
+def test_totals_accumulate_for_every_phase_not_just_explore():
+    state = SharedState()
+    _enter(state, ps.PHASE_FRAMEWORK_AGENT, T0)
+    _enter(state, ps.PHASE_KERNEL_AGENT, T0 + 100.0)
+    _enter(state, ps.PHASE_SWEEP, T0 + 250.0)
+    _enter(state, ps.PHASE_FRAMEWORK_AGENT, T0 + 300.0)
+
+    assert state.phase_elapsed_totals == {
+        ps.PHASE_FRAMEWORK_AGENT: 100.0,
+        ps.PHASE_KERNEL_AGENT: 150.0,
+        ps.PHASE_SWEEP: 50.0,
+    }
+
+
+def test_fresh_state_has_no_banked_totals():
+    state = SharedState()
+    assert state.phase_elapsed_totals == {}
+    assert ps.phase_cumulative_seconds(state) == 0.0
+
+
+def _resumed_prelude_state() -> SharedState:
+    """A session still in PRELUDE whose previous leg stopped 3 days ago."""
+    import hyperloom.orchestrator.phases.machine_state as ps
+
+    state = SharedState()
+    state.max_minutes = RESUMED_SESSION_MINUTES
+    state.phase = ps.PHASE_PRELUDE
+    state.phase_started_unix = T0
+    state.resumed_ts = _iso(RESUME_UNIX)
+    state.phase_budget_pct = ps.normalize_budget_pct(None)
+    return state
+
+
+def test_a_resume_does_not_charge_the_phase_for_the_gap_it_was_not_running():
+    # phase_started_unix is only rewritten on a phase transition, and exiting the process is not one, so the current
+    # entry spans both legs.
+    state = _resumed_prelude_state()
+    now = RESUME_UNIX + NEW_LEG_SEC
+
+    assert ps.phase_elapsed_seconds(state, now_unix=now) == pytest.approx(NEW_LEG_SEC)
+    assert ps.phase_cumulative_seconds(state, now_unix=now) == pytest.approx(NEW_LEG_SEC)
+
+
+def test_the_charge_back_base_of_a_resumed_phase_stays_inside_the_session():
+    # The crash / recorded-stop branch re-anchors start_ts, so the session clock restarts.
+    state = _resumed_prelude_state()
+    state.start_ts = state.resumed_ts
+    now = RESUME_UNIX + NEW_LEG_SEC
+
+    budget = ps.normalize_budget_pct(None)
+    denom = sum(pct for pct in budget.values() if pct > 0.0)
+    session_sec = RESUMED_SESSION_MINUTES * 60.0
+    total = ps._phase_budget_total_seconds(state, now_unix=now)
+
+    assert total == pytest.approx(session_sec * budget[ps.PHASE_PRELUDE] / denom)
+
+
+def test_a_kept_budget_anchor_charges_the_resumed_phase_the_smaller_base():
+    # The clean-stop branch keeps start_ts, so the session stays charged for the idle gap while the phase clock no
+    # longer is.
+    idle_gap = 3600.0
+    state = _resumed_prelude_state()
+    state.start_ts = T0_ISO
+    state.resumed_ts = _iso(T0 + PRELUDE_LEG_SEC + idle_gap)
+    now = T0 + PRELUDE_LEG_SEC + idle_gap + NEW_LEG_SEC
+
+    budget = ps.normalize_budget_pct(None)
+    denom = sum(pct for pct in budget.values() if pct > 0.0)
+    base = RESUMED_SESSION_MINUTES * 60.0 - (PRELUDE_LEG_SEC + idle_gap)
+    total = ps._phase_budget_total_seconds(state, now_unix=now)
+
+    assert total == pytest.approx(base * budget[ps.PHASE_PRELUDE] / denom)
+
+
+def test_a_later_phase_entry_supersedes_the_resume_boundary():
+    # The leg boundary only floors the entry it interrupted; once the phase is re-entered its own stamp is the later
+    # of the two.
+    state = _resumed_prelude_state()
+    _enter(state, ps.PHASE_FRAMEWORK_AGENT, RESUME_UNIX + NEW_LEG_SEC)
+
+    assert state.phase_elapsed_totals[ps.PHASE_PRELUDE] == pytest.approx(NEW_LEG_SEC)
+    assert ps.phase_elapsed_seconds(
+        state,
+        now_unix=RESUME_UNIX + NEW_LEG_SEC + 180.0,
+    ) == pytest.approx(180.0)
+
+
+def test_budget_exit_evidence_reports_the_time_it_judged_on():
+    state = _kernel_state()
+    state.max_minutes = 180
+    state.start_ts = T0_ISO
+    # Kernel work stays pending so the budget guard, not the settled-kernel exit, decides.
+    state.pending_kernel_integrations = {
+        "i1": {"kernel_id": "k1", "status": "pending", "source_file": "a.py", "task_key": "t1"},
+    }
+    state.phase_elapsed_totals = {ps.PHASE_KERNEL_AGENT: 2 * ENTRY_SEC}
+    state.phase = ps.PHASE_KERNEL_AGENT
+    state.phase_started_unix = T0
+
+    out = ps.compute_next_phase(state, now_unix=T0 + ENTRY_SEC)
+
+    assert out is not None
+    target, reason, evidence = out
+    assert (target, reason) == (ps.PHASE_SWEEP, "kernel_phase_budget_exhausted")
+    assert evidence["entry_elapsed_seconds"] == pytest.approx(ENTRY_SEC)
+    assert evidence["cumulative_elapsed_seconds"] == pytest.approx(3 * ENTRY_SEC)

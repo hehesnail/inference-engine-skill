@@ -1,0 +1,367 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""PR-A3 (Arbor-into-Hyperloom): multi-emit concurrent specialist dispatch."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from hyperloom.orchestrator.state.task_registry import TaskSpec
+
+
+async def _build_coord_with_capacity(
+    tmp_path: Path,
+    *,
+    capacity: int,
+    gpu_specialist_capacity: int = 0,
+    monkeypatch=None,
+):
+    """Build a minimal Coordinator with the requested research_lane capacity."""
+    from hyperloom.orchestrator.roles.agent_role import default_role_registry
+    from hyperloom.orchestrator.roles.mock_backend import (
+        MockBackend,
+        MockTurn,
+        ScriptedPlan,
+    )
+    from hyperloom.orchestrator.loop.coordinator import AdvisoryServices, Coordinator
+    from hyperloom.orchestrator.state.shared_state import SharedState
+
+    # Clear GPU-pool env so tests resolve a deterministic [0..capacity-1] pool.
+    if monkeypatch is not None:
+        for _var in (
+            "TP",
+            "ROCR_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "CUDA_VISIBLE_DEVICES",
+            "INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES",
+        ):
+            monkeypatch.delenv(_var, raising=False)
+
+    # SharedState pre-write so Coordinator picks the capacity at construction.
+    state = SharedState(session_id=f"concurrent-{capacity}")
+    state.research_lane_capacity = capacity
+    state.gpu_specialist_capacity = gpu_specialist_capacity
+    state.save(tmp_path)
+
+    idle_plan = ScriptedPlan(turns=[MockTurn(intents=[])])
+    backends = {
+        "orchestration": MockBackend(idle_plan),
+        "critic": MockBackend(idle_plan),
+    }
+    return Coordinator(
+        session_dir=tmp_path,
+        backends=backends,
+        role_registry=default_role_registry(),
+        advisory=AdvisoryServices(knowledge_plane=None),
+    )
+
+
+async def _pump_until_drained(coord) -> None:
+    """Pump until nothing is queued or in flight; each pump returns on its first completion."""
+    while await coord.tasks.queued() or coord.dispatcher._inflight_actions:
+        await coord.dispatcher.pump_dispatcher_once()
+
+
+class _ConcurrencyProbe:
+    """Captures per-task entry/exit times to detect actual parallelism."""
+
+    def __init__(
+        self, sleep_seconds: float = 0.2, *, expected_concurrency: int | None = None, wait_timeout: float = 10.0
+    ):
+        self.sleep_seconds = sleep_seconds
+        self.expected_concurrency = expected_concurrency
+        self.wait_timeout = wait_timeout
+        self.entries: list[tuple[str, float]] = []
+        self.exits: list[tuple[str, float]] = []
+        self.gpu_ids_by_task: dict[str, list[int]] = {}
+        self._lock = asyncio.Lock()
+        self._wave_ready = asyncio.Event()
+        self._wave_entries = 0
+
+    async def __call__(self, ctx) -> dict:
+        async with self._lock:
+            self.entries.append((ctx.task.task_id, time.monotonic()))
+            self.gpu_ids_by_task[ctx.task.task_id] = list((ctx.extra or {}).get("gpu_ids") or [])
+            wave_ready = self._wave_ready
+            if self.expected_concurrency is not None:
+                self._wave_entries += 1
+                if self._wave_entries == self.expected_concurrency:
+                    wave_ready.set()
+                    self._wave_ready = asyncio.Event()
+                    self._wave_entries = 0
+        if self.expected_concurrency is not None:
+            await asyncio.wait_for(wave_ready.wait(), timeout=self.wait_timeout)
+        await asyncio.sleep(self.sleep_seconds)
+        async with self._lock:
+            self.exits.append((ctx.task.task_id, time.monotonic()))
+        return {
+            "runner_status": "succeeded",
+            "task_id": ctx.task.task_id,
+            "domain": "serving_specialist",
+            "gap_canonical_id": ctx.task.params.get("gap_canonical_id", ""),
+            "specialist_done": {
+                "gap_canonical_id": ctx.task.params.get("gap_canonical_id", ""),
+                "domain": "serving_specialist",
+                "proposal_set": [],
+                "summary": "concurrency-probe noop",
+                "reason": "test",
+                "confidence": 0.0,
+                "new_findings": [],
+                "residual_questions": [],
+            },
+            "workspace": "",
+            "transcript_path": "",
+            "done_path": "",
+            "error": None,
+            "notes": [],
+        }
+
+
+def _max_concurrent(entries: list[tuple[str, float]], exits: list[tuple[str, float]]) -> int:
+    """Compute peak concurrency from entry/exit timestamps."""
+    events: list[tuple[float, int]] = []
+    for _, t in entries:
+        events.append((t, 1))
+    for _, t in exits:
+        events.append((t, -1))
+    events.sort()
+    peak = 0
+    cur = 0
+    for _, delta in events:
+        cur += delta
+        peak = max(peak, cur)
+    return peak
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("participants, capacity", [(3, 3), (4, 1)], ids=["missing-participant", "serial"])
+async def test_concurrency_probe_rejects_insufficient_concurrency(participants: int, capacity: int):
+    probe = _ConcurrencyProbe(sleep_seconds=0, expected_concurrency=4, wait_timeout=0.05)
+    slots = asyncio.Semaphore(capacity)
+
+    async def _run(index):
+        async with slots:
+            ctx = SimpleNamespace(task=SimpleNamespace(task_id=str(index), params={}), extra={})
+            return await probe(ctx)
+
+    tasks = [asyncio.create_task(_run(i)) for i in range(participants)]
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+        assert sum(isinstance(result, asyncio.TimeoutError) for result in results) == 3
+        assert len(probe.entries) == participants
+        assert len(probe.exits) == participants - 3
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_concurrency_probe_requires_a_fresh_second_wave():
+    probe = _ConcurrencyProbe(sleep_seconds=0.01, expected_concurrency=2)
+    contexts = [SimpleNamespace(task=SimpleNamespace(task_id=str(i), params={}), extra={}) for i in range(4)]
+    tasks = [asyncio.create_task(probe(ctx)) for ctx in contexts[:2]]
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+        tasks.append(asyncio.create_task(probe(contexts[2])))
+        await asyncio.sleep(0.4)
+        assert len(probe.exits) == 2
+        tasks.append(asyncio.create_task(probe(contexts[3])))
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+        assert len(probe.entries) == len(probe.exits) == 4
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_entry_delay", [0.0, 0.4], ids=["default", "staggered"])
+async def test_dispatcher_runs_four_specialists_concurrently(tmp_path: Path, late_entry_delay: float):
+    """capacity=4 with 4 queued specialists runs all 4 at once (peak concurrency 4)."""
+    coord = await _build_coord_with_capacity(tmp_path, capacity=4)
+    probe = _ConcurrencyProbe(sleep_seconds=0.3, expected_concurrency=4)
+    first_entry = asyncio.Event()
+
+    async def _staggered_probe(ctx):
+        if ctx.task.params["gap_canonical_id"] == "gap.test.3":
+            await first_entry.wait()
+            await asyncio.sleep(late_entry_delay)
+        else:
+            first_entry.set()
+        return await probe(ctx)
+
+    coord.sub.register_executor("specialist", _staggered_probe)
+
+    for i in range(4):
+        await coord.tasks.create_or_return_existing(
+            TaskSpec(
+                kind="specialist",
+                params={
+                    "domain": "serving_specialist",
+                    "gap_canonical_id": f"gap.test.{i}",
+                    "max_turns": 2,
+                },
+                idempotency_key=f"concurrent-t-{i}",
+                requires_lanes=["research_lane"],
+            ),
+        )
+
+    await _pump_until_drained(coord)
+
+    assert len(probe.entries) == 4
+    assert len(probe.exits) == 4
+
+    # Peak concurrency (from overlapping entry/exit intervals) is the authoritative, deterministic proof of parallel
+    # dispatch: if the 4 tasks serialised, peak would be 1.
+    peak = _max_concurrent(probe.entries, probe.exits)
+    assert peak == 4, f"expected peak concurrency 4 (capacity=4 with 4 queued), got {peak}"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_caps_concurrency_at_capacity_when_more_queued(
+    tmp_path: Path,
+):
+    """capacity=2 with 4 queued: all 4 drain but never above peak concurrency 2 (the lane-capacity invariant), re-dispatching as a slot frees."""
+    coord = await _build_coord_with_capacity(tmp_path, capacity=2)
+    probe = _ConcurrencyProbe(sleep_seconds=0.3, expected_concurrency=2)
+    coord.sub.register_executor("specialist", probe)
+
+    for i in range(4):
+        await coord.tasks.create_or_return_existing(
+            TaskSpec(
+                kind="specialist",
+                params={
+                    "domain": "serving_specialist",
+                    "gap_canonical_id": f"gap.test.{i}",
+                    "max_turns": 2,
+                },
+                idempotency_key=f"capped-t-{i}",
+                requires_lanes=["research_lane"],
+            ),
+        )
+
+    await _pump_until_drained(coord)
+
+    # All four eventually run ...
+    assert len(probe.entries) == 4
+    assert len(probe.exits) == 4
+    # ... but never more than `capacity` at once.
+    peak = _max_concurrent(probe.entries, probe.exits)
+    assert peak == 2, f"expected peak concurrency 2 (capacity=2), got {peak}"
+    assert not await coord.tasks.queued()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_capacity_one_serialises(tmp_path: Path):
+    """capacity=1 serialises execution (peak concurrency 1) while still draining the whole queue."""
+    coord = await _build_coord_with_capacity(tmp_path, capacity=1)
+    probe = _ConcurrencyProbe(sleep_seconds=0.1)
+    coord.sub.register_executor("specialist", probe)
+
+    for i in range(3):
+        await coord.tasks.create_or_return_existing(
+            TaskSpec(
+                kind="specialist",
+                params={
+                    "domain": "serving_specialist",
+                    "gap_canonical_id": f"gap.test.{i}",
+                    "max_turns": 2,
+                },
+                idempotency_key=f"serial-t-{i}",
+                requires_lanes=["research_lane"],
+            ),
+        )
+
+    await _pump_until_drained(coord)
+    assert len(probe.entries) == 3
+    peak = _max_concurrent(probe.entries, probe.exits)
+    assert peak == 1, f"expected serial execution (peak 1), got {peak}"
+    assert not await coord.tasks.queued()
+
+
+@pytest.mark.asyncio
+async def test_gpu_specialist_pool_limits_concurrency_even_when_research_lane_free(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """GPU-specialist pool capacity 1 caps GPU concurrency at 1 even when the research_lane has headroom; both tasks drain serially, reusing GPU id 0."""
+    coord = await _build_coord_with_capacity(
+        tmp_path,
+        capacity=2,
+        gpu_specialist_capacity=1,
+        monkeypatch=monkeypatch,
+    )
+    probe = _ConcurrencyProbe(sleep_seconds=0.1)
+    coord.sub.register_executor("specialist", probe)
+
+    for i in range(2):
+        await coord.tasks.create_or_return_existing(
+            TaskSpec(
+                kind="specialist",
+                params={
+                    "domain": "serving_specialist",
+                    "gap_canonical_id": f"gap.gpu.{i}",
+                    "max_turns": 2,
+                    "needs_gpu": True,
+                    "gpu_count": 1,
+                },
+                idempotency_key=f"gpu-t-{i}",
+                requires_lanes=["research_lane"],
+            ),
+        )
+
+    await _pump_until_drained(coord)
+
+    # Both ran (drained), but GPU concurrency never exceeded the pool cap of 1.
+    assert len(probe.entries) == 2
+    peak = _max_concurrent(probe.entries, probe.exits)
+    assert peak == 1, f"expected GPU concurrency 1, got {peak}"
+    for _task_id, gpu_ids in probe.gpu_ids_by_task.items():
+        assert gpu_ids == [0]
+    assert not await coord.tasks.queued()
+
+
+def test_cli_default_research_lane_capacity_is_ceiling(monkeypatch):
+    """The default ``--research-lane-capacity`` is the GPU-derived ceiling (2 × visible GPU)."""
+    from hyperloom.common import visible_devices
+    from hyperloom.inference_optimizer import cli as cli_mod
+    from hyperloom.orchestrator.policy import gate as policy_mod
+
+    monkeypatch.setattr(visible_devices, "detect_gpu_count", lambda: 4)
+    monkeypatch.setattr(policy_mod, "detect_gpu_count", lambda: 4)
+    parser = cli_mod._build_parser()
+    args = parser.parse_args(["optimize", "--model", "/tmp/dummy"])
+    assert args.research_lane_capacity == policy_mod.research_lane_ceiling()
+    assert args.research_lane_capacity == 8
+    # GPU specialists default on at whole-machine capacity; env=0 disables.
+    assert args.gpu_specialist_capacity == 4
+
+
+def test_cli_clamps_research_lane_capacity_above_ceiling(tmp_path, monkeypatch):
+    """An operator value above the GPU-derived ceiling is clamped down in SharedState."""
+    from hyperloom.common import visible_devices
+    from hyperloom.inference_optimizer import cli as cli_mod
+    from hyperloom.inference_optimizer.cli.bootstrap import LaunchPlatform, _seed_shared_state
+    from hyperloom.orchestrator.policy import gate as policy_mod
+
+    monkeypatch.setattr(visible_devices, "detect_gpu_count", lambda: 4)
+    monkeypatch.setattr(policy_mod, "detect_gpu_count", lambda: 4)
+
+    args = cli_mod._build_parser().parse_args(
+        ["optimize", "--model", "/tmp/dummy-model", "--research-lane-capacity", "32"]
+    )
+    state = _seed_shared_state(
+        session_dir=tmp_path,
+        args=args,
+        session_id="clamp-test",
+        framework="sglang",
+        platform=LaunchPlatform(compute_partition={}, gpu_power_settings={}),
+    )
+    assert policy_mod.research_lane_ceiling() == 8
+    assert state.research_lane_capacity == 8

@@ -1,0 +1,248 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Warm-replay BORROWED config-donor trustworthiness gate."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from hyperloom.orchestrator.knowledge.recipe_kb_t0 import (
+    _build_warm_start_context,
+    _cascade_warm_start_search,
+    _donor_is_trustworthy,
+    _find_config_donor,
+    WarmMatch,
+)
+
+
+def _donor(
+    *,
+    canonical_id: str = "donor-cid",
+    arch: list[str] | None = None,
+    model_type: str = "qwen2",
+    gain: float = 12.5,
+    hardware: str = "mi300x",
+    framework_version: str = "1.2.5",
+    precision: str = "bf16",
+    conc: Any = 64,
+    isl: Any = 128,
+    osl: Any = 128,
+    with_config: bool = True,
+) -> dict[str, Any]:
+    """Build a minimal donor recipe row for gate tests."""
+    row: dict[str, Any] = {
+        "canonical_id": canonical_id,
+        "architectures": ["Qwen2ForCausalLM"] if arch is None else arch,
+        "model_type": model_type,
+        "hardware": hardware,
+        "framework_version": framework_version,
+        "precision": precision,
+        "validated_gain_pct": gain,
+        "conc": conc,
+        "isl": isl,
+        "osl": osl,
+    }
+    if with_config:
+        row["best_config"] = {"extra_server_args": "--enable-foo", "extra_envs": {"X": "1"}}
+    return row
+
+
+_TARGET_IDENTITY = {"architectures": "qwen2forcausallm", "model_type": "qwen2"}
+_TARGET_SHAPE = {"conc": 64, "isl": 128, "osl": 128}
+
+
+def test_trustworthy_donor_accepted() -> None:
+    assert _donor_is_trustworthy(_donor(), _TARGET_IDENTITY, _TARGET_SHAPE) is True
+
+
+def test_donor_identity_falls_back_to_canonical_id() -> None:
+    donor = _donor(canonical_id=("inference:checkpoint:mi300x:sglang:qwen2:qwen2forcausallm:1.2.5:bf16"))
+    donor.pop("architectures")
+    donor.pop("model_type")
+
+    assert _donor_is_trustworthy(donor, _TARGET_IDENTITY, _TARGET_SHAPE) is True
+
+
+def test_explicit_zero_donor_confidence_is_preserved() -> None:
+    context = _build_warm_start_context(
+        match=WarmMatch({}, "exact", 1.0),
+        canonical_id="self-cid",
+        source="recipe-kb",
+        config_donor=WarmMatch(_donor(), "kg_cross_model", 0.0),
+    )
+
+    assert context["recommended_replay"]["config_confidence"] == 0.0
+
+
+class _StubKB:
+    """A search-only KB stub returning a fixed donor row list."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+
+    def search(self, *, label_match: dict[str, Any], limit: int = 10) -> list[dict[str, Any]]:
+        return list(self._rows)
+
+
+class _BatchKB:
+    """Return one result batch per degradation tier."""
+
+    def __init__(self, batches: list[list[dict[str, Any]]]) -> None:
+        self._batches = list(batches)
+
+    def search(
+        self,
+        *,
+        label_match: dict[str, Any],
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self._batches.pop(0) if self._batches else []
+
+
+def _find_identity(**over: Any) -> dict[str, Any]:
+    base = {
+        "canonical_id": "self-cid",
+        "hardware": "mi300x",
+        "framework_name": "sglang",
+        "model_type": "qwen2",
+        "architectures": "qwen2forcausallm",
+        "framework_version": "v1",
+        "precision": "bf16",
+    }
+    base.update(over)
+    return base
+
+
+def test_find_config_donor_skips_untrustworthy() -> None:
+    kb = _StubKB(
+        [
+            _donor(canonical_id="untrusted", gain=0.0),
+            _donor(canonical_id="trusted", gain=20.0),
+        ]
+    )
+    donor, tier, conf = _find_config_donor(kb, _find_identity(), _TARGET_SHAPE)
+    assert donor is not None
+    assert donor["validated_gain_pct"] == 20.0
+    assert tier == "same_arch_class"
+    assert conf == 0.95
+
+
+def test_find_config_donor_queries_canonical_framework_name() -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _CaptureKB:
+        def search(self, **kwargs: Any) -> list[dict[str, Any]]:
+            calls.append(dict(kwargs))
+            return [_donor(gain=20.0)]
+
+    donor, _tier, _confidence = _find_config_donor(_CaptureKB(), _find_identity(), _TARGET_SHAPE)
+
+    assert donor is not None
+    assert calls[0]["label_match"]["framework_name"] == "sglang"
+    assert "framework" not in calls[0]["label_match"]
+
+
+def test_find_config_donor_returns_none_when_all_untrustworthy() -> None:
+    kb = _StubKB([_donor(gain=0.0), _donor(arch=["LlamaForCausalLM"], gain=30.0)])
+    donor, tier, conf = _find_config_donor(kb, _find_identity(), _TARGET_SHAPE)
+    assert donor is None
+    assert tier == ""
+    assert conf == 0.0
+
+
+def test_find_config_donor_skips_self_cid() -> None:
+    kb = _StubKB([_donor(gain=20.0)])
+    donor, _tier, _conf = _find_config_donor(kb, _find_identity(canonical_id="donor-cid"), _TARGET_SHAPE)
+    assert donor is None
+
+
+def test_find_config_donor_uses_framework_version_fallback() -> None:
+    compatible = _donor(
+        hardware="mi325x",
+        framework_version="1.2.4",
+        gain=20.0,
+    )
+    kb = _BatchKB([[], [], [compatible]])
+
+    donor, tier, conf = _find_config_donor(
+        kb,
+        _find_identity(hardware="mi300x", framework_version="1.2.5"),
+        _TARGET_SHAPE,
+    )
+
+    assert donor is compatible
+    assert (tier, conf) == ("compatible_framework_version", 0.72)
+
+
+def test_remote_cascade_skips_unproven_and_wrong_structure() -> None:
+    exact = {
+        "canonical_id": "self-cid",
+        "replayable": False,
+        "what_worked": [{"name": "target-prior"}],
+        "sessions": [{"gain_pct": 80.0}],
+        "validated_gain_pct": 80.0,
+    }
+    unproven = {
+        **_donor(gain=0.0),
+        "canonical_id": "unproven",
+        "replayable": True,
+        "view_source": "current",
+    }
+    empty = {
+        **_donor(gain=25.0, with_config=False),
+        "canonical_id": "empty",
+        "replayable": True,
+        "view_source": "current",
+        "replay_config_available": False,
+    }
+    wrong_structure = {
+        **_donor(arch=["LlamaForCausalLM"], gain=30.0),
+        "canonical_id": "wrong-structure",
+        "replayable": True,
+        "view_source": "current",
+    }
+    selected = {
+        **_donor(gain=12.0),
+        "canonical_id": "selected",
+        "replayable": True,
+        "view_source": "current",
+        "sessions": [{"gain_pct": 12.0}],
+    }
+
+    class _RemoteKB:
+        def __init__(self) -> None:
+            self.selected: list[str] = []
+
+        def get_recipe(self, *, canonical_id: str) -> dict[str, Any]:
+            return exact
+
+        def search(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [empty, unproven, wrong_structure, selected]
+
+        def select_candidate(self, row: dict[str, Any]) -> bool:
+            self.selected.append(str(row["canonical_id"]))
+            return True
+
+    kb = _RemoteKB()
+    row, tier, confidence = _cascade_warm_start_search(
+        kb,  # type: ignore[arg-type]
+        cid="self-cid",
+        identity=_find_identity(),
+        shape=_TARGET_SHAPE,
+    )
+
+    assert row["canonical_id"] == "selected"
+    assert row["validated_gain_pct"] == 12.0
+    assert row["sessions"][0]["gain_pct"] == 12.0
+    assert row["exact_history"]["validated_gain_pct"] == 80.0
+    assert row["exact_history"]["sessions"][0]["gain_pct"] == 80.0
+    assert tier == "same_arch_class"
+    assert confidence == 0.95
+    assert kb.selected == ["selected"]
+    context = _build_warm_start_context(
+        match=WarmMatch(row, tier, confidence),
+        canonical_id="self-cid",
+        source="kb-store",
+    )
+    assert context["proven_prior"] == [{"name": "target-prior"}]

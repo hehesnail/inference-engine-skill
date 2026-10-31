@@ -1,0 +1,245 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Coverage for machine_state pure helpers: escalate hints, budget normalization, time/budget remaining math,
+post-prelude target, and history-row builder.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hyperloom.orchestrator.phases import machine_state as ps
+from hyperloom.orchestrator.state.shared_state import ESCALATE_HINT_VOCAB, SharedState, is_valid_escalate_hint
+
+
+def test_is_valid_escalate_hint() -> None:
+    assert is_valid_escalate_hint("not-a-real-hint") is False
+    # at least one vocab member should validate
+    some_vocab = next(iter(ESCALATE_HINT_VOCAB))
+    assert is_valid_escalate_hint(some_vocab) is True
+
+
+def test_normalize_budget_pct_defaults_and_filters() -> None:
+    assert ps.normalize_budget_pct(None) == dict(ps.DEFAULT_PHASE_BUDGET_PCT)
+    out = ps.normalize_budget_pct(
+        {
+            ps.PHASE_FRAMEWORK_AGENT: 0.4,
+            "BOGUS_PHASE": 0.5,  # unknown phase dropped
+            ps.PHASE_KERNEL_AGENT: "bad",  # non-numeric dropped
+            ps.PHASE_SWEEP: 2.0,  # out of (0,1] dropped
+        }
+    )
+    assert out[ps.PHASE_FRAMEWORK_AGENT] == 0.4
+    assert "BOGUS_PHASE" not in out
+    # A dropped entry falls back to its default rather than vanishing: a capped phase with no share would run to
+    # whatever it costs. ENABLEMENT carries no default, so it stays absent and uncapped.
+    assert set(out) == set(ps.DEFAULT_PHASE_BUDGET_PCT)
+    assert ps.PHASE_ENABLEMENT not in out
+    assert out[ps.PHASE_SWEEP] == ps.DEFAULT_PHASE_BUDGET_PCT[ps.PHASE_SWEEP]
+
+
+def test_now_unix_injected() -> None:
+    state = SharedState()
+    state._now_unix = lambda: 1234.0  # type: ignore[attr-defined]
+    assert ps._now_unix(state) == 1234.0
+
+
+def test_phase_started_unix_bad_value() -> None:
+    assert ps._phase_started_unix(SharedState(phase_started_unix="bad")) == 0.0
+    assert ps._phase_started_unix(SharedState(phase_started_unix=10.0)) == 10.0
+
+
+def test_pending_escalate_hint() -> None:
+    valid = next(iter(ESCALATE_HINT_VOCAB))
+    assert ps._pending_escalate_hint(SharedState(pending_escalate_hint=valid)) == valid
+    assert ps._pending_escalate_hint(SharedState(pending_escalate_hint="garbage")) == ""
+    assert ps._pending_escalate_hint(SharedState(pending_escalate_hint="")) == ""
+
+
+def test_max_minutes_coercion() -> None:
+    assert ps._max_minutes(SharedState(max_minutes=30)) == 30.0
+    assert ps._max_minutes(SharedState(max_minutes="bad")) == 0.0
+    assert ps._max_minutes(SharedState(max_minutes=0)) == 0.0
+
+
+def test_phase_elapsed_seconds() -> None:
+    # not started -> 0
+    assert ps.phase_elapsed_seconds(SharedState(phase_started_unix=0.0)) == 0.0
+    # started -> now - started, clamped non-negative.
+    state = SharedState(phase_started_unix=100.0)
+    assert ps.phase_elapsed_seconds(state, now_unix=160.0) == 60.0
+    assert ps.phase_elapsed_seconds(state, now_unix=50.0) == 0.0
+
+
+def test_phase_budget_remaining_seconds() -> None:
+    # unlimited -> None
+    assert ps.phase_budget_remaining_seconds(SharedState(max_minutes=0)) is None
+    # phase not in the budget map -> None
+    state = SharedState(
+        max_minutes=60,
+        phase="UNKNOWN_PHASE",
+        start_ts="",
+        phase_started_unix=0.0,
+        phase_budget_pct={ps.PHASE_FRAMEWORK_AGENT: 0.5},
+    )
+    assert ps.phase_budget_remaining_seconds(state) is None
+    # 60min * 0.5 = 1800s budget, minus elapsed.
+    state2 = SharedState(
+        max_minutes=60,
+        phase=ps.PHASE_FRAMEWORK_AGENT,
+        start_ts="",
+        phase_started_unix=1000.0,
+        phase_budget_pct={ps.PHASE_FRAMEWORK_AGENT: 0.5},
+    )
+    rem = ps.phase_budget_remaining_seconds(state2, now_unix=1300.0)
+    assert rem == pytest.approx(1800.0 - 300.0)
+
+
+def test_session_remaining_seconds() -> None:
+    assert ps.session_remaining_seconds(SharedState(max_minutes=0)) is None
+    # Nothing dates the session: no charge, no anchor, no stamp.
+    assert (
+        ps.session_remaining_seconds(
+            SharedState(max_minutes=60, start_ts=""),
+        )
+        is None
+    )
+    # bad ts -> None
+    assert (
+        ps.session_remaining_seconds(
+            SharedState(max_minutes=60, start_ts="not-a-date"),
+        )
+        is None
+    )
+    # valid recent start -> positive remaining
+    from datetime import datetime, timezone
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rem = ps.session_remaining_seconds(
+        SharedState(max_minutes=60, start_ts=now_iso),
+    )
+    assert rem is not None and 0.0 < rem <= 3600.0
+
+
+def test_a_live_leg_is_charged_from_its_anchor() -> None:
+    """With a leg open, the answer is the charged total plus the leg so far."""
+    state = SharedState(max_minutes=12 * 60, elapsed_charged_sec=3600.0, leg_anchor_unix=10_000.0, start_ts="")
+
+    remaining = ps.session_remaining_seconds(state, now_unix=10_000.0 + 10 * 3600.0)
+
+    assert remaining == pytest.approx(3600.0)
+
+
+def test_an_unarmed_anchor_does_not_hand_a_started_session_its_budget_again() -> None:
+    """Nothing has charged this session, but it started eleven hours ago.
+
+    Reading the leg fields alone reports a full twelve hours left, which is the
+    budget being reissued to a run that has already spent most of it.
+    """
+    from datetime import datetime, timezone
+
+    started = 1_000_000.0
+    state = SharedState(
+        max_minutes=12 * 60,
+        elapsed_charged_sec=0.0,
+        leg_anchor_unix=0.0,
+        start_ts=datetime.fromtimestamp(started, timezone.utc).isoformat(),
+    )
+
+    remaining = ps.session_remaining_seconds(state, now_unix=started + 11 * 3600.0)
+
+    assert remaining == pytest.approx(3600.0)
+
+
+def test_an_unarmed_anchor_between_legs_is_not_charged_for_the_idle_gap() -> None:
+    """A charged total answers on its own: the gap between legs ran nothing."""
+    state = SharedState(max_minutes=12 * 60, elapsed_charged_sec=3600.0, leg_anchor_unix=0.0, start_ts="")
+
+    remaining = ps.session_remaining_seconds(state, now_unix=10_000_000.0)
+
+    assert remaining == pytest.approx(11 * 3600.0)
+
+
+@pytest.mark.parametrize(
+    ("optimize", "kernel", "target"),
+    [
+        (True, True, ps.PHASE_FRAMEWORK_AGENT),
+        (True, False, ps.PHASE_FRAMEWORK_AGENT),
+        # --no-framework-agent collapses past the optimisation phase.
+        (False, True, ps.PHASE_KERNEL_AGENT),
+        (False, False, ps.PHASE_SWEEP),
+    ],
+)
+def test_post_prelude_target(optimize: bool, kernel: bool, target: str) -> None:
+    assert ps._post_prelude_target(optimize_enabled=optimize, kernel_enabled=kernel) == target
+
+
+def test_make_history_row() -> None:
+    row = ps.make_history_row(
+        ps.HistoryEntry(
+            from_phase="framework_agent",
+            to_phase="kernel_agent",
+            reason="  plateau  ",
+            evidence={"k": 1},
+            ts="2026-06-09T00:00:00Z",
+            ts_unix=12.0,
+        )
+    )
+    assert row["from_phase"] == "FRAMEWORK_AGENT"
+    assert row["to_phase"] == "KERNEL_AGENT"
+    assert row["reason"] == "plateau"
+    assert row["evidence"] == {"k": 1}
+    assert row["ts_unix"] == 12.0
+
+
+def test_phase_budget_help_quotes_the_real_default() -> None:
+    """``--help`` must quote the default the run will actually use."""
+    import re
+
+    from hyperloom.inference_optimizer.cli.parser import _build_parser
+
+    # The flags live on the ``optimize`` subparser, so walk the tree.
+    pending = [_build_parser()]
+    quoted: dict[str, float] = {}
+    while pending:
+        for action in pending.pop()._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                pending.extend(sub for sub in choices.values() if hasattr(sub, "_actions"))
+                continue
+            match = re.fullmatch(r"phase_budget_(\w+)_pct", action.dest or "")
+            if not match:
+                continue
+            default_text = re.search(r"Default:\s*([0-9.]+)\.", action.help or "")
+            assert default_text, f"{action.dest} help does not quote a default"
+            quoted[match.group(1).upper()] = float(default_text.group(1))
+
+    assert quoted, "no phase-budget flags found; this guard would pass vacuously"
+
+    real = {phase.upper(): value for phase, value in ps.DEFAULT_PHASE_BUDGET_PCT.items()}
+    # The FRAMEWORK_AGENT flag is spelled --phase-budget-framework-pct.
+    real["FRAMEWORK"] = real.pop("FRAMEWORK_AGENT")
+    real["KERNEL"] = real.pop("KERNEL_AGENT")
+
+    # A capped phase has a flag quoting its default; an uncapped one has no flag
+    # at all, since nothing would enforce what it set.
+    assert quoted == real
+    assert ps.PHASE_ENABLEMENT not in ps.DEFAULT_PHASE_BUDGET_PCT
+
+
+def test_a_failing_marker_record_propagates_after_the_history_row_is_appended(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from hyperloom.inference_optimizer.breakdown.recorder import phase_event
+
+    def _boom(_marker) -> None:
+        raise RuntimeError("marker bug")
+
+    monkeypatch.setattr(phase_event, "record_marker", _boom)
+    state = SimpleNamespace(phase="kernel_agent", macro_cycle=0, phase_history=[])
+
+    with pytest.raises(RuntimeError, match="marker bug"):
+        ps.append_phase_history_event(state, reason="arm_dropped", evidence={"k": 1})
+
+    assert [row["reason"] for row in state.phase_history] == ["arm_dropped"]

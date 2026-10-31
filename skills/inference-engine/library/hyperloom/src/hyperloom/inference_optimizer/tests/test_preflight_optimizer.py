@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the launcher-side preflight tool."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+from hyperloom.common import rocm_smi
+from hyperloom.common.rocm_smi import GpuVram
+
+_TOTAL_MIB = 288 * 1024.0
+
+
+@pytest.fixture
+def preflight() -> ModuleType:
+    """Load the tool by path; it ships as an operator script, not as a module."""
+    path = Path(__file__).resolve().parents[1] / "tools" / "preflight_optimizer.py"
+    spec = importlib.util.spec_from_file_location("_preflight_under_test", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _usage(*used_fractions: float) -> list[GpuVram]:
+    return [GpuVram(_TOTAL_MIB * f, _TOTAL_MIB) for f in used_fractions]
+
+
+def test_occupancy_idle_below_fraction(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every GPU under the fraction reports idle."""
+    monkeypatch.setattr(rocm_smi, "gpu_vram_usage", lambda: _usage(0.005, 0.001))
+    assert preflight._check_gpu_occupancy() is True
+
+
+def test_occupancy_busy_when_one_gpu_exceeds_fraction(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One GPU over the fraction fails the whole check."""
+    monkeypatch.setattr(rocm_smi, "gpu_vram_usage", lambda: _usage(0.001, 0.05))
+    assert preflight._check_gpu_occupancy() is False
+
+
+def test_occupancy_fails_when_unreadable(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unknown GPU state is a failure, not a pass."""
+    monkeypatch.setattr(rocm_smi, "gpu_vram_usage", lambda: None)
+    assert preflight._check_gpu_occupancy() is False
+
+
+def test_main_propagates_busy_gpu_to_exit_code(
+    preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A busy GPU must reach the exit code, not just stdout."""
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setattr(rocm_smi, "gpu_vram_usage", lambda: _usage(0.05))
+    monkeypatch.setattr(preflight, "_print_torch_visibility", lambda: True)
+    monkeypatch.setattr(preflight, "_find_stale_processes", list)
+    assert preflight.run_checks([str(model)]) == 2
+
+
+def test_exit_bypasses_interpreter_teardown(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate's status must not be reachable by an atexit handler.
+
+    A ROCm torch teardown forces status 0, so a plain ``sys.exit`` loses every
+    violation the checks above detect.
+    """
+    left_with: list[int] = []
+    monkeypatch.setattr(preflight.os, "_exit", left_with.append)
+    preflight._exit(2)
+    assert left_with == [2]
+
+
+def test_stale_scan_skips_the_launcher_ancestry(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A launcher shell whose argv quotes the CLI command is not leftover workload."""
+    parents = {11: 10, 10: 1}
+    monkeypatch.setattr(preflight.os, "getpid", lambda: 11)
+    monkeypatch.setattr(preflight, "_parent_pid", lambda pid: parents.get(pid, 0))
+    monkeypatch.setattr(preflight.os, "listdir", lambda path: ["10", "11", "12"])
+    monkeypatch.setattr(
+        preflight,
+        "_read_cmdline",
+        lambda pid: f"bash -c python -m hyperloom optimize  # pid {pid}",
+    )
+    assert [pid for pid, _ in preflight._find_stale_processes()] == ["12"]
+
+
+@pytest.mark.parametrize(
+    ("cmdline", "stale"),
+    [
+        ("/venv/bin/python3 -m hyperloom optimize --model /m", True),
+        ("/venv/bin/hyperloom optimize --model /m", True),
+        ("/venv/bin/python3 -m hyperloom check /m", False),
+    ],
+)
+def test_stale_scan_matches_the_unified_optimize_command(
+    preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, cmdline: str, stale: bool
+) -> None:
+    monkeypatch.setattr(preflight.os, "getpid", lambda: 11)
+    monkeypatch.setattr(preflight, "_parent_pid", lambda pid: 1)
+    monkeypatch.setattr(preflight.os, "listdir", lambda path: ["12"])
+    monkeypatch.setattr(preflight, "_read_cmdline", lambda pid: cmdline)
+    assert [pid for pid, _ in preflight._find_stale_processes()] == (["12"] if stale else [])
+
+
+def test_stale_scan_sees_an_atom_server(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ATOM serves from its own entrypoint, which the vLLM and SGLang fragments do not match."""
+    monkeypatch.setattr(preflight.os, "getpid", lambda: 11)
+    monkeypatch.setattr(preflight, "_parent_pid", lambda pid: 1)
+    monkeypatch.setattr(preflight.os, "listdir", lambda path: ["12"])
+    monkeypatch.setattr(preflight, "_read_cmdline", lambda pid: "python3 -m atom.entrypoints.openai_server")
+    assert [pid for pid, _ in preflight._find_stale_processes()] == ["12"]
+
+
+def test_main_leaves_through_exit_with_the_check_status(preflight: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``hyperloom check`` calls main(); torch teardown must not get to rewrite its status."""
+    left_with: list[int] = []
+    monkeypatch.setattr(preflight, "run_checks", lambda argv: 2)
+    monkeypatch.setattr(preflight.os, "_exit", left_with.append)
+    preflight.main(["/models/m"])
+    assert left_with == [2]
+
+
+def test_main_returns_zero_when_every_check_passes(
+    preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Model path present, torch visible, GPUs idle, no stale processes."""
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setattr(rocm_smi, "gpu_vram_usage", lambda: _usage(0.002))
+    monkeypatch.setattr(preflight, "_print_torch_visibility", lambda: True)
+    monkeypatch.setattr(preflight, "_find_stale_processes", list)
+    assert preflight.run_checks([str(model)]) == 0

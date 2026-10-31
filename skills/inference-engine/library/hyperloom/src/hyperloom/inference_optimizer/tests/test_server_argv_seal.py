@@ -1,0 +1,465 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""There is one last writer of the server argv, and nothing writes after it."""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+import yaml
+
+from hyperloom.inference_optimizer.framework_registry import names, server_args_env_name
+from hyperloom.orchestrator.actions.executors import _grid_runner, _profile_setup, _workload_envs
+from hyperloom.orchestrator.actions.executors._grid_base import GridVariant
+from hyperloom.orchestrator.actions.executors._server_argv import (
+    ServerArgv,
+    add_server_arg_unless_pinned,
+    config_launch_env,
+    config_server_argv,
+    reseal_config_argv,
+    seal_server_argv,
+)
+from hyperloom.orchestrator.actions.executors._workload_envs import materialize_config_with_envs, LaunchLayer
+
+#: The name every composer ends on.
+SEAL = "seal_server_argv"
+
+#: The registry call that is the only source of the argument env's name.
+RESOLVER = "server_args_env_name"
+
+#: Every env name the registry can return, so a literal write is recognised by
+#: its value rather than by a prefix someone has to remember to keep using.
+ARGUMENT_ENVS = frozenset(server_args_env_name(framework) for framework in names())
+
+#: The composers, each of which ends on the seal.
+_COMPOSERS = (
+    (_workload_envs, "materialize_config_with_envs"),
+    (_grid_runner, "_build_variant_yaml"),
+)
+
+#: The functions allowed to write the argument env: the phases a composer delegates
+#: to -- each source merged in turn, the profiler flags, the caller's removals and the
+#: final guards -- all of which run above the seal, plus the composer that still writes
+#: the env itself, the seal, and the re-seal a repair is written back through.
+_WRITERS = frozenset(
+    {
+        "_seed_reference_launch",
+        "_merge_caller_overrides",
+        "_settle_merged_server_args",
+        "_apply_caller_removals",
+        "_restate_profile_capture",
+        "add_server_arg_unless_pinned",
+        "_finalize_framework_server_args",
+        "_build_variant_yaml",
+        "seal_server_argv",
+        "reseal_config_argv",
+        "_apply_vllm_profile",
+        "_apply_sglang_profile",
+        "apply_atom_profile_caps",
+    }
+)
+
+#: Root of the package the census walks.
+_PACKAGE = Path(_workload_envs.__file__).parents[3]
+
+
+def _function(module, name: str) -> ast.FunctionDef:
+    """Return the parsed ``def`` of ``name`` in ``module``'s source."""
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {module.__file__}")
+
+
+def _seal_call(body: list[ast.stmt]) -> tuple[int, ast.Call]:
+    """Return the index and node of the sole seal call among a body's statements."""
+    found = [
+        (index, stmt.value)
+        for index, stmt in enumerate(body)
+        if isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == SEAL
+    ]
+    assert len(found) == 1, f"expected exactly one top-level {SEAL} call, found {len(found)}"
+    return found[0]
+
+
+def _argument_env_writes(source: str) -> list[tuple[str, int]]:
+    """Return ``(function, lineno)`` for every write to the framework argument env."""
+    tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    resolved: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        called = node.value.func
+        name = called.id if isinstance(called, ast.Name) else getattr(called, "attr", "")
+        if name != RESOLVER:
+            continue
+        resolved.update(target.id for target in node.targets if isinstance(target, ast.Name))
+
+    def _is_argument_env(key: ast.expr) -> bool:
+        if isinstance(key, ast.Call):
+            called = key.func
+            return (called.id if isinstance(called, ast.Name) else getattr(called, "attr", "")) == RESOLVER
+        if isinstance(key, ast.Name):
+            return key.id in resolved
+        return isinstance(key, ast.Constant) and key.value in ARGUMENT_ENVS
+
+    writes: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if not (isinstance(target, ast.Subscript) and _is_argument_env(target.slice)):
+                continue
+            owner: ast.AST = node
+            while owner in parents and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = parents[owner]
+            writes.append((getattr(owner, "name", "<module>"), node.lineno))
+    return writes
+
+
+@pytest.mark.parametrize(("module", "name"), _COMPOSERS)
+def test_nothing_the_seal_was_given_is_touched_again_after_it(module, name):
+    """The seal is the last statement naming the mapping it was handed."""
+    body = _function(module, name).body
+    index, call = _seal_call(body)
+    sealed = {node.id for argument in call.args for node in ast.walk(argument) if isinstance(node, ast.Name)}
+    assert sealed, "the seal call names nothing this test could follow"
+    late = [
+        node.lineno
+        for stmt in body[index + 1 :]
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name) and node.id in sealed
+    ]
+    assert not late, f"{name} touches {sorted(sealed)} after the seal, at line(s) {late}"
+
+
+def test_every_write_to_the_argument_env_is_one_the_seal_settles():
+    """No module writes the argument env outside the composers and the seal."""
+    offenders: list[str] = []
+    for path in sorted(_PACKAGE.rglob("*.py")):
+        if "/tests/" in str(path):
+            continue
+        for function, lineno in _argument_env_writes(path.read_text(encoding="utf-8")):
+            if function not in _WRITERS:
+                offenders.append(f"{path}:{lineno} in {function}")
+    assert not offenders, "the server argument env is written outside the seal's reach: " + "; ".join(offenders)
+
+
+@pytest.mark.parametrize(("module", "name"), _COMPOSERS)
+def test_every_write_inside_a_composer_happens_above_the_seal(module, name):
+    """Composition is what runs before the seal; nothing writes the env below it."""
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    seal_line = _seal_call(_function(module, name).body)[1].lineno
+    late = [lineno for function, lineno in _argument_env_writes(source) if function == name and lineno > seal_line]
+    assert not late, f"{name} writes the argument env after the seal at line {seal_line}, at line(s) {late}"
+
+
+def test_profile_argument_writers_only_run_through_the_sealed_composer():
+    """Every profile argument mutation reaches the fixed-sequence final seal."""
+    owners = {
+        "_apply_vllm_profile": (_profile_setup, "_apply_framework_profile"),
+        "_apply_sglang_profile": (_profile_setup, "_apply_framework_profile"),
+        "_apply_framework_profile": (_profile_setup, "prepare_profile"),
+        "prepare_profile": (_workload_envs, "_shape_request_window"),
+        "apply_atom_profile_caps": (_workload_envs, "_restate_profile_capture"),
+        "fit_capture_to_speculative": (_workload_envs, "_restate_profile_capture"),
+    }
+    calls = {name: [] for name in owners}
+    for path in sorted(_PACKAGE.rglob("*.py")):
+        if "/tests/" in str(path):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = call.func.id if isinstance(call.func, ast.Name) else getattr(call.func, "attr", "")
+                if name in calls:
+                    calls[name].append((path, node.name, call.lineno))
+    composer = _function(_workload_envs, "materialize_config_with_envs")
+    seal_line = _seal_call(composer.body)[1].lineno
+    phase_lines = {
+        call.func.id: call.lineno
+        for call in ast.walk(composer)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    for name, (module, function) in owners.items():
+        assert calls[name], f"{name} is no longer composed"
+        for path, caller, line in calls[name]:
+            assert (path, caller) == (Path(module.__file__), function), f"unsealed call to {name}: {path}:{line}"
+            if module is _workload_envs:
+                assert phase_lines[function] < seal_line, f"{function} runs after the seal"
+
+
+def test_the_census_sees_a_writer_that_renames_everything_it_touches():
+    """The check is dataflow, not convention, so renaming does not hide a write."""
+    plant = (
+        "from hyperloom.inference_optimizer.framework_registry import server_args_env_name\n"
+        "\n"
+        "def sneak(bench, framework):\n"
+        "    slot = server_args_env_name(framework)\n"
+        "    mapping = bench['envs']\n"
+        "    mapping[slot] = '--late-write'\n"
+        "\n"
+        "def sneak_nested(bench):\n"
+        "    bench['envs']['EXTRA_SGLANG_ARGS'] = '--also-late'\n"
+    )
+
+    assert [function for function, _ in _argument_env_writes(plant)] == ["sneak", "sneak_nested"]
+
+
+def test_what_the_preflight_reads_back_is_what_the_launch_exports(tmp_path):
+    """One rendered file answers both readers, so they cannot be given two argvs."""
+    source = tmp_path / "base.yaml"
+    source.write_text(
+        yaml.safe_dump(
+            {
+                "benchmark": {
+                    "framework": "sglang",
+                    "model": "/path/models/Qwen-Qwen3-8B",
+                    "envs": {"TP": 1, "CONC": 8, "ISL": 256, "OSL": 256, "EXTRA_SGLANG_ARGS": "  --tp   8 "},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+
+    config = materialize_config_with_envs(
+        source, out, launch=LaunchLayer(extra_server_args="--attention-backend aiter")
+    )
+
+    sealed = config_server_argv(config)
+    exported = config_launch_env(config, {})[server_args_env_name("sglang")]
+    assert sealed.text == exported
+    assert sealed.argv == tuple(exported.split())
+    assert "--attention-backend" in sealed.argv
+
+
+def test_an_injection_never_overwrites_a_flag_the_caller_pinned():
+    """The one way to add a flag leaves an operator's own spelling standing."""
+    envs = {"EXTRA_VLLM_ARGS": "--block-size 128"}
+
+    add_server_arg_unless_pinned(envs, "vllm", "--block-size 16", pinned_by=("--block-size", "--block_size"))
+    assert envs["EXTRA_VLLM_ARGS"] == "--block-size 128"
+
+
+def test_an_injection_merges_onto_what_is_already_composed():
+    """An unpinned flag joins the string rightmost, where last-wins reads it."""
+    envs = {"EXTRA_SGLANG_ARGS": "--tp 8"}
+
+    add_server_arg_unless_pinned(envs, "sglang", "--trust-remote-code", pinned_by=("--trust-remote-code",))
+    assert envs["EXTRA_SGLANG_ARGS"] == "--tp 8 --trust-remote-code"
+
+
+def test_an_injection_into_an_empty_env_is_the_whole_string():
+    """The first flag composed needs no separate spelling of "nothing yet"."""
+    envs: dict[str, str] = {}
+
+    add_server_arg_unless_pinned(envs, "sglang", "--tp 8", pinned_by=("--tp",))
+    assert envs["EXTRA_SGLANG_ARGS"] == "--tp 8"
+
+
+def test_the_seal_returns_the_argv_it_leaves_in_the_envs():
+    """What the seal writes back and what it hands the caller are one string."""
+    envs = {"EXTRA_SGLANG_ARGS": "  --tp 8   --attention-backend  aiter "}
+    sealed = seal_server_argv(envs, "sglang")
+    assert sealed.argv == ("--tp", "8", "--attention-backend", "aiter")
+    assert envs["EXTRA_SGLANG_ARGS"] == sealed.text
+    assert sealed.tokenized
+
+
+def test_an_explicit_empty_argument_string_stays_authoritative():
+    """The child must not inherit ambient args after an explicit replacement."""
+    envs = {"EXTRA_VLLM_ARGS": "   "}
+    sealed = seal_server_argv(envs, "vllm")
+    assert sealed.argv == ()
+    assert envs["EXTRA_VLLM_ARGS"] == ""
+
+
+def test_the_digest_is_the_argv_and_the_framework_and_nothing_else():
+    """Two spellings of one argument list key the same repair; two frameworks do not."""
+    tight = seal_server_argv({"EXTRA_SGLANG_ARGS": "--tp 8"}, "sglang")
+    loose = seal_server_argv({"EXTRA_SGLANG_ARGS": "  --tp   8  "}, "sglang")
+    other = seal_server_argv({"EXTRA_VLLM_ARGS": "--tp 8"}, "vllm")
+    assert tight.digest == loose.digest
+    assert tight.digest != other.digest
+
+
+def test_a_repaired_argv_reaches_the_launch_through_the_rendered_config(tmp_path):
+    """A repair that is not written back to the YAML is a repair the server never sees."""
+    config = tmp_path / "bench.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {"benchmark": {"framework": "sglang", "model": "/m", "envs": {"EXTRA_SGLANG_ARGS": "--tp 8 --bogus x"}}}
+        ),
+        encoding="utf-8",
+    )
+    assert config_server_argv(config).argv == ("--tp", "8", "--bogus", "x")
+
+    resealed = reseal_config_argv(config, "--tp 8")
+    assert resealed.argv == ("--tp", "8")
+    # Read back off disk, because the file is what the launch opens.
+    assert config_server_argv(config).argv == ("--tp", "8")
+
+
+def _seal_with_ep(framework: str, args: str, ep: object) -> ServerArgv:
+    """Seal ``args`` for ``framework`` with ``ep`` in the envs; ``None`` leaves EP unset."""
+    envs: dict[str, object] = {server_args_env_name(framework): args}
+    if ep is not None:
+        envs["EP"] = ep
+    return seal_server_argv(envs, framework)
+
+
+@pytest.mark.parametrize(
+    ("framework", "args", "ep", "expected"),
+    [
+        ("sglang", "--tp 8", 4, ("--tp", "8", "--ep-size", "4")),
+        ("sglang", "", "8", ("--ep-size", "8")),
+        ("sglang", "--ep-size 4", 4, ("--ep-size", "4")),
+        ("sglang", "--expert-parallel-size=4", 4, ("--expert-parallel-size=4",)),
+        ("sglang", "--ep 4", "4", ("--ep", "4")),
+        # A flag that merely starts with an alias is a different option.
+        ("sglang", "--ep-num-redundant-experts 32", 4, ("--ep-num-redundant-experts", "32", "--ep-size", "4")),
+        ("vllm", "--foo", 8, ("--foo", "--enable-expert-parallel")),
+        ("vllm", "", 8, ("--enable-expert-parallel",)),
+        ("vllm", "--enable-expert-parallel", 8, ("--enable-expert-parallel",)),
+        ("vllm", "-ep", 8, ("-ep",)),
+        ("atom", "--level 2", 8, ("--level", "2", "--enable-expert-parallel")),
+        ("vllm", "--foo", 1, ("--foo",)),
+        ("vllm", "--foo", None, ("--foo",)),
+        # EP 1 is a no-op, so a recipe that pins its own EP size is left standing.
+        ("sglang", "--ep-size 4", 1, ("--ep-size", "4")),
+        ("xdit", "--foo", 8, ("--foo",)),
+    ],
+)
+def test_the_seal_hands_the_server_its_expert_parallel_flag(framework, args, ep, expected):
+    """EP > 1 reaches the server's argv exactly once, in the framework's own spelling."""
+    assert _seal_with_ep(framework, args, ep).argv == expected
+
+
+@pytest.mark.parametrize("pinned", ["--ep-size 2", "--expert-parallel-size=8", "--ep 1", "--ep-size"])
+def test_an_expert_parallel_pin_that_contradicts_ep_fails_the_seal(pinned):
+    """Neither the operator's pin nor the CLI's EP may win silently."""
+    with pytest.raises(ValueError, match="EP=4"):
+        _seal_with_ep("sglang", pinned, 4)
+
+
+def test_a_contradicting_pin_fails_the_seal_even_when_ep_does_not_divide_tp():
+    """The skip for an EP that TP cannot hold must not let a different pinned size launch unreported."""
+    with pytest.raises(ValueError, match="EP=3"):
+        seal_server_argv({"EXTRA_SGLANG_ARGS": "--ep-size 2", "EP": 3, "TP": 8}, "sglang")
+
+
+def test_sealing_twice_adds_the_expert_parallel_flag_once():
+    """The seal reads its own output back as a pin."""
+    envs = {"EXTRA_SGLANG_ARGS": "--tp 8", "EP": 8}
+    seal_server_argv(envs, "sglang")
+
+    assert seal_server_argv(envs, "sglang").argv == ("--tp", "8", "--ep-size", "8")
+
+
+def test_a_resealed_argv_keeps_the_expert_parallel_flag(tmp_path):
+    """A repair rewrites the argument string, not the run's EP."""
+    config = tmp_path / "bench.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {"benchmark": {"framework": "sglang", "model": "/m", "envs": {"EP": 4, "EXTRA_SGLANG_ARGS": "--bogus x"}}}
+        ),
+        encoding="utf-8",
+    )
+
+    assert reseal_config_argv(config, "--tp 4").argv == ("--tp", "4", "--ep-size", "4")
+    assert config_server_argv(config).argv == ("--tp", "4", "--ep-size", "4")
+
+
+@pytest.mark.parametrize(("variant_mode", "base_mode"), [("replace", "append"), ("append", "replace")])
+def test_a_replacing_grid_variant_keeps_the_expert_parallel_flag(tmp_path, variant_mode, base_mode):
+    """Replacing the argument string does not replace the run's EP."""
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        yaml.safe_dump(
+            {
+                "benchmark": {
+                    "framework": "vllm",
+                    "model": "/m",
+                    "envs": {"TP": 8, "EP": 8, "EXTRA_VLLM_ARGS": "--enable-expert-parallel --block-size 64"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    variant = GridVariant(name="v", extra_server_args="--max-num-seqs 64", args_mode=variant_mode)
+
+    config = _grid_runner._build_variant_yaml(
+        _grid_runner.GridRecipe(
+            base_yaml_path=base, base=LaunchLayer(extra_server_args="--max-num-seqs 32", args_mode=base_mode)
+        ),
+        variant,
+        output_subdir=tmp_path / "v",
+    )
+
+    argv = config_server_argv(config).argv
+    assert "--block-size" not in argv
+    assert argv.count("--enable-expert-parallel") == 1
+
+
+@pytest.mark.parametrize(
+    ("nodes", "tp", "ep"),
+    [("1", 8, 3), ("2", 16, 16)],
+    ids=["ep-does-not-divide-tp", "multi-node"],
+)
+def test_a_resealed_argv_gets_no_expert_parallel_flag_the_launch_cannot_take(tmp_path, monkeypatch, nodes, tp, ep):
+    """A repair goes through the same EP rule as the first seal."""
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_NODES", nodes)
+    config = tmp_path / "bench.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {"benchmark": {"framework": "sglang", "model": "/m", "envs": {"TP": tp, "EP": ep, "EXTRA_SGLANG_ARGS": ""}}}
+        ),
+        encoding="utf-8",
+    )
+
+    assert reseal_config_argv(config, "--mem-fraction-static 0.9").argv == ("--mem-fraction-static", "0.9")
+
+
+def test_a_grid_variant_ep_that_does_not_divide_tp_adds_no_flag(tmp_path, caplog):
+    """A variant's extra_envs reach the seal unfiltered, so the seal is where EP meets TP."""
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        yaml.safe_dump(
+            {
+                "benchmark": {
+                    "framework": "sglang",
+                    "model": "/m",
+                    "envs": {"TP": 8, "EXTRA_SGLANG_ARGS": "--mem-fraction-static 0.9"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    variant = GridVariant(name="v", extra_envs={"EP": "3"})
+
+    with caplog.at_level("WARNING"):
+        config = _grid_runner._build_variant_yaml(
+            _grid_runner.GridRecipe(base_yaml_path=base), variant, output_subdir=tmp_path / "v"
+        )
+
+    assert "--ep-size" not in config_server_argv(config).argv
+    assert "EP=3 does not divide the launched TP=8" in caplog.text

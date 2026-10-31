@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Server-less (scriptable) benchmarks must leave the server-log watchdogs off."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import yaml
+
+from hyperloom.orchestrator.actions.executors import _subprocess_kill as sk
+from hyperloom.orchestrator.actions.executors.benchmark_run.records import (
+    _config_framework,
+    _watchdog_server_log_path,
+)
+
+
+def test_scriptable_frameworks_get_no_watchdog_log(tmp_path):
+    for framework in ("custom", "xdit"):
+        assert _watchdog_server_log_path(tmp_path, framework) is None
+
+
+def test_serving_frameworks_keep_the_watchdog_log(tmp_path):
+    for framework in ("sglang", "vllm", ""):
+        assert _watchdog_server_log_path(tmp_path, framework) == str(tmp_path / "server.log")
+
+
+def test_config_framework_reads_materialized_yaml(tmp_path):
+    cfg = tmp_path / "materialized.yaml"
+    cfg.write_text(yaml.safe_dump({"benchmark": {"framework": "Custom"}}), encoding="utf-8")
+    assert _config_framework(cfg) == "custom"
+    assert _config_framework(tmp_path / "missing.yaml") == ""
+
+
+def _count_scans(monkeypatch) -> dict[str, int]:
+    calls = {"scan": 0}
+
+    def _scan(self, server_log_path):
+        calls["scan"] += 1
+        return sk._LogScan(
+            saw_ready=False,
+            saw_progress=False,
+            saw_eval_start=False,
+            grew=False,
+            child_spoke=False,
+        )
+
+    monkeypatch.setattr(sk._LogCursor, "advance", _scan)
+    return calls
+
+
+def test_no_server_log_leaves_both_watchdogs_disarmed(monkeypatch):
+    calls = _count_scans(monkeypatch)
+
+    proc = sk.run_with_session_kill(
+        [sys.executable, "-c", "import time; time.sleep(1.2)"],
+        watch=sk.RoundWatch(timeout=30, server_log_path=None),
+    )
+
+    assert proc.returncode == 0
+    assert calls == {"scan": 0}
+
+
+def test_server_log_is_scanned(monkeypatch, tmp_path: Path):
+    calls = _count_scans(monkeypatch)
+
+    proc = sk.run_with_session_kill(
+        [sys.executable, "-c", "import time; time.sleep(1.2)"],
+        watch=sk.RoundWatch(timeout=30, server_log_path=str(tmp_path / "server.log")),
+    )
+
+    assert proc.returncode == 0
+    assert calls["scan"] > 0

@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for ``orchestrator.actions.executors.session_breakdown``."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from hyperloom.orchestrator.actions.executors import session_breakdown as sb
+
+
+def _ctx(*, params: dict | None = None, extra: dict | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        task=SimpleNamespace(task_id="sb-t1", params=params or {}),
+        extra=extra or {},
+    )
+
+
+@pytest.fixture
+def session_dir(tmp_path: Path) -> Path:
+    (tmp_path / "manifest.json").write_text(json.dumps({"session": "x"}))
+    return tmp_path
+
+
+class TestExecutor:
+    @pytest.mark.asyncio
+    async def test_writer_error_propagates(self, monkeypatch, session_dir):
+        def boom(*args, **kwargs):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(
+            "hyperloom.inference_optimizer.breakdown.write_breakdown_json",
+            boom,
+        )
+        monkeypatch.setattr(
+            "hyperloom.inference_optimizer.breakdown.build",
+            lambda *a, **k: {"warnings": []},
+        )
+        with pytest.raises(RuntimeError, match="kaboom"):
+            await sb.SessionBreakdownExecutor()(
+                _ctx(extra={"session_dir": str(session_dir)}),
+            )
+
+    @pytest.mark.asyncio
+    async def test_succeeded_returns_breakdown_metadata(
+        self,
+        monkeypatch,
+        session_dir,
+    ):
+        target = session_dir / "session_breakdown.json"
+        target.write_text(json.dumps({"metadata": {"warnings": ["w1"]}}))
+
+        def fake_writer(_sd, *, output_path=None):
+            return target
+
+        monkeypatch.setattr(
+            "hyperloom.inference_optimizer.breakdown.write_breakdown_json",
+            fake_writer,
+        )
+        ctx = _ctx(extra={"session_dir": str(session_dir)})
+        result = await sb.SessionBreakdownExecutor()(ctx)
+        assert result["status"] == "succeeded"
+        assert result["breakdown_path"] == str(target)
+        assert result["warnings"] == ["w1"]
+        assert result["size_bytes"] > 0
+
+    @pytest.mark.asyncio
+    async def test_a_breakdown_without_warnings_reports_none(
+        self,
+        monkeypatch,
+        session_dir,
+    ):
+        target = session_dir / "session_breakdown.json"
+        target.write_text("{}")
+
+        monkeypatch.setattr(
+            "hyperloom.inference_optimizer.breakdown.write_breakdown_json",
+            lambda *a, **k: target,
+        )
+        ctx = _ctx(extra={"session_dir": str(session_dir)})
+        result = await sb.SessionBreakdownExecutor()(ctx)
+        assert result["status"] == "succeeded"
+        assert result["warnings"] == []

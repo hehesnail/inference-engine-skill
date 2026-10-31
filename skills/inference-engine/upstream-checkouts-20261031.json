@@ -1,0 +1,119 @@
+{
+  "date": "2026-10-31",
+  "storage": "Maintaining workspace research directory; see workspace report for location.",
+  "checkout_mode": "depth=1, filter=blob:none with checked-out source, no recursive submodules, GIT_LFS_SKIP_SMUDGE=1",
+  "repositories": [
+    {
+      "repository": "vllm-project/vllm-skills",
+      "revision": "c99623410c1531148ff9b39fe1dcb27efbf4bf23",
+      "relative_checkout": "repos/vllm-project__vllm-skills",
+      "tracked_files": 14,
+      "skill_entries": 6
+    },
+    {
+      "repository": "cfregly/gpu-perf-tune",
+      "revision": "25d74d031732e2f76d30a43e44c3434b588f06b3",
+      "relative_checkout": "repos/cfregly__gpu-perf-tune",
+      "tracked_files": 425,
+      "skill_entries": 33
+    },
+    {
+      "repository": "Orchestra-Research/AI-Research-SKILLs",
+      "revision": "773a52944ba4747a18bd4ae9ade53fff041adcbc",
+      "relative_checkout": "repos/Orchestra-Research__AI-Research-SKILLs",
+      "tracked_files": 529,
+      "skill_entries": 98
+    },
+    {
+      "repository": "NVlabs/kda",
+      "revision": "acdd79343c5e9d0c7cb96289f26fd3f1051ce785",
+      "relative_checkout": "repos/NVlabs__kda",
+      "tracked_files": 25,
+      "skill_entries": 0
+    },
+    {
+      "repository": "BytedTsinghua-SIA/CUDA-Agent",
+      "revision": "473025c8af7878e928525138b5cb327d6bcdf9dd",
+      "relative_checkout": "repos/BytedTsinghua-SIA__CUDA-Agent",
+      "tracked_files": 16,
+      "skill_entries": 1
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "relative_checkout": "repos/NVIDIA__skills",
+      "tracked_files": 6289,
+      "skill_entries": 431
+    },
+    {
+      "repository": "intel/gpu-ai-skills",
+      "revision": "d0f47fcf262560b06fea1684c70d80c877e04854",
+      "relative_checkout": "repos/intel__gpu-ai-skills",
+      "tracked_files": 113,
+      "skill_entries": 23
+    },
+    {
+      "repository": "cohere-ai/vllm-skills",
+      "revision": "2a9ed1ff5dd822a521a453f49eff84e8dd5a7071",
+      "relative_checkout": "repos/cohere-ai__vllm-skills",
+      "tracked_files": 12,
+      "skill_entries": 5
+    },
+    {
+      "repository": "shen-shanshan/vllm-dev-skills",
+      "revision": "1ccafeebf71b5d922f351a0cd009a258b7474fac",
+      "relative_checkout": "repos/shen-shanshan__vllm-dev-skills",
+      "tracked_files": 330,
+      "skill_entries": 17
+    },
+    {
+      "repository": "meta-pytorch/KernelAgent",
+      "revision": "e0647170da36ef9b059ac0bd3d60103aa4ed378b",
+      "relative_checkout": "repos/meta-pytorch__KernelAgent",
+      "tracked_files": 201,
+      "skill_entries": 0
+    },
+    {
+      "repository": "AMD-AGI/Hyperloom",
+      "revision": "a646a9c14c827800be4df8cd862da89100b5b3df",
+      "relative_checkout": "repos/AMD-AGI__Hyperloom",
+      "tracked_files": 2799,
+      "skill_entries": 17
+    },
+    {
+      "repository": "huggingface/kernels",
+      "revision": "633d1faef0caea5f2b9acf447e17ad5f840a52d1",
+      "relative_checkout": "repos/huggingface__kernels",
+      "tracked_files": 890,
+      "skill_entries": 5
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "relative_checkout": "repos/mit-han-lab__ncu-report-skill",
+      "tracked_files": 23,
+      "skill_entries": 1
+    },
+    {
+      "repository": "BBuf/AI-Infra-Auto-Driven-SKILLS",
+      "revision": "c592955044e896edd20890468c9bdbbe30ab0be6",
+      "relative_checkout": "repos/BBuf__AI-Infra-Auto-Driven-SKILLS",
+      "tracked_files": 491,
+      "skill_entries": 12
+    },
+    {
+      "repository": "alibaba/atrex-kernel-agent",
+      "revision": "ffd2b70126ae87a92ec48a0da0fa97b9c7bef595",
+      "relative_checkout": "repos/alibaba__atrex-kernel-agent",
+      "tracked_files": 1608,
+      "skill_entries": 19
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "relative_checkout": "repos/NVIDIA__TensorRT-LLM",
+      "tracked_files": 19029,
+      "skill_entries": 35
+    }
+  ]
+}

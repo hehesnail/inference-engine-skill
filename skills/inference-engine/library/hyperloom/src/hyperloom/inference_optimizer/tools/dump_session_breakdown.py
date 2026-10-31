@@ -1,0 +1,183 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Dump ``session_breakdown.json`` for one hyperloom session directory.
+
+This is the offline / historical / debugging entrypoint. The same
+builder is used by:
+
+* Coordinator action ``session_breakdown`` (live, agent-driven)
+* ``cli.py`` finally block (live, end-of-session safety net)
+* This script (offline / batch / shared-filesystem sessions)
+
+Examples
+--------
+
+::
+
+    # Live session in this sandbox ($INFERENCE_OPTIMIZER_CURRENT_SESSION_DIR,
+    # else $USER_DATA_PATH / /workspace/hyperloom)
+    hyperloom session breakdown
+
+    # Historical session on a shared filesystem
+    hyperloom session breakdown \\
+        --session-dir /shared/hyperloom-sessions/<user>/<sid>
+
+    # Override output path (don't touch session_dir)
+    hyperloom session breakdown \\
+        --session-dir <SD> --output /tmp/breakdown-<sid>.json
+
+    # Bulk historical
+    for d in /shared/hyperloom-sessions/*/*; do
+        [ -d "$d" ] || continue
+        hyperloom session breakdown \\
+            --session-dir "$d" > /dev/null
+    done
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import sys
+from pathlib import Path
+
+from ..breakdown import build, write_breakdown_json
+from ..session.paths import session_dir as default_session_dir
+from ..session.session_paths import BREAKDOWN_FILENAME
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for the session-breakdown CLI.
+
+    Returns:
+        argparse.ArgumentParser: Parser configured with ``--session-dir``,
+        ``--output``, ``--dry-run``, ``--print``,
+        and ``--verbose`` options.
+    """
+    parser = argparse.ArgumentParser(
+        prog="hyperloom session breakdown",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--session-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Hyperloom session directory. Defaults to "
+            "$INFERENCE_OPTIMIZER_CURRENT_SESSION_DIR (the per-run pin set by "
+            "the launcher), else $USER_DATA_PATH, else /workspace/hyperloom; "
+            "the latter two are the workspace root, not a per-session dir."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=None,
+        help=(f"Override output file path. Defaults to <session_dir>/{BREAKDOWN_FILENAME}."),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build the breakdown dict and print summary stats; do not write.",
+    )
+    parser.add_argument(
+        "--print",
+        dest="print_json",
+        action="store_true",
+        help="Also print the full JSON to stdout (useful for piping).",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="count",
+        default=0,
+        help="-v INFO, -vv DEBUG.",
+    )
+    return parser
+
+
+def _setup_logging(verbose: int) -> None:
+    """Configure root logging level from a verbosity count."""
+    level = logging.WARNING
+    if verbose == 1:
+        level = logging.INFO
+    elif verbose >= 2:
+        level = logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def _summary_line(breakdown: dict) -> str:
+    """Format a one-line summary of a session breakdown.
+
+    Args:
+        breakdown (dict): Session breakdown mapping produced by ``build``.
+
+    Returns:
+        str: Single-line summary with session id, stop reason, validated gain,
+        the shape of the session's record, and how it closed.
+    """
+    metadata = breakdown["metadata"]
+    sess = metadata.get("session") or {}
+    outcome = breakdown["outcome"]
+    final = outcome.get("final") or {}
+    validation = outcome.get("validation") or {}
+    by_source = (validation.get("attribution") or {}).get("by_source") or {}
+    geak_n = int((((by_source.get("kernel") or {}).get("by_backend") or {}).get("geak") or {}).get("keep_count") or 0)
+    gain = final.get("gain_pct")
+    gain_text = f"{gain:.2f}%" if isinstance(gain, (int, float)) and not math.isnan(gain) else "n/a"
+    return (
+        f"session_id={sess.get('session_id', '?')}  "
+        f"claw_session_id={sess.get('claw_session_id') or '(none)'}  "
+        f"stop_reason={outcome.get('stop_reason') or '?'}  "
+        f"gain_validated={gain_text}  "
+        f"geak={geak_n}  "
+        f"adopted={int(validation.get('adoption_count') or 0)}  "
+        f"events={len(breakdown['timeline'])}  "
+        f"close={breakdown['close'].get('status') or '?'}  "
+        f"warnings={len(metadata['warnings'])}"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build and (optionally) write the session breakdown JSON."""
+    args = _build_parser().parse_args(argv)
+    _setup_logging(args.verbose)
+    log = logging.getLogger("dump_session_breakdown")
+
+    sd = args.session_dir if args.session_dir else default_session_dir()
+    sd = Path(sd).resolve()
+    if not sd.exists():
+        print(f"ERROR: session-dir does not exist: {sd}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        breakdown = build(sd)
+        print(_summary_line(breakdown))
+        if args.print_json:
+            print(json.dumps(breakdown, indent=2, sort_keys=True))
+        return 0
+
+    try:
+        out_path = write_breakdown_json(
+            sd,
+            output_path=args.output,
+        )
+    except Exception as exc:
+        log.exception("write_breakdown_json failed")
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    breakdown = json.loads(out_path.read_text(encoding="utf-8"))
+    print(f"Wrote {out_path}")
+    print(_summary_line(breakdown))
+    if args.print_json:
+        print(json.dumps(breakdown, indent=2, sort_keys=True))
+    return 0

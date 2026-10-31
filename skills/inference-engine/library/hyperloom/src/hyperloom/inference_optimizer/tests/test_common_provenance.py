@@ -1,0 +1,618 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the shared provenance builder (hyperloom.common.provenance)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+import pytest
+
+from hyperloom.common.provenance import (
+    build_provenance,
+    detect_gfx_arch,
+    server_args_hash,
+)
+
+
+def _ns(**kw):
+    return argparse.Namespace(**kw)
+
+
+def test_env_only_mapping():
+    env = {
+        "FRAMEWORK": "sglang",
+        "GPU_TYPE": "MI355X",
+        "HYPERLOOM_GFX_ARCH": "gfx950",
+        "HYPERLOOM_GRAPH_MODE": "graph_capture",
+        "TP": "1",
+        "EP": "8",
+        "PRECISION": "bf16",
+        "CONC": "64",
+        "ISL": "1024",
+        "OSL": "1024",
+        "MAX_MODEL_LEN": "2048",
+    }
+    p = build_provenance(args=None, env=env, probe=False)
+    assert p["framework"] == "sglang"
+    assert p["gpu_type"] == "MI355X"
+    assert p["gfx_arch"] == "gfx950"
+    assert p["graph_mode"] == "graph_capture"
+    assert p["tp"] == 1 and p["ep"] == 8
+    assert p["dtype"] == "bf16"
+    assert p["concurrency"] == 64
+    assert p["isl"] == 1024 and p["osl"] == 1024 and p["max_model_len"] == 2048
+
+
+def test_target_product_wins_over_runner_in_provenance():
+    p = build_provenance(
+        args=None,
+        env={"TARGET_GPU_TYPE": "r9700", "GPU_TYPE": "gfx12"},
+        probe=False,
+    )
+    assert p["gpu_type"] == "r9700"
+    assert p["gfx_arch"] == "gfx1201"
+
+
+def test_args_override_env():
+    env = {"FRAMEWORK": "sglang", "GPU_TYPE": "MI300X", "TP": "8", "ISL": "512"}
+    args = _ns(
+        framework="vllm",
+        gpu_type="MI355X",
+        tp=1,
+        ep=4,
+        isl=1024,
+        osl=2048,
+        precision="fp8",
+        graph_mode="eager",
+        model="/models/DeepSeek-V4-Flash",
+        model_display_name="DeepSeek-V4-Flash",
+    )
+    p = build_provenance(args=args, env=env, probe=False)
+    assert p["framework"] == "vllm"
+    assert p["gpu_type"] == "MI355X"
+    assert p["tp"] == 1 and p["ep"] == 4
+    assert p["isl"] == 1024 and p["osl"] == 2048
+    assert p["dtype"] == "fp8"
+    assert p["graph_mode"] == "eager"
+    assert p["model_path"] == "/models/DeepSeek-V4-Flash"
+    assert p["model_name"] == "DeepSeek-V4-Flash"
+
+
+def test_model_name_falls_back_to_basename():
+    args = _ns(model="/shared_nfs/models/Qwen3-14B")
+    p = build_provenance(args=args, env={}, probe=False)
+    assert p["model_path"] == "/shared_nfs/models/Qwen3-14B"
+    assert p["model_name"] == "Qwen3-14B"
+
+
+def test_missing_degrades_to_none_never_raises():
+    p = build_provenance(args=None, env={}, probe=False)
+    for key in (
+        "model_name",
+        "model_path",
+        "framework",
+        "gpu_type",
+        "gfx_arch",
+        "graph_mode",
+        "tp",
+        "ep",
+        "dtype",
+        "concurrency",
+        "isl",
+        "osl",
+        "max_model_len",
+    ):
+        assert p[key] is None
+    assert p["stack_fingerprint"] == {
+        "rocm": "unknown",
+        "aiter": "unknown",
+        "sglang": "unknown",
+        "vllm": "unknown",
+        "torch": "unknown",
+    }
+    assert p["server_args"] == []
+    assert p["server_args_hash"] == ""
+    assert p["code_revision"] == ""
+    assert p["image"] is None
+
+
+def test_gfx_env_normalized_and_fallback():
+    # A decorated arch string is normalized to the bare gfx token.
+    assert detect_gfx_arch({"HYPERLOOM_GFX_ARCH": "gfx950:sramecc+:xnack-"}, probe=False) == "gfx950"
+    # Priority falls back to GFX_ARCH.
+    assert detect_gfx_arch({"GFX_ARCH": "gfx942"}, probe=False) == "gfx942"
+    # No env + no probe -> None (never shells out to rocminfo).
+    assert detect_gfx_arch({}, probe=False) is None
+
+
+def test_gfx_ignores_build_target_env():
+    """PYTORCH_ROCM_ARCH names compile targets, not the installed device."""
+    build_list = {"PYTORCH_ROCM_ARCH": "gfx90a;gfx942;gfx950;gfx1100"}
+    assert detect_gfx_arch(build_list, probe=False) is None
+    assert detect_gfx_arch({"PYTORCH_ROCM_ARCH": "gfx942"}, probe=False) is None
+    # A real override still wins over the build target.
+    assert detect_gfx_arch({**build_list, "HYPERLOOM_GFX_ARCH": "gfx950"}, probe=False) == "gfx950"
+
+
+def test_gfx_resolves_from_gpu_type_without_probing():
+    """--gpu-type answers the question rocminfo would, and is always present."""
+    assert detect_gfx_arch({}, gpu_type="mi355x", probe=False) == "gfx950"
+    assert detect_gfx_arch({}, gpu_type="MI300X", probe=False) == "gfx942"
+    # The session env carries it too, when args are not threaded through.
+    assert detect_gfx_arch({"GPU_TYPE": "mi325x"}, probe=False) == "gfx942"
+    # An unrecognised board must not invent an answer.
+    assert detect_gfx_arch({}, gpu_type="h100", probe=False) is None
+
+
+def test_gfx_override_beats_gpu_type():
+    """An explicit operator override outranks the board table."""
+    assert detect_gfx_arch({"HYPERLOOM_GFX_ARCH": "gfx950"}, gpu_type="mi300x", probe=False) == "gfx950"
+
+
+def test_gfx_gpu_type_short_circuits_the_probe(monkeypatch):
+    """A resolvable gpu_type must not spawn rocminfo."""
+
+    def _boom(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("rocminfo probed despite a known gpu_type")
+
+    monkeypatch.setattr("hyperloom.common.provenance.subprocess.run", _boom)
+    assert detect_gfx_arch({}, gpu_type="mi355x", probe=True) == "gfx950"
+
+
+def test_server_args_hash_stable_and_sensitive():
+    a = ["--tp", "1", "--quant", "fp8"]
+    b = ["--tp", "1", "--quant", "fp8"]
+    c = ["--tp", "8", "--quant", "fp8"]
+    assert server_args_hash(a) == server_args_hash(b)
+    assert server_args_hash(a) != server_args_hash(c)
+    assert server_args_hash([]) == ""
+
+
+def test_server_args_from_env_string_tokenized():
+    p = build_provenance(args=None, env={"SERVER_ARGS": "--tp 1 --mem-fraction 0.9"}, probe=False)
+    assert p["server_args"] == ["--tp", "1", "--mem-fraction", "0.9"]
+    assert p["server_args_hash"]  # non-empty
+
+
+def test_server_args_from_args_list_preferred_over_env():
+    args = _ns(server_args=["--x", "1"])
+    p = build_provenance(args=args, env={"SERVER_ARGS": "--y 2"}, probe=False)
+    assert p["server_args"] == ["--x", "1"]
+
+
+def test_int_coercion_rejects_garbage():
+    p = build_provenance(env={"ISL": "abc", "TP": " 4 ", "OSL": ""}, probe=False)
+    assert p["isl"] is None
+    assert p["tp"] == 4
+    assert p["osl"] is None
+
+
+def test_stack_fingerprint_from_env():
+    env = {"ROCM_VERSION": "6.5.0", "AITER_COMMIT": "abc123", "SGLANG_VERSION": "0.5.12"}
+    p = build_provenance(env=env, probe=False)
+    fp = p["stack_fingerprint"]
+    assert fp["rocm"] == "6.5.0"
+    assert fp["aiter"] == "abc123"
+    assert fp["sglang"] == "0.5.12"
+    assert fp["vllm"] == "unknown"
+
+
+def test_json_serializable():
+    p = build_provenance(args=_ns(model="/m/x", framework="sglang"), env={"TP": "1"}, probe=False)
+    json.dumps(p)
+
+
+# --- probe/marker branch coverage (WP-0) -----------------------------------
+from types import SimpleNamespace
+
+import hyperloom.common.provenance as _prov
+
+
+def test_gfx_arch_probe_via_rocminfo(monkeypatch):
+    # empty env -> falls through to the rocminfo subprocess probe.
+    monkeypatch.setattr(
+        _prov.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="  Name:  gfx950  \n"),
+    )
+    assert detect_gfx_arch({}, probe=True) == "gfx950"
+
+
+def test_gfx_arch_probe_subprocess_absent(monkeypatch):
+    def _boom(*a, **k):
+        raise FileNotFoundError("rocminfo not installed")
+
+    monkeypatch.setattr(_prov.subprocess, "run", _boom)
+    assert detect_gfx_arch({}, probe=True) is None
+
+
+def test_gfx_arch_probe_nonzero_returncode(monkeypatch):
+    monkeypatch.setattr(_prov.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
+    assert detect_gfx_arch({}, probe=True) is None
+
+
+def test_read_first_line(tmp_path):
+    f = tmp_path / "v.txt"
+    f.write_text("\n\n  first real line \nsecond\n", encoding="utf-8")
+    assert _prov._read_first_line(f) == "first real line"
+    # non-existent path degrades to "" (never raises)
+    assert _prov._read_first_line(tmp_path / "nope.txt") == ""
+
+
+@pytest.fixture
+def pid1_cgroup(monkeypatch, tmp_path):
+    """Write PID 1's cgroup text for ``detect_image`` to read, with no marker files present."""
+    monkeypatch.setattr(_prov, "_read_first_line", lambda p: "")
+    path = tmp_path / "cgroup"
+    monkeypatch.setattr(_prov, "_PID1_CGROUP", path)
+    return lambda text: path.write_text(text, encoding="utf-8")
+
+
+def test_detect_image_env_wins_over_markers(monkeypatch):
+    monkeypatch.setattr(_prov, "_read_first_line", lambda p: "myrepo/img:tag")
+    assert _prov.detect_image({"CONTAINER_IMAGE": " env/img:1 "}) == "env/img:1"
+
+
+def test_detect_image_none_when_absent(pid1_cgroup):
+    # no image env vars, no marker files, and no PID 1 cgroup file -> None.
+    assert _prov.detect_image({}) is None
+
+
+@pytest.mark.parametrize(
+    ("cgroup", "expected"),
+    [
+        ("12:devices:/docker/0123456789abcdef0123\n7:cpu:/other\n", "unknown@0123456789ab"),
+        ("0::/system.slice/containerd-aaaabbbbccccdddd.scope\n", "unknown@aaaabbbbcccc"),
+        ("12:devices:/user.slice/0123456789abcdef0123\n", None),
+        ("0::/\n", None),
+    ],
+)
+def test_detect_image_falls_back_to_the_cgroup_container_id(pid1_cgroup, cgroup, expected):
+    pid1_cgroup(cgroup)
+    assert _prov.detect_image({}) == expected
+
+
+def test_detect_image_from_marker(monkeypatch):
+    monkeypatch.setattr(_prov, "_read_first_line", lambda p: "myrepo/img:tag")
+    assert _prov.detect_image({}) == "myrepo/img:tag"
+
+
+def test_detect_image_probe_false_skips_markers(monkeypatch, pid1_cgroup):
+    # probe=False must be hermetic: no marker or cgroup reads even if one would match (else provenance becomes
+    # host-dependent and non-reproducible for hashing).
+    pid1_cgroup("12:devices:/docker/0123456789abcdef0123\n")
+
+    def _boom(p):
+        raise AssertionError("marker file must not be read when probe=False")
+
+    monkeypatch.setattr(_prov, "_read_first_line", _boom)
+    assert _prov.detect_image({}, probe=False) is None
+
+
+def test_build_provenance_probe_false_image_hermetic(monkeypatch):
+    # build_provenance(probe=False) must not read image markers.
+    def _boom(p):
+        raise AssertionError("marker read under probe=False")
+
+    monkeypatch.setattr(_prov, "_read_first_line", _boom)
+    prov = _prov.build_provenance(None, env={}, probe=False)
+    assert prov["image"] is None
+
+
+def test_stack_fingerprint_reads_rocm_marker(monkeypatch):
+    # empty env + probe -> rocm resolves from the /opt/rocm marker file.
+    monkeypatch.setattr(_prov, "_read_first_line", lambda p: "6.2.0")
+    fp = _prov.detect_stack_fingerprint({}, probe=True)
+    assert fp["rocm"] == "6.2.0"
+
+
+def test_code_revision_falls_back_when_git_absent(monkeypatch):
+    def _boom(*a, **k):
+        raise FileNotFoundError("git not installed")
+
+    monkeypatch.setattr(_prov.subprocess, "run", _boom)
+    assert _prov.detect_code_revision({"HYPERLOOM_CODE_REVISION": "envrev"}, probe=True) == "envrev"
+
+
+# --- isolated framework venv ------------------------------------------------
+
+
+def _installed(venv_root, name: str, version: str) -> str:
+    """A distribution installed under ``venv_root`` and nowhere this process looks."""
+    site = venv_root / "lib" / "python3.12" / "site-packages"
+    info = site / f"{name}-{version}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n")
+    bin_dir = venv_root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "python3.12").symlink_to(sys.executable)
+    (bin_dir / "python").symlink_to("python3.12")
+    return str(bin_dir / "python")
+
+
+def test_a_framework_in_its_own_venv_is_still_versioned(tmp_path):
+    """``--framework-env isolated`` is the default for vLLM, whose ROCm wheel pins its own torch."""
+    python_exe = _installed(tmp_path / "vllm-venv", "vllm", "0.27.1+rocm723")
+    fp = _prov.detect_stack_fingerprint(
+        {"HYPERLOOM_RESOLVED_FRAMEWORK": "vllm", "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": python_exe}, probe=True
+    )
+    assert fp["vllm"] == "0.27.1+rocm723"
+
+
+def test_resolved_vllm_venv_versions_vllm_and_aiter(tmp_path):
+    venv_root = tmp_path / "vllm-venv"
+    python_exe = _installed(venv_root, "vllm", "0.29.0+rocm723")
+    info = venv_root / "lib" / "python3.12" / "site-packages" / "amd_aiter-0.1.19.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.4\nName: amd-aiter\nVersion: 0.1.19\n")
+
+    fp = _prov.detect_stack_fingerprint(
+        {"HYPERLOOM_RESOLVED_FRAMEWORK": "vllm", "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": python_exe}, probe=True
+    )
+    assert fp["vllm"] == "0.29.0+rocm723"
+    assert fp["aiter"] == "0.1.19"
+
+
+def test_a_develop_checkout_reached_through_a_pth_file_is_versioned(tmp_path):
+    """``setup.py develop`` leaves vLLM's metadata in the checkout, which only the venv's ``.pth`` puts on the path."""
+    import subprocess as _sp
+
+    venv_root = tmp_path / "vllm-venv"
+    _sp.run([sys.executable, "-m", "venv", "--without-pip", str(venv_root)], check=True)
+    checkout = tmp_path / "vllm-src"
+    info = checkout / "vllm.egg-info"
+    info.mkdir(parents=True)
+    (info / "PKG-INFO").write_text("Metadata-Version: 2.1\nName: vllm\nVersion: 0.29.0+rocm100\n")
+    (site,) = (venv_root / "lib").glob("python*/site-packages")
+    (site / "easy-install.pth").write_text(f"{checkout}\n")
+
+    env = {
+        "HYPERLOOM_RESOLVED_FRAMEWORK": "vllm",
+        "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": str(venv_root / "bin" / "python"),
+    }
+    assert _prov.detect_stack_fingerprint(env, probe=True)["vllm"] == "0.29.0+rocm100"
+
+
+def test_an_operator_pin_still_wins_over_the_resolved_interpreter(tmp_path):
+    python_exe = _installed(tmp_path / "vllm-venv", "vllm", "0.27.1+rocm723")
+    fp = _prov.detect_stack_fingerprint(
+        {
+            "HYPERLOOM_RESOLVED_FRAMEWORK": "vllm",
+            "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": python_exe,
+            "VLLM_VERSION": "0.28.0-rc1",
+        },
+        probe=True,
+    )
+    assert fp["vllm"] == "0.28.0-rc1"
+
+
+def test_an_interpreter_whose_prefix_yields_nothing_falls_back(tmp_path):
+    """No ``site-packages`` under the prefix means the derivation failed."""
+    fp = _prov.detect_stack_fingerprint(
+        {
+            "HYPERLOOM_RESOLVED_FRAMEWORK": "vllm",
+            "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": str(tmp_path / "gone" / "bin" / "python"),
+        },
+        probe=True,
+    )
+    assert fp["vllm"] == _prov.detect_stack_fingerprint({}, probe=True)["vllm"]
+
+
+def test_a_real_venv_without_the_distribution_is_authoritative(tmp_path):
+    """A resolved venv that genuinely lacks the package must not be papered over."""
+    venv_root = tmp_path / "vllm-venv"
+    (venv_root / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    bin_dir = venv_root / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").symlink_to(sys.executable)
+
+    fp = _prov.detect_stack_fingerprint(
+        {
+            "HYPERLOOM_RESOLVED_FRAMEWORK": "vllm",
+            "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": str(bin_dir / "python"),
+        },
+        probe=True,
+    )
+    assert fp["vllm"] == "unknown"
+
+
+def _only_installed(**versions: str):
+    """An ``_im.version`` stub where anything unlisted is genuinely absent.
+
+    Every component is answered explicitly, so the test does not depend on how broadly the caller catches.
+    """
+    from importlib.metadata import PackageNotFoundError
+
+    def _version(dist: str) -> str:
+        try:
+            return versions[dist]
+        except KeyError:
+            raise PackageNotFoundError(dist) from None
+
+    return _version
+
+
+def test_therock_rocm_sdk_core_distribution_is_versioned(monkeypatch):
+    monkeypatch.setattr(_prov, "_read_first_line", lambda path: "")
+    monkeypatch.setattr(_prov._im, "version", _only_installed(**{"rocm-sdk-core": "10.0.0"}))
+
+    assert _prov.detect_stack_fingerprint({}, probe=True)["rocm"] == "10.0.0"
+
+
+def test_torch_is_part_of_the_stack_fingerprint(monkeypatch):
+    """The ROCm 10 legs differ in torch alone, and that difference decides whether the profiler records any GPU
+    kernel, so a fingerprint without it cannot tell the legs apart.
+    """
+    monkeypatch.setattr(_prov, "_read_first_line", lambda path: "")
+    monkeypatch.setattr(_prov._im, "version", _only_installed(torch="2.13.0+rocm10.0.0"))
+
+    assert _prov.detect_stack_fingerprint({}, probe=True)["torch"] == "2.13.0+rocm10.0.0"
+
+
+def test_the_framework_venvs_torch_is_the_one_recorded(tmp_path):
+    """The isolated vLLM overlay pins its own torch and that is the build actually serving; recording the
+    orchestrator's names a build the run never executed on.
+    """
+    venv_root = tmp_path / "vllm-venv"
+    python_exe = _installed(venv_root, "vllm", "0.29.0+rocm723")
+    info = venv_root / "lib" / "python3.12" / "site-packages" / "torch-2.12.0+git6bbd260.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.4\nName: torch\nVersion: 2.12.0+git6bbd260\n")
+
+    fp = _prov.detect_stack_fingerprint(
+        {"HYPERLOOM_RESOLVED_FRAMEWORK": "vllm", "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": python_exe}, probe=True
+    )
+    assert fp["torch"] == "2.12.0+git6bbd260"
+
+
+def _trace_with_head(path, head: str, *, events: int = 3) -> str:
+    """A gzipped chrome trace whose top-level metadata precedes ``traceEvents``, as PyTorch writes them."""
+    import gzip as _gzip
+
+    body = '{\n  "schemaVersion": 1,\n' + head + '  "traceEvents": [\n'
+    body += ",\n".join('    {"cat": "kernel", "name": "k%d"}' % i for i in range(events))
+    body += "\n  ]\n}\n"
+    with _gzip.open(path, "wb") as fh:
+        fh.write(body.encode("utf-8"))
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("head", "expected"),
+    [
+        pytest.param('  "rocprofiler-sdk_version": 1.3,\n', "rocprofiler-sdk 1.3", id="rocprofiler-sdk"),
+        pytest.param('  "roctracer_version": 4.1,\n', "roctracer 4.1", id="roctracer"),
+        pytest.param('  "hip_runtime_version": 71526333,\n', "", id="neither-backend"),
+    ],
+)
+def test_the_kineto_backend_is_read_from_the_trace_head(tmp_path, head, expected):
+    """The torch build selects this backend and the trace is the only place that states it outright."""
+    trace = _trace_with_head(tmp_path / "r.trace.json.gz", head)
+    assert _prov.detect_kineto_backend(trace) == expected
+
+
+def test_an_unreadable_trace_yields_no_backend(tmp_path):
+    """A backend we could not read must come back empty rather than as a guess, since this is recorded as fact."""
+    broken = tmp_path / "broken.trace.json.gz"
+    broken.write_bytes(b"not gzip at all")
+    assert _prov.detect_kineto_backend(broken) == ""
+    assert _prov.detect_kineto_backend(tmp_path / "absent.trace.json.gz") == ""
+
+
+def test_a_workspace_directory_resolves_to_the_trace_inside_it(tmp_path):
+    """Profile executors record the workspace directory, so reading the file directly finds nothing."""
+    workspace = tmp_path / "torch_trace"
+    workspace.mkdir()
+    _trace_with_head(workspace / "r.trace.json.gz", '  "roctracer_version": 4.1,\n')
+    assert _prov.detect_kineto_backend(workspace) == "roctracer 4.1"
+    assert _prov.detect_kineto_backend(tmp_path / "empty") == ""
+
+
+def test_explicit_versions_outrank_distribution_probes(monkeypatch, tmp_path):
+    venv_root = tmp_path / "vllm-venv"
+    python_exe = _installed(venv_root, "vllm", "0.29.0+rocm723")
+    info = venv_root / "lib" / "python3.12" / "site-packages" / "amd_aiter-0.1.19.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.4\nName: amd-aiter\nVersion: 0.1.19\n")
+    monkeypatch.setattr(_prov._im, "version", _only_installed(**{"rocm-sdk-core": "10.0.0"}))
+
+    fp = _prov.detect_stack_fingerprint(
+        {
+            "HYPERLOOM_RESOLVED_FRAMEWORK": "vllm",
+            "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": python_exe,
+            "ROCM_VERSION": "9.9.9",
+            "AITER_VERSION": "0.1.20",
+            "VLLM_VERSION": "0.30.0",
+        },
+        probe=True,
+    )
+    assert fp["rocm"] == "9.9.9"
+    assert fp["aiter"] == "0.1.20"
+    assert fp["vllm"] == "0.30.0"
+
+
+def test_the_aiter_ref_the_installer_resolved_reaches_the_fingerprint(monkeypatch):
+    """``install_baremetal.sh`` exports ``AITER_REF`` and persists it to ``.env``; nothing wrote the other two."""
+    monkeypatch.setattr(_prov._im, "version", _only_installed())
+
+    assert _prov.detect_stack_fingerprint({"AITER_REF": "v0.1.9"}, probe=True)["aiter"] == "v0.1.9"
+
+
+def test_an_operator_aiter_commit_outranks_the_installer_ref(monkeypatch):
+    """A commit is the finer pin, so an explicit one must not be displaced by the tag the installer chose."""
+    monkeypatch.setattr(_prov._im, "version", _only_installed(**{"amd-aiter": "0.1.9"}))
+
+    env = {"AITER_COMMIT": "abc123", "AITER_REF": "v0.1.9"}
+    assert _prov.detect_stack_fingerprint(env, probe=True)["aiter"] == "abc123"
+
+
+def test_the_probe_reads_the_distribution_aiter_renamed_itself_to(monkeypatch):
+    """AITER renamed its distribution to ``amd-aiter`` at v0.1.8, so the old lookup found nothing on any new host."""
+    monkeypatch.setattr(_prov._im, "version", _only_installed(**{"amd-aiter": "0.1.9"}))
+
+    assert _prov.detect_stack_fingerprint({}, probe=True)["aiter"] == "0.1.9"
+
+
+def test_the_unrelated_pypi_aiter_is_never_recorded_as_the_amd_one(monkeypatch):
+    """``aiter`` on PyPI is a 2019 async-iterator library. Its version looks like an answer and is not one."""
+    monkeypatch.setattr(_prov._im, "version", _only_installed(aiter="0.13.20191203"))
+
+    assert _prov.detect_stack_fingerprint({}, probe=True)["aiter"] == "unknown"
+
+
+def test_an_installer_venv_root_is_not_consulted(tmp_path):
+    """Provenance records a resolution, it does not perform one."""
+    root = tmp_path / "installer-venv"
+    _installed(root, "vllm", "0.27.1+rocm723")
+    fp = _prov.detect_stack_fingerprint({"VLLM_VENV_ROOT": str(root)}, probe=True)
+    assert fp["vllm"] != "0.27.1+rocm723"
+
+
+def test_the_venv_is_not_scanned_under_probe_false(tmp_path):
+    """probe=False is the hermetic contract: env only, no filesystem."""
+    python_exe = _installed(tmp_path / "vllm-venv", "vllm", "0.27.1+rocm723")
+    fp = _prov.detect_stack_fingerprint(
+        {"HYPERLOOM_RESOLVED_FRAMEWORK": "vllm", "HYPERLOOM_RESOLVED_FRAMEWORK_PYTHON": python_exe}, probe=False
+    )
+    assert fp["vllm"] == "unknown"
+
+
+def test_the_lever_is_what_came_back_not_what_was_asked_for():
+    """A config deliverable is a config lever, whoever dispatched it."""
+    from hyperloom.orchestrator.lever import (
+        LEVER_CONFIG,
+        LEVER_SOURCE_PATCH,
+        patch_lever_kind,
+    )
+
+    config_deliverable = {
+        "framework_agent_candidate_id": "local_explore:0",
+        "specialist_task_id": "t1",
+        "extra_server_args": "--max-num-batched-tokens 16384",
+        "extra_envs": {},
+        "patch_name": "",
+    }
+    assert patch_lever_kind(config_deliverable) == LEVER_CONFIG
+
+    # The same arm, when it really does write a diff.
+    source_deliverable = {
+        "framework_agent_candidate_id": "local_explore:0",
+        "specialist_task_id": "t1",
+        "patches_applied": ["/w/a.patch"],
+        "extra_server_args": "",
+    }
+    assert patch_lever_kind(source_deliverable) == LEVER_SOURCE_PATCH
+
+
+def test_an_explicit_stamp_still_outranks_the_derivation():
+    """Callers that do know the lever keep saying so."""
+    from hyperloom.orchestrator.lever import (
+        LEVER_UPSTREAM_PR,
+        patch_lever_kind,
+    )
+
+    assert patch_lever_kind({"lever_kind": "upstream_pr", "extra_server_args": "--x"}) == LEVER_UPSTREAM_PR

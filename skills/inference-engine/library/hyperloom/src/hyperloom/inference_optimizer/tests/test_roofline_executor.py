@@ -1,0 +1,1674 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Roofline-v2 N2b: real RooflineExecutor orchestration tests."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from hyperloom.orchestrator.actions.executors import roofline as roofline_mod
+from hyperloom.orchestrator.actions.executors.roofline import (
+    RooflineExecutor,
+    _extract_trace_path,
+    _fail,
+    _gpu_trace_unsupported_reason,
+)
+from hyperloom.inference_optimizer.trace.task_progress import progress_scope
+from hyperloom.orchestrator.state.shared_state import ActionAttempt, SharedState
+from hyperloom.orchestrator.loop.sub_agent_runner import RunnerContext
+from hyperloom.orchestrator.state.task_registry import Task
+
+
+def _ctx(tmp_path: Path | None = None) -> RunnerContext:
+    task = Task(
+        task_id="t-roofline-1",
+        kind="roofline",
+        state="running",
+        params={"base_extra_args": "--mem-fraction-static=0.92"},
+        idempotency_key="roofline:t-1",
+        requires_lanes=["profile_lane"],
+    )
+    extra = {}
+    if tmp_path is not None:
+        extra["session_dir"] = str(tmp_path)
+    return RunnerContext(task=task, lease=None, extra=extra)
+
+
+def _state() -> SharedState:
+    s = SharedState()
+    s.baseline_tput = 100.0
+    return s
+
+
+def _profile_success(trace_path: str = "/tmp/trace.json.gz") -> dict:
+    return {
+        "status": "succeeded",
+        "main_trace_path": trace_path,
+        "workspace": "/tmp/workspace",
+        "output_throughput": 110.0,
+    }
+
+
+def _trace_analyze_success(*, snapshot_id_in_state: int = 1) -> dict:
+    """`trace_analyze_handler` success result shape."""
+    return {
+        "status": "ok",
+        "candidates_path": "/tmp/kc.json",
+        "trace_report_path": "/tmp/analysis.md",
+        "artifact_paths": {
+            "tracelens_steady_state_trace": "/tmp/mixed_steady_state.trace.json.gz",
+        },
+        "hot_kernels": [],
+        "trace_health_warnings": [],
+    }
+
+
+def _patch_subs(profile_result, ta_result):
+    """Return patches for both sub-step callables."""
+
+    async def fake_profile(ctx):
+        if isinstance(profile_result, Exception):
+            raise profile_result
+        return profile_result
+
+    async def fake_ta(payload, *, session_dir):
+        if isinstance(ta_result, Exception):
+            raise ta_result
+        return ta_result
+
+    return patch(
+        "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+        new=fake_profile,
+    ), patch(
+        "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+        new=fake_ta,
+    )
+
+
+@pytest.mark.asyncio
+async def test_happy_path_promotes_profile_and_caches_trace_analyze(tmp_path):
+    state = _state()
+    state.cumulative_gain_validated = 2.5
+    ctx = _ctx(tmp_path)
+
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nCompute 51%, Idle 48%\n", encoding="utf-8")
+    ta = _trace_analyze_success()
+    ta["trace_report_path"] = str(md)
+    ta["kernel_roofline_path"] = "/tmp/reports/kernel_roofline.json"
+
+    p1, p2 = _patch_subs(_profile_success("/tmp/trace.gz"), ta)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "succeeded"
+    assert result["snapshot_id"] == 1
+    assert result["last_profile_trace"] == "/tmp/trace.gz"
+    assert result["analysis_md_path"] == str(md)
+    assert result["kernel_roofline_path"] == "/tmp/reports/kernel_roofline.json"
+    assert result["profile_workspace"] == "/tmp/workspace"
+    assert "executed_at_iso" in result
+
+    assert state.last_profile_trace == "/tmp/trace.gz"
+    assert state.last_profile_status == "succeeded"
+    assert state.last_profile_args == "--mem-fraction-static=0.92"
+    assert state.last_profile_workload == state.profile_workload_context(ctx.task.params)
+    assert state.last_trace_analyze["trace_input"] == state.last_profile_trace
+    assert state.last_trace_analyze["steady_state_trace"] == ("/tmp/mixed_steady_state.trace.json.gz")
+    assert result["steady_state_trace"] == "/tmp/mixed_steady_state.trace.json.gz"
+    cached = state.last_trace_analyze
+    assert cached["analysis_md_path"] == str(md)
+    assert cached["kernel_roofline_path"] == "/tmp/reports/kernel_roofline.json"
+    assert "Executive Summary" in cached["analysis_md_text"]
+    assert cached["roofline_snapshot_id"] == 1
+    assert cached["roofline_baseline_gain_at_snapshot"] == 2.5
+
+
+@pytest.mark.asyncio
+async def test_roofline_passes_resolved_framework_to_trace_analysis(tmp_path, monkeypatch):
+    """The trace-analysis payload carries the same framework as the profile."""
+    state = _state()
+    state.framework = "xdit"
+    captured: list[dict] = []
+
+    async def fake_profile(_ctx):
+        return _profile_success("/tmp/xdit.trace.json.gz")
+
+    async def fake_trace_analyze(payload, *, session_dir):
+        captured.append(dict(payload))
+        return _trace_analyze_success()
+
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+        fake_profile,
+    )
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+        fake_trace_analyze,
+    )
+
+    result = await RooflineExecutor(shared_state=state)(_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert captured[0]["framework"] == "xdit"
+
+
+@pytest.mark.asyncio
+async def test_cuda_graph_capture_failure_is_reported_not_retried_eager(tmp_path, monkeypatch):
+    """A capture failure ends the action with its classification; roofline never re-boots the arm eager.
+
+    Re-booting eager would publish a trace of a configuration nobody asked to measure, so the whole outcome is
+    the classified failure plus enough evidence on disk to decide the fix offline.
+    """
+    state = _state()
+    state.framework = "vllm"
+    ctx = _ctx(tmp_path)
+    calls = 0
+
+    async def fake_profile(profile_ctx):
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "failed",
+            "error": "Capture cuda graph failed",
+        }
+
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+        fake_profile,
+    )
+
+    result = await RooflineExecutor(shared_state=state)(ctx)
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "profile_cuda_graph_capture_config_failed"
+    assert calls == 1
+    assert not state.last_profile_workload
+
+    evidence = tmp_path / "diagnostics" / "roofline_cuda_graph_capture_t-roofline-1.json"
+    # The message has to name the evidence: a failure nobody can act on offline is the thing being removed here.
+    assert str(evidence) in result["error"]
+    diagnosis = json.loads(evidence.read_text(encoding="utf-8"))
+    assert diagnosis["category"] == "config"
+    assert diagnosis["matched_marker"] == "capture cuda graph failed"
+    assert diagnosis["config"]["disable_cuda_graph"] is False
+    assert diagnosis["config"]["framework"] == "vllm"
+    assert "Capture cuda graph failed" in diagnosis["sources"]["last_error"]
+    assert diagnosis["marker_hits"][0]["source"] == "last_error"
+    assert diagnosis["marker_hits"][0]["line_no"] == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_marker_is_not_classified_when_capture_was_already_off(tmp_path, monkeypatch):
+    """With the operator override set, a capture marker is not evidence about this run.
+
+    The server log tail can span an earlier boot, so a stale marker must not hard-fail the action as a capture
+    failure -- and "does not re-profile with graph capture disabled" would be nonsense to read on a run that already
+    had it disabled. The failure stays a plain profile failure.
+    """
+    state = _state()
+    state.framework = "sglang"
+    ctx = _ctx(tmp_path)
+    monkeypatch.setenv("HYPERLOOM_PROFILE_DISABLE_CUDA_GRAPH", "1")
+
+    async def fake_profile(profile_ctx):
+        return {"status": "failed", "error": "Capture cuda graph failed"}
+
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+        fake_profile,
+    )
+
+    result = await RooflineExecutor(shared_state=state)(ctx)
+
+    assert result["status"] == "failed"
+    assert not result["error_class"].startswith("profile_cuda_graph_capture_")
+    assert "does not re-profile with graph capture disabled" not in result["error"]
+    assert not (tmp_path / "diagnostics").exists()
+
+
+@pytest.mark.asyncio
+async def test_profile_instrumentation_capture_failure_is_classified_apart(tmp_path, monkeypatch):
+    """The profiler's own shape discovery colliding with capture is a different owner than bad server args."""
+    state = _state()
+    state.framework = "sglang"
+    ctx = _ctx(tmp_path)
+
+    async def fake_profile(profile_ctx):
+        return {
+            "status": "failed",
+            "error": "AssertionError in get_num_new_pages: assert seq_lens.device == cpu_device",
+        }
+
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+        fake_profile,
+    )
+
+    result = await RooflineExecutor(shared_state=state)(ctx)
+
+    assert result["error_class"] == "profile_cuda_graph_capture_instrumentation_failed"
+    diagnosis = json.loads(
+        (tmp_path / "diagnostics" / "roofline_cuda_graph_capture_t-roofline-1.json").read_text(encoding="utf-8")
+    )
+    assert diagnosis["category"] == "instrumentation"
+
+
+@pytest.mark.asyncio
+async def test_happy_path_increments_snapshot_id_on_re_run(tmp_path):
+    """Second roofline run on the same session bumps snapshot_id."""
+    state = _state()
+    ctx = _ctx(tmp_path)
+    md = tmp_path / "a.md"
+    md.write_text("first", encoding="utf-8")
+    ta = _trace_analyze_success()
+    ta["trace_report_path"] = str(md)
+
+    p1, p2 = _patch_subs(_profile_success("/tmp/t1.gz"), ta)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result1 = await executor(ctx)
+    assert result1["snapshot_id"] == 1
+
+    md.write_text("second", encoding="utf-8")
+    state.cumulative_gain_validated = 4.0
+    p1b, p2b = _patch_subs(_profile_success("/tmp/t2.gz"), ta)
+    with p1b, p2b:
+        result2 = await executor(ctx)
+    assert result2["snapshot_id"] == 2
+    assert state.last_trace_analyze["roofline_baseline_gain_at_snapshot"] == 4.0
+
+
+@pytest.mark.asyncio
+async def test_profile_failed_does_not_mutate_shared_state(tmp_path):
+    state = _state()
+    state.last_profile_trace = "/old/trace.gz"
+    state.last_trace_analyze = {"analysis_md_text": "old", "roofline_snapshot_id": 5}
+    ctx = _ctx(tmp_path)
+
+    profile_failed = {
+        "status": "failed",
+        "error": "magpie exited 1",
+        "error_class": "subprocess_error",
+    }
+    p1, p2 = _patch_subs(profile_failed, _trace_analyze_success())
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "profile_failed"
+    assert result["phase"] == "profile"
+    assert "magpie exited 1" in result["error"]
+    assert result["sub_result"]["status"] == "failed"
+
+    assert state.last_profile_trace == "/old/trace.gz"
+    assert state.last_trace_analyze["roofline_snapshot_id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_profile_failed_with_trace_continues_to_trace_analyze(tmp_path):
+    """Duplicate stop_profile failures are non-fatal once a trace exists."""
+    state = _state()
+    ctx = _ctx(tmp_path)
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nRecovered trace\n", encoding="utf-8")
+    ta = _trace_analyze_success()
+    ta["trace_report_path"] = str(md)
+    profile_failed_with_trace = {
+        "status": "failed",
+        "error_class": "subprocess_nonzero",
+        "error": "RuntimeError: Profiling is not in progress. Call /start_profile first.",
+        "main_trace_path": "/tmp/recovered.trace.json.gz",
+        "workspace": "/tmp/workspace",
+    }
+
+    p1, p2 = _patch_subs(profile_failed_with_trace, ta)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "recovered"
+    assert result["last_profile_trace"] == "/tmp/recovered.trace.json.gz"
+    assert result["profile_warning"]["error_class"] == "subprocess_nonzero"
+    assert "Profiling is not in progress" in result["profile_warning"]["error"]
+    assert state.last_profile_trace == "/tmp/recovered.trace.json.gz"
+    assert state.last_profile_status == "recovered"
+    assert state.profile_trace_usable()
+    assert state.last_trace_analyze["analysis_md_path"] == str(md)
+
+
+@pytest.mark.asyncio
+async def test_profile_failed_without_trace_never_calls_trace_analyze(tmp_path):
+    """failed + no trace fields must stay profile_failed, never analyze a trace."""
+    state = _state()
+    state.last_profile_trace = "/old/trace.gz"
+    ctx = _ctx(tmp_path)
+    profile_failed_no_trace = {
+        "status": "failed",
+        "error_class": "no_trace_files",
+        "error": "no .trace.json.gz under /tmp/workspace",
+        "main_trace_path": None,
+        "trace_files": [],
+        "workspace": "/tmp/workspace",
+    }
+    ta_should_not_run = AssertionError("trace_analyze must not run without trace")
+
+    p1, p2 = _patch_subs(profile_failed_no_trace, ta_should_not_run)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "profile_failed"
+    assert result["phase"] == "profile"
+    assert "profile_warning" not in result
+    assert state.last_profile_trace == "/old/trace.gz"
+
+
+@pytest.mark.asyncio
+async def test_primary_rank_missing_is_not_retried(tmp_path):
+    calls = 0
+
+    async def fake_profile(_ctx):
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "failed",
+            "error_class": "primary_rank_trace_missing",
+            "error": "no rank-0 trace",
+            "trace_input_ready": False,
+            "trace_files": ["/tmp/merged.trace.json.gz"],
+        }
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with (
+        patch(
+            "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+            new=fake_profile,
+        ),
+        patch(
+            "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+            side_effect=AssertionError("trace_analyze must not run"),
+        ),
+    ):
+        result = await executor(_ctx(tmp_path))
+
+    assert calls == 1
+    assert result["status"] == "failed"
+    assert "no rank-0 trace" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "api_port_allocation_failed",
+        "capture_status_missing",
+        "profiler_output_unconfigured",
+    ],
+)
+async def test_deterministic_capture_failures_are_not_retried(tmp_path, reason):
+    calls = 0
+
+    async def fake_profile(_ctx):
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "failed",
+            "error_class": "profile_capture_failed",
+            "error": reason,
+            "trace_input_ready": False,
+            "trace_capture": {"status": "failed", "reason": reason},
+        }
+
+    executor = RooflineExecutor(shared_state=_state())
+    with patch(
+        "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+        new=fake_profile,
+    ):
+        result = await executor(_ctx(tmp_path))
+
+    assert calls == 1
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_profile_no_trace_path(tmp_path):
+    """Profile succeeded but result lacks main_trace_path / trace_files."""
+    state = _state()
+    ctx = _ctx(tmp_path)
+    profile_bad = {"status": "succeeded", "output_throughput": 110.0}
+    p1, p2 = _patch_subs(profile_bad, _trace_analyze_success())
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "profile_no_trace_failed"
+    assert "no trace_path" in result["error"]
+    assert state.last_profile_trace == ""
+
+
+def _selfcert_result(kernel_count: int, *, zero_ops: bool) -> dict:
+    """A profile result carrying only the two fields the stack-capability verdict reads."""
+    return {
+        "status": "succeeded",
+        "trace_validate": {"verdict": {"measures": {"kernel_count": kernel_count}}},
+        "trace_health": {"zero_ops": zero_ops},
+    }
+
+
+def test_zero_kernels_beside_a_populated_host_timeline_is_a_stack_verdict():
+    """The ROCm 10 Kineto shape: the trace parses and carries host ops, yet no kernel was recorded."""
+    reason = _gpu_trace_unsupported_reason(_selfcert_result(0, zero_ops=False))
+    assert reason == (
+        "the profiler recorded 0 GPU kernels beside a populated host timeline, so this stack cannot capture "
+        "GPU traces at all"
+    )
+
+
+@pytest.mark.parametrize(
+    "profile_result",
+    [
+        pytest.param(_selfcert_result(0, zero_ops=True), id="empty-window"),
+        pytest.param(_selfcert_result(91, zero_ops=False), id="kernels-present"),
+        pytest.param({"status": "succeeded"}, id="no-certificate"),
+        pytest.param(
+            {"status": "succeeded", "trace_validate": {"verdict": {"measures": {"kernel_count": 0}}}},
+            id="no-trace-health",
+        ),
+        pytest.param(
+            {
+                "status": "succeeded",
+                "trace_validate": {"verdict": {"measures": {"kernel_count": None}}},
+                "trace_health": {"zero_ops": False},
+            },
+            id="kernel-count-unmeasured",
+        ),
+    ],
+)
+def test_a_transient_capture_failure_is_never_a_stack_verdict(profile_result):
+    """Only a parsed trace with host ops and zero kernels condemns the stack; anything less must stay retryable,
+    because condemning it wrongly gives up kernel attribution for the rest of the session.
+    """
+    assert _gpu_trace_unsupported_reason(profile_result) == ""
+
+
+@pytest.mark.asyncio
+async def test_zero_kernel_trace_records_the_stack_verdict_on_shared_state(tmp_path):
+    """The verdict has to survive the action, since the enqueue gate reads it rather than the profile result."""
+    state = _state()
+    profile_result = _profile_success()
+    profile_result["trace_validate"] = {"verdict": {"measures": {"kernel_count": 0}}}
+    profile_result["trace_health"] = {"zero_ops": False}
+    p1, p2 = _patch_subs(profile_result, _trace_analyze_success())
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        await executor(_ctx(tmp_path))
+
+    assert state.gpu_trace_unsupported_reason == (
+        "the profiler recorded 0 GPU kernels beside a populated host timeline, so this stack cannot capture "
+        "GPU traces at all"
+    )
+
+
+def _trace_reporting_backend(path: Path, backend_line: str) -> str:
+    """A gzipped trace whose top-level metadata names the Kineto backend, as PyTorch writes it."""
+    import gzip as _gzip
+
+    body = '{\n  "schemaVersion": 1,\n' + backend_line + '  "traceEvents": [\n    {"cat": "kernel"}\n  ]\n}\n'
+    with _gzip.open(path, "wb") as handle:
+        handle.write(body.encode("utf-8"))
+    return str(path)
+
+
+@pytest.mark.asyncio
+async def test_the_condemning_verdict_names_the_backend_that_lost_the_kernels(tmp_path):
+    """Which backend recorded the trace is what matches the session against the upstream fix, so the verdict carries
+    it rather than leaving a reader to guess from the torch version.
+    """
+    state = _state()
+    trace = _trace_reporting_backend(tmp_path / "r.trace.json.gz", '  "rocprofiler-sdk_version": 1.3,\n')
+    profile_result = _profile_success(trace)
+    profile_result["trace_validate"] = {"verdict": {"measures": {"kernel_count": 0}}}
+    profile_result["trace_health"] = {"zero_ops": False}
+    p1, p2 = _patch_subs(profile_result, _trace_analyze_success())
+    with p1, p2:
+        await RooflineExecutor(shared_state=state)(_ctx(tmp_path))
+
+    assert state.gpu_trace_unsupported_reason == (
+        "the profiler recorded 0 GPU kernels beside a populated host timeline, so this stack cannot capture "
+        "GPU traces at all (Kineto backend: rocprofiler-sdk 1.3)"
+    )
+    assert state.stack_fingerprint_meta["kineto_backend"] == "rocprofiler-sdk 1.3"
+
+
+@pytest.mark.asyncio
+async def test_the_backend_is_recorded_even_when_the_capture_worked(tmp_path):
+    """The backend is stack provenance, not a failure detail: the healthy leg has to be identifiable too."""
+    state = _state()
+    trace = _trace_reporting_backend(tmp_path / "ok.trace.json.gz", '  "roctracer_version": 4.1,\n')
+    profile_result = _profile_success(trace)
+    profile_result["trace_validate"] = {"verdict": {"measures": {"kernel_count": 99631}}}
+    profile_result["trace_health"] = {"zero_ops": False}
+    p1, p2 = _patch_subs(profile_result, _trace_analyze_success())
+    with p1, p2:
+        await RooflineExecutor(shared_state=state)(_ctx(tmp_path))
+
+    assert state.stack_fingerprint_meta["kineto_backend"] == "roctracer 4.1"
+    assert state.gpu_trace_unsupported_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_a_trace_with_kernels_leaves_the_stack_uncondemned(tmp_path):
+    """The default path must stay untouched: a healthy capture leaves the gate open."""
+    state = _state()
+    profile_result = _profile_success()
+    profile_result["trace_validate"] = {"verdict": {"measures": {"kernel_count": 90488}}}
+    profile_result["trace_health"] = {"zero_ops": False}
+    p1, p2 = _patch_subs(profile_result, _trace_analyze_success())
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        await executor(_ctx(tmp_path))
+
+    assert state.gpu_trace_unsupported_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_profile_raises_exception(tmp_path):
+    state = _state()
+    ctx = _ctx(tmp_path)
+    p1, p2 = _patch_subs(RuntimeError("boom"), _trace_analyze_success())
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "profile_failed"
+    assert "boom" in result["error"]
+    assert "raised" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_profile_returns_non_dict(tmp_path):
+    state = _state()
+    ctx = _ctx(tmp_path)
+    p1, p2 = _patch_subs("garbage", _trace_analyze_success())
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+    assert result["status"] == "failed"
+    assert result["error_class"] == "profile_failed"
+    assert "non-dict" in result["error"]
+
+
+_NO_STEADY_STATE = {
+    "status": "failed",
+    "error_class": "trace_split_no_steady_state",
+    "error": "no steady-state window in the trace",
+}
+
+
+def _seed_profile_record(state: SharedState) -> None:
+    """Leave the record of an earlier roofline whose trace was analysed."""
+    state.last_profile_trace = "/prev/trace.gz"
+    state.last_profile_launch_evidence_path = "/prev/launch_evidence.json"
+    state.last_profile_status = "succeeded"
+    state.record_profile_workload({"base_extra_args": "--prev"}, arm="baseline")
+    state.last_trace_analyze = {"trace_input": "/prev/trace.gz", "analysis_md_text": "prev", "roofline_snapshot_id": 3}
+
+
+def _profile_record(state: SharedState) -> dict:
+    return {
+        "trace": state.last_profile_trace,
+        "launch_evidence": state.last_profile_launch_evidence_path,
+        "status": state.last_profile_status,
+        "workload": dict(state.last_profile_workload),
+        "workload_action": state.last_profile_workload_action,
+        "args": state.last_profile_args,
+        "analysis": dict(state.last_trace_analyze),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ta_result",
+    [
+        pytest.param(_NO_STEADY_STATE, id="reported-failure"),
+        pytest.param(ValueError("tracelens crashed"), id="raised"),
+        pytest.param(42, id="non-dict"),
+    ],
+)
+async def test_a_failed_analysis_leaves_the_previous_profile_record_intact(tmp_path, ta_result):
+    """The profile record pairs a trace with its analysis, so a trace whose analysis failed never enters it.
+
+    Recording it as succeeded beside an empty analysis reads as a roofline stuck in trace_analyze, and hands
+    forge-fusion and the kernel freshness checks a trace nothing could analyse.
+    """
+    state = _state()
+    _seed_profile_record(state)
+    previous = _profile_record(state)
+    profile = _profile_success("/tmp/new.gz")
+    profile["launch_evidence_path"] = "/tmp/new_launch_evidence.json"
+
+    p1, p2 = _patch_subs(profile, ta_result)
+    with p1, p2:
+        result = await RooflineExecutor(shared_state=state)(_ctx(tmp_path))
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "trace_analyze_failed"
+    assert result["phase"] == "trace_analyze"
+    assert _profile_record(state) == previous
+
+
+@pytest.mark.asyncio
+async def test_a_failed_analysis_still_records_what_the_profile_itself_showed(tmp_path):
+    """The stack verdict, the Kineto backend and the host-side rewrite evidence do not depend on the analysis.
+
+    The verdict in particular is what stops futile re-enqueues, and a zero-kernel trace is exactly the one whose
+    analysis fails.
+    """
+    state = _state()
+    trace = _trace_reporting_backend(tmp_path / "r.trace.json.gz", '  "rocprofiler-sdk_version": 1.3,\n')
+    profile = _profile_success(trace)
+    profile["trace_validate"] = {"verdict": {"measures": {"kernel_count": 0}}}
+    profile["trace_health"] = {"zero_ops": False}
+    profile["framework_rewrite_evidence"] = str(tmp_path / "framework_rewrite_evidence.json")
+    profile["framework_rewrite_evidence_status"] = "ok"
+
+    p1, p2 = _patch_subs(profile, _NO_STEADY_STATE)
+    with p1, p2:
+        result = await RooflineExecutor(shared_state=state)(_ctx(tmp_path))
+
+    assert result["status"] == "failed"
+    assert state.gpu_trace_unsupported_reason.endswith("(Kineto backend: rocprofiler-sdk 1.3)")
+    assert state.stack_fingerprint_meta["kineto_backend"] == "rocprofiler-sdk 1.3"
+    assert state.last_framework_rewrite_evidence == str(tmp_path / "framework_rewrite_evidence.json")
+    assert state.last_framework_rewrite_evidence_status == "ok"
+    assert state.last_profile_trace == ""
+    assert state.last_profile_status == ""
+
+
+@pytest.mark.asyncio
+async def test_trace_analyze_raises_exception(tmp_path):
+    state = _state()
+    ctx = _ctx(tmp_path)
+    p1, p2 = _patch_subs(_profile_success("/tmp/t.gz"), ValueError("bad payload"))
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+    assert result["status"] == "failed"
+    assert result["error_class"] == "trace_analyze_failed"
+    assert "bad payload" in result["error"]
+    assert state.last_profile_trace == ""
+
+
+@pytest.mark.asyncio
+async def test_trace_analyze_returns_non_dict(tmp_path):
+    state = _state()
+    ctx = _ctx(tmp_path)
+    p1, p2 = _patch_subs(_profile_success("/tmp/t.gz"), 42)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+    assert result["status"] == "failed"
+    assert result["error_class"] == "trace_analyze_failed"
+    assert "non-dict" in result["error"]
+
+
+def test_extract_trace_path_prefers_main_trace_path():
+    r = {
+        "main_trace_path": "/main.gz",
+        "trace_files": ["/alt-0.gz", "/alt-1.gz"],
+    }
+    assert _extract_trace_path(r) == "/main.gz"
+
+
+def test_extract_trace_path_falls_back_to_first_trace_file():
+    r = {"trace_files": ["/first.gz", "/second.gz"]}
+    assert _extract_trace_path(r) == "/first.gz"
+
+
+def test_extract_trace_path_refuses_explicitly_unready_trace():
+    r = {
+        "trace_input_ready": False,
+        "main_trace_path": "/merged.gz",
+        "trace_files": ["/merged.gz"],
+    }
+    assert _extract_trace_path(r) == ""
+
+
+def test_extract_trace_path_empty_when_both_missing():
+    assert _extract_trace_path({}) == ""
+    assert _extract_trace_path({"trace_files": []}) == ""
+    assert _extract_trace_path({"trace_files": [None]}) == ""
+
+
+def test_extract_trace_path_handles_non_dict():
+    assert _extract_trace_path(None) == ""  # type: ignore[arg-type]
+    assert _extract_trace_path("garbage") == ""  # type: ignore[arg-type]
+
+
+def test_fail_helper_constructs_canonical_shape():
+    f = _fail(None, "profile", "boom")
+    assert f["status"] == "failed"
+    assert f["error_class"] == "profile_failed"
+    assert f["error"] == "boom"
+    assert f["phase"] == "profile"
+    assert "executed_at_iso" in f
+    assert "sub_result" not in f
+
+    f2 = _fail(None, "trace_analyze", "x", {"status": "failed", "error": "y", "extra": "ignored"})
+    assert f2["sub_result"] == {"status": "failed", "error": "y"}
+    assert "extra" not in f2["sub_result"]
+
+
+def test_roofline_executor_requires_shared_state():
+    with pytest.raises(ValueError, match="requires a SharedState"):
+        RooflineExecutor(shared_state=None)
+
+
+def test_wrap_profile_ctx_creates_child_task():
+    state = SharedState()
+    exe = RooflineExecutor(shared_state=state)
+    parent = _ctx()
+    parent.extra["session_dir"] = "/sess"
+    child = exe._wrap_profile_ctx(parent)
+    assert child.task.kind == "profile"
+    assert child.task.task_id == "t-roofline-1-profile"
+    assert child.task.idempotency_key == "roofline:t-1-profile"
+    assert child.task.state == "running"
+    assert child.task.params == {"base_extra_args": "--mem-fraction-static=0.92"}
+    assert child.extra["session_dir"] == "/sess"
+    assert child.lease is parent.lease
+
+
+# N10: Coordinator persists roofline executor SharedState mutations to state.json.
+import json
+
+from hyperloom.orchestrator.roles import (
+    MockBackend,
+    MockCriticBackend,
+    ScriptedPlan,
+)
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.orchestrator.state._shared_state.attempt_audit import (
+    _AUDIT_ACTIONS as SHARED_STATE_AUDIT_ACTIONS,
+    _KEY_METRIC_MAP,
+)
+from hyperloom.inference_optimizer.session.paths import make_session_dir
+
+
+@pytest.fixture
+def session_dir(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
+    return make_session_dir()
+
+
+def _silent_backends() -> dict[str, object]:
+    silent = ScriptedPlan(
+        turns=[],
+        default_intent=Intent(
+            type=IntentType.SEND_MESSAGE,
+            payload={"topic": "heartbeat", "body_md": "ok"},
+        ),
+    )
+    return {
+        "orchestration": MockBackend(silent, name="orch"),
+        "critic": MockCriticBackend(),
+    }
+
+
+def _roofline_task(snapshot_id: int = 1) -> Task:
+    return Task(
+        task_id="t-rf-1",
+        kind="roofline",
+        state="running",
+        params={"base_extra_args": "--mem-fraction-static=0.9"},
+        idempotency_key=f"roofline-tick5-initial-{snapshot_id}",
+    )
+
+
+def _roofline_result(snapshot_id: int = 1) -> dict:
+    """Mirrors RooflineExecutor's success result."""
+    return {
+        "status": "succeeded",
+        "executed_at_iso": "2026-05-19T15:55:00+00:00",
+        "snapshot_id": snapshot_id,
+        "last_profile_trace": "/sessions/abc/runs/roofline/.../trace.json.gz",
+        "analysis_md_path": "/sessions/abc/kernel-agent/runs/.../analysis.md",
+        "profile_workspace": "/sessions/abc/runs/roofline/.../benchmark_sglang_...",
+    }
+
+
+def test_shared_state_has_roofline_audit_fields_by_default():
+    """Both audit mirrors are declared fields, so both survive a save."""
+    s = SharedState()
+    assert s.roofline_attempts == []
+    assert s.last_roofline == {}
+    assert {"roofline_attempts", "last_roofline"} <= set(s.to_dict())
+
+
+def test_audit_actions_includes_roofline():
+    """One set gates both the recorder and writeback's failed-attempt row."""
+    from hyperloom.orchestrator.loop import writeback as wb
+
+    assert "roofline" in SHARED_STATE_AUDIT_ACTIONS
+    assert wb._AUDIT_ACTIONS is SHARED_STATE_AUDIT_ACTIONS
+
+
+def test_key_metric_map_has_roofline_snapshot_id():
+    assert "roofline" in _KEY_METRIC_MAP
+    key, label = _KEY_METRIC_MAP["roofline"]
+    assert key == "snapshot_id"
+    assert label == "snapshot_id"
+
+
+def test_record_action_attempt_populates_last_roofline_and_history():
+    s = SharedState()
+    s.record_action_attempt(
+        action="roofline",
+        attempt=ActionAttempt(
+            task_id="t-rf-1",
+            status="succeeded",
+            decision="promoted",
+            result={"snapshot_id": 3},
+            extras={"analysis_md_path": "/p/analysis.md"},
+        ),
+    )
+    assert s.last_roofline
+    assert s.last_roofline.get("status") == "succeeded"
+    assert s.last_roofline.get("decision") == "promoted"
+    assert s.last_roofline.get("key_metric") == 3
+    assert s.last_roofline.get("key_metric_kind") == "snapshot_id"
+    assert s.last_roofline.get("extras", {}).get("analysis_md_path") == "/p/analysis.md"
+    assert len(s.roofline_attempts) == 1
+
+
+def test_record_action_attempt_caps_roofline_history():
+    s = SharedState()
+    for i in range(25):
+        s.record_action_attempt(
+            action="roofline",
+            attempt=ActionAttempt(task_id=f"t-{i}", status="succeeded", decision="promoted", result={"snapshot_id": i}),
+        )
+    assert len(s.roofline_attempts) == 20
+    assert s.roofline_attempts[-1].get("task_id") == "t-24"
+
+
+@pytest.mark.asyncio
+async def test_promote_roofline_flips_changed_and_saves(session_dir):
+    coord = Coordinator(session_dir, backends=_silent_backends())
+    s = coord.shared_state
+
+    s.last_profile_trace = "/sessions/abc/runs/roofline/.../trace.json.gz"
+    s.last_profile_status = "succeeded"
+    s.last_profile_args = "--mem-fraction-static=0.9"
+    s.last_trace_analyze = {
+        "trace_input": "/sessions/abc/runs/roofline/.../trace.json.gz",
+        "analysis_md_path": "/sessions/abc/.../analysis.md",
+        "analysis_md_text": "# Executive Summary\nCompute 51%\n",
+        "roofline_snapshot_id": 1,
+        "roofline_baseline_gain_at_snapshot": 0.0,
+    }
+
+    s.save(session_dir)
+    pre = json.loads((session_dir / "state.json").read_text())
+    assert pre.get("last_profile_trace", "") == s.last_profile_trace
+
+    s.last_profile_trace = "/sessions/abc/.../NEW_trace.gz"
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        _roofline_result(snapshot_id=1),
+        task=_roofline_task(),
+    )
+    post = json.loads((session_dir / "state.json").read_text())
+    assert post.get("last_profile_trace") == "/sessions/abc/.../NEW_trace.gz", (
+        "N10 promote_to_shared_state 'roofline' branch must trigger "
+        "the tail-save; otherwise the post-promote state.json would "
+        "still show the pre-mutate trace path"
+    )
+
+
+@pytest.mark.asyncio
+async def test_promote_roofline_records_audit_attempt(session_dir):
+    coord = Coordinator(session_dir, backends=_silent_backends())
+    s = coord.shared_state
+    s.last_trace_analyze = {
+        "analysis_md_path": "/p/analysis.md",
+        "roofline_snapshot_id": 1,
+    }
+    s.last_profile_trace = "/t/trace.gz"
+
+    assert s.roofline_attempts == []
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        _roofline_result(snapshot_id=1),
+        task=_roofline_task(),
+    )
+    assert len(s.roofline_attempts) == 1, "roofline must enter _AUDIT_ACTIONS so record_action_attempt fires"
+    attempt = s.roofline_attempts[-1]
+    assert attempt.get("status") == "succeeded"
+    assert attempt.get("decision") == "promoted"
+    assert attempt.get("task_id") == "t-rf-1"
+    extras = attempt.get("extras") or {}
+    assert extras.get("snapshot_id") == 1
+    assert extras.get("analysis_md_path") == "/p/analysis.md"
+
+
+@pytest.mark.asyncio
+async def test_promote_roofline_does_not_remutate_state(session_dir):
+    coord = Coordinator(session_dir, backends=_silent_backends())
+    s = coord.shared_state
+    s.last_profile_trace = "/before/trace.gz"
+    s.last_trace_analyze = {
+        "analysis_md_text": "before report",
+        "roofline_snapshot_id": 3,
+    }
+    s.last_profile_status = "succeeded"
+
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        _roofline_result(snapshot_id=3),
+        task=_roofline_task(snapshot_id=3),
+    )
+    assert s.last_profile_trace == "/before/trace.gz"
+    assert s.last_trace_analyze["analysis_md_text"] == "before report"
+    assert s.last_trace_analyze["roofline_snapshot_id"] == 3
+    assert s.last_profile_status == "succeeded"
+
+
+def test_format_analysis_md_pointer_points_at_the_tool_instead_of_inlining():
+    s = SharedState()
+    s.last_trace_analyze = {
+        "roofline_snapshot_id": 7,
+        "roofline_baseline_gain_at_snapshot": 3.0,
+        "analysis_md_text": "# Report\nverbatim body text\n",
+        "analysis_md_path": "/p/analysis.md",
+    }
+    rendered = s._format_analysis_md_pointer()
+    assert "verbatim body text" not in rendered
+    assert "show_analysis_md" in rendered
+    assert "snapshot #7" in rendered
+
+
+# N26: RooflineExecutor auto-retries trace_analyze on steady_state_chunk_{empty,missing} with an alternate mode.
+from hyperloom.orchestrator.actions.executors.roofline import (
+    _extract_steady_state_retry_mode,
+)
+
+
+def _n26_ctx(tmp_path: Path) -> RunnerContext:
+    task = Task(
+        task_id="t-n26-1",
+        kind="roofline",
+        state="running",
+        params={"base_extra_args": ""},
+        idempotency_key="roofline:n26-1",
+        requires_lanes=["profile_lane"],
+    )
+    return RunnerContext(task=task, lease=None, extra={"session_dir": str(tmp_path)})
+
+
+def _profile_ok(trace: str = "/tmp/t.gz") -> dict:
+    return {
+        "status": "succeeded",
+        "main_trace_path": trace,
+        "workspace": "/tmp/wsp",
+        "output_throughput": 50.0,
+    }
+
+
+def _ta_empty_chunk_failure(
+    *,
+    requested: str = "mixed",
+    non_empty: list[str] | None = None,
+) -> dict:
+    return {
+        "status": "failed",
+        "error": (
+            f"RuntimeError: steady_state_chunk_low_quality: requested "
+            f"--steady-state-mode={requested} but the selected chunk has "
+            "zero GPU events"
+        ),
+        "trace_health_warnings": [
+            {
+                "code": "steady_state_chunk_low_quality",
+                "severity": "blocking",
+                "requested_mode": requested,
+                "selected_chunk": f"/tmp/{requested}.json.gz",
+                "num_gpu_events": 0,
+                "gpu_busy_duration": 0.0,
+                "non_empty_modes": list(non_empty if non_empty is not None else []),
+                "remediation": "Re-issue with one of non_empty_modes.",
+                "message": "stub",
+            },
+        ],
+    }
+
+
+def _ta_missing_chunk_failure(
+    *,
+    requested: str = "decode_only",
+    available: list[str] | None = None,
+) -> dict:
+    return {
+        "status": "failed",
+        "error": (
+            f"RuntimeError: steady_state_chunk_missing: requested "
+            f"--steady-state-mode={requested} but splitter produced no "
+            "matching chunk"
+        ),
+        "trace_health_warnings": [
+            {
+                "code": "steady_state_chunk_missing",
+                "severity": "blocking",
+                "requested_mode": requested,
+                "requested_chunk_label": f"{requested}_steady_state",
+                "available_modes": list(available if available is not None else []),
+                "remediation": "Re-issue with one of available_modes.",
+                "trace_input": "/tmp/raw.trace.json.gz",
+                "split_dir": "/tmp/split",
+            },
+        ],
+    }
+
+
+def _ta_ok(*, report_md: Path) -> dict:
+    return {
+        "status": "ok",
+        "candidates_path": "/tmp/kc.json",
+        "trace_report_path": str(report_md),
+        "hot_kernels": [],
+        "trace_health_warnings": [],
+    }
+
+
+def _run_roofline_captured_payload(tmp_path, *, reason: str) -> dict:
+    """Run RooflineExecutor with stubbed profile/trace_analyze; return the payload passed to record_trace_analyze."""
+    import asyncio
+
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nbody\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    async def fake_profile(ctx):
+        return _profile_ok()
+
+    async def fake_ta(payload, *, session_dir):
+        return _ta_ok(report_md=md)
+
+    state = _state()
+    orig_record = state.record_trace_analyze
+
+    def record_spy(payload, result):
+        captured["payload"] = dict(payload)
+        return orig_record(payload, result)
+
+    state.record_trace_analyze = record_spy  # type: ignore[assignment]
+
+    task = Task(
+        task_id=f"t-{reason}-1",
+        kind="roofline",
+        state="running",
+        params={"base_extra_args": "", "reason": reason},
+        idempotency_key=f"roofline:{reason}-1",
+        requires_lanes=["profile_lane"],
+    )
+    ctx = RunnerContext(
+        task=task,
+        lease=None,
+        extra={"session_dir": str(tmp_path)},
+    )
+
+    executor = RooflineExecutor(shared_state=state)
+    with (
+        patch(
+            "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+            new=fake_profile,
+        ),
+        patch(
+            "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+            new=fake_ta,
+        ),
+    ):
+        result = asyncio.run(executor(ctx))
+
+    assert result["status"] == "succeeded"
+    return captured["payload"]  # type: ignore[return-value]
+
+
+def test_prelude_roofline_records_baseline_arm(tmp_path):
+    """A prelude_initial roofline tags trace_analyze payload roofline_arm=baseline."""
+    payload = _run_roofline_captured_payload(tmp_path, reason="prelude_initial")
+    assert payload.get("roofline_arm") == "baseline"
+
+
+def test_watermark_roofline_tags_current_best_arm(tmp_path):
+    """A non-prelude roofline explicitly tags arm=current_best (no reliance on transient recorder inference)."""
+    payload = _run_roofline_captured_payload(
+        tmp_path,
+        reason="explore_keep_watermark",
+    )
+    assert payload.get("roofline_arm") == "current_best"
+
+
+def test_extract_picks_first_non_empty_mode():
+    res = _ta_empty_chunk_failure(non_empty=["prefilldecode"])
+    out = _extract_steady_state_retry_mode(res)
+    assert out is not None
+    mode, w = out
+    assert mode == "prefilldecode"
+    assert w["code"] == "steady_state_chunk_low_quality"
+
+
+def test_extract_handles_missing_chunk_warning():
+    res = _ta_missing_chunk_failure(available=["mixed", "prefilldecode"])
+    out = _extract_steady_state_retry_mode(res)
+    assert out is not None
+    mode, w = out
+    assert mode == "mixed"
+    assert w["code"] == "steady_state_chunk_missing"
+
+
+def test_extract_returns_none_when_no_alternate():
+    res = _ta_empty_chunk_failure(non_empty=[])
+    assert _extract_steady_state_retry_mode(res) is None
+
+
+def test_extract_returns_none_for_unrelated_warning():
+    res = {
+        "status": "failed",
+        "trace_health_warnings": [
+            {"code": "tracelens_analysis_failed", "severity": "warning"},
+        ],
+    }
+    assert _extract_steady_state_retry_mode(res) is None
+
+
+def test_extract_returns_none_for_empty_result():
+    assert _extract_steady_state_retry_mode({}) is None
+    assert _extract_steady_state_retry_mode({"status": "ok"}) is None
+    assert (
+        _extract_steady_state_retry_mode(  # type: ignore[arg-type]
+            None
+        )
+        is None
+    )
+
+
+def test_extract_skips_blank_mode_entries():
+    res = _ta_empty_chunk_failure(non_empty=["", "   ", "prefilldecode"])
+    out = _extract_steady_state_retry_mode(res)
+    assert out is not None
+    assert out[0] == "prefilldecode"
+
+
+def _n26_patch_subs(profile_result, ta_results, *, on_ta_call=None):
+    ta_calls = {"n": 0, "payloads": []}
+
+    async def fake_profile(ctx):
+        return profile_result
+
+    async def fake_ta(payload, *, session_dir):
+        idx = ta_calls["n"]
+        ta_calls["payloads"].append(dict(payload))
+        ta_calls["n"] += 1
+        if on_ta_call is not None:
+            on_ta_call()
+        if idx >= len(ta_results):
+            return ta_results[-1]
+        return ta_results[idx]
+
+    return (
+        patch(
+            "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+            new=fake_profile,
+        ),
+        patch(
+            "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+            new=fake_ta,
+        ),
+        ta_calls,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_retry_succeeds_on_alternate_mode(tmp_path):
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nCompute 60%, Idle 40%\n", encoding="utf-8")
+    fail = _ta_empty_chunk_failure(
+        requested="mixed",
+        non_empty=["prefilldecode"],
+    )
+    succ = _ta_ok(report_md=md)
+    p1, p2, calls = _n26_patch_subs(_profile_ok(), [fail, succ])
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert result["snapshot_id"] == 1
+    assert calls["n"] == 2
+    assert calls["payloads"][0].get("steady_state_mode") is None
+    assert calls["payloads"][1]["steady_state_mode"] == "prefilldecode"
+    assert state.last_profile_trace == "/tmp/t.gz"
+    cached = state.last_trace_analyze
+    assert cached["analysis_md_path"] == str(md)
+    assert cached["roofline_snapshot_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_retry_succeeds_on_missing_chunk(tmp_path):
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nCompute 80%, Idle 20%\n", encoding="utf-8")
+    fail = _ta_missing_chunk_failure(
+        requested="decode_only",
+        available=["mixed", "prefilldecode"],
+    )
+    succ = _ta_ok(report_md=md)
+    p1, p2, calls = _n26_patch_subs(_profile_ok(), [fail, succ])
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert calls["payloads"][1]["steady_state_mode"] == "mixed"
+
+
+@pytest.mark.asyncio
+async def test_no_retry_when_no_alternate_modes(tmp_path):
+    fail = _ta_empty_chunk_failure(requested="mixed", non_empty=[])
+    p1, p2, calls = _n26_patch_subs(_profile_ok(), [fail])
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "failed"
+    assert result.get("phase") == "trace_analyze"
+    assert "steady_state_chunk_low_quality" in str(result.get("error") or "")
+    assert calls["n"] == 1
+    assert state.last_trace_analyze == {}
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_unrelated_failure(tmp_path):
+    fail = {
+        "status": "failed",
+        "error": "RuntimeError: TraceLens skill crashed",
+        "trace_health_warnings": [
+            {"code": "tracelens_analysis_failed", "severity": "warning"},
+        ],
+    }
+    p1, p2, calls = _n26_patch_subs(_profile_ok(), [fail])
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "failed"
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_propagates_without_third_attempt(tmp_path):
+    fail1 = _ta_empty_chunk_failure(
+        requested="mixed",
+        non_empty=["prefilldecode"],
+    )
+    fail2 = {
+        "status": "failed",
+        "error": (
+            "RuntimeError: steady_state_chunk_low_quality: requested "
+            "--steady-state-mode=prefilldecode but the selected chunk has "
+            "zero GPU events"
+        ),
+        "trace_health_warnings": [
+            {
+                "code": "steady_state_chunk_low_quality",
+                "requested_mode": "prefilldecode",
+                "non_empty_modes": ["decode_only"],
+            },
+        ],
+    }
+    p1, p2, calls = _n26_patch_subs(_profile_ok(), [fail1, fail2])
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "failed"
+    assert calls["n"] == 2
+    err = str(result.get("error") or "")
+    assert "prefilldecode" in err
+
+
+@pytest.mark.asyncio
+async def test_retry_exception_propagates(tmp_path):
+    fail = _ta_empty_chunk_failure(
+        requested="mixed",
+        non_empty=["prefilldecode"],
+    )
+
+    async def fake_profile(ctx):
+        return _profile_ok()
+
+    call_count = {"n": 0}
+
+    async def fake_ta(payload, *, session_dir):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return fail
+        raise RuntimeError("network unreachable")
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with (
+        patch(
+            "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+            new=fake_profile,
+        ),
+        patch(
+            "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+            new=fake_ta,
+        ),
+    ):
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "failed"
+    err = str(result.get("error") or "")
+    assert "N26 auto-retry" in err
+    assert "prefilldecode" in err
+
+
+@pytest.mark.asyncio
+async def test_retry_success_stamps_n26_metadata(tmp_path):
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nCompute 60%, Idle 40%\n", encoding="utf-8")
+    fail = _ta_empty_chunk_failure(
+        requested="mixed",
+        non_empty=["prefilldecode"],
+    )
+    succ = _ta_ok(report_md=md)
+
+    captured = {"ta_result": None}
+
+    async def fake_profile(ctx):
+        return _profile_ok()
+
+    async def fake_ta(payload, *, session_dir):
+        return fail if payload.get("steady_state_mode") != "prefilldecode" else succ
+
+    state = _state()
+
+    orig_record = state.record_trace_analyze
+
+    def record_spy(payload, result):
+        captured["ta_result"] = dict(result)
+        return orig_record(payload, result)
+
+    state.record_trace_analyze = record_spy  # type: ignore[assignment]
+
+    executor = RooflineExecutor(shared_state=state)
+    with (
+        patch(
+            "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+            new=fake_profile,
+        ),
+        patch(
+            "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+            new=fake_ta,
+        ),
+    ):
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    stamp = (captured["ta_result"] or {}).get("n26_auto_retry") or {}
+    assert stamp.get("applied") is True
+    assert stamp.get("from_mode") == "mixed"
+    assert stamp.get("to_mode") == "prefilldecode"
+    assert stamp.get("source_warning_code") == "steady_state_chunk_low_quality"
+
+
+@pytest.mark.asyncio
+async def test_retry_works_when_operator_started_with_non_mixed(tmp_path):
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nCompute 60%, Idle 40%\n", encoding="utf-8")
+    fail = _ta_empty_chunk_failure(
+        requested="prefilldecode",
+        non_empty=["decode_only"],
+    )
+    succ = _ta_ok(report_md=md)
+    p1, p2, calls = _n26_patch_subs(_profile_ok(), [fail, succ])
+
+    state = _state()
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert calls["payloads"][1]["steady_state_mode"] == "decode_only"
+
+
+# cuda-graph folding -> trace_analyze ok but 0 hot kernels
+@pytest.mark.asyncio
+async def test_431_zero_hot_with_degraded_trace_appends_warning(tmp_path):
+    """trace_analyze succeeds but returns 0 hot kernels because cuda-graph capture folded per-kernel activity; the executor appends a ``cuda_graph_attribution_degraded`` trace_health_warnings entry so the LLM re-profiles eager instead of reading top=[] as 'no optimizable kernels'."""
+    state = _state()
+    ctx = _ctx(tmp_path)
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\nCompute 80%, Idle 18%\n", encoding="utf-8")
+
+    profile = _profile_success("/tmp/trace.gz")
+    profile["trace_health"] = {
+        "per_kernel_attribution_degraded": True,
+        "capture_traces_present": True,
+        "issues": ["[3] main trace ... no execute_*/user_annotation ..."],
+    }
+    ta = _trace_analyze_success()
+    ta["trace_report_path"] = str(md)
+
+    p1, p2 = _patch_subs(profile, ta)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "succeeded"
+    assert result["kernel_attribution_degraded"] is True
+    warnings = state.last_trace_analyze.get("trace_health_warnings") or []
+    codes = [w.get("code") for w in warnings if isinstance(w, dict)]
+    assert "cuda_graph_attribution_degraded" in codes, warnings
+    w = next(w for w in warnings if w.get("code") == "cuda_graph_attribution_degraded")
+    assert w["capture_traces_present"] is True
+    assert "--compilation-config.cudagraph_mode NONE" in w["message"]
+
+
+@pytest.mark.asyncio
+async def test_431_zero_hot_without_degraded_health_no_warning(tmp_path):
+    """Healthy trace (per_kernel_attribution_degraded=False) that genuinely finds 0 hot kernels must NOT be mislabeled as cuda-graph degradation."""
+    state = _state()
+    ctx = _ctx(tmp_path)
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\n", encoding="utf-8")
+
+    profile = _profile_success("/tmp/trace.gz")
+    profile["trace_health"] = {
+        "per_kernel_attribution_degraded": False,
+        "capture_traces_present": True,
+        "issues": [],
+    }
+    ta = _trace_analyze_success()
+    ta["trace_report_path"] = str(md)
+
+    p1, p2 = _patch_subs(profile, ta)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "succeeded"
+    assert result["kernel_attribution_degraded"] is False
+    warnings = state.last_trace_analyze.get("trace_health_warnings") or []
+    codes = [w.get("code") for w in warnings if isinstance(w, dict)]
+    assert "cuda_graph_attribution_degraded" not in codes
+
+
+def _progress_sink(notes: list[dict]):
+    """Build an ambient progress sink appending every note to ``notes``."""
+
+    async def _sink(**note):
+        notes.append(note)
+
+    return _sink
+
+
+@pytest.mark.asyncio
+async def test_the_n26_retry_reports_before_it_runs(tmp_path):
+    """The retry re-runs TraceLens; unannounced, it is indistinguishable from a hang."""
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\n", encoding="utf-8")
+    notes: list[dict] = []
+    at_call: list[list[str]] = []
+    fail = _ta_empty_chunk_failure(requested="mixed", non_empty=["prefilldecode"])
+    p1, p2, _calls = _n26_patch_subs(
+        _profile_ok(),
+        [fail, _ta_ok(report_md=md)],
+        on_ta_call=lambda: at_call.append([n["label"] for n in notes]),
+    )
+
+    executor = RooflineExecutor(shared_state=_state())
+    with p1, p2, progress_scope(_progress_sink(notes)):
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert at_call == [
+        ["profile", "trace_analyze"],
+        ["profile", "trace_analyze", "trace_analyze_n26_retry"],
+    ]
+    assert all(n["unit"] == "roofline_step" and n["status"] == "started" for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_the_compute_bound_reprofile_reports_both_of_its_steps(tmp_path, monkeypatch):
+    """A second profile and a second analysis, silent end to end until now."""
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\n", encoding="utf-8")
+    host_bound = _ta_ok(report_md=md)
+    host_bound["trace_health_warnings"] = [
+        {"code": "high_gpu_idle_pct", "severity": "warning"},
+    ]
+    compute_bound = _ta_ok(report_md=md)
+    compute_bound["hot_kernels"] = [{"kernel_id": "k001", "name": "fused_moe", "gpu_pct": 30.0}]
+    notes: list[dict] = []
+    p1, p2, _calls = _n26_patch_subs(_profile_ok(), [host_bound, compute_bound])
+    monkeypatch.setattr(roofline_mod, "is_multi_node", lambda: True)
+
+    executor = RooflineExecutor(shared_state=_state())
+    with p1, p2, progress_scope(_progress_sink(notes)):
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert [n["label"] for n in notes] == [
+        "profile",
+        "trace_analyze",
+        "profile_compute_bound",
+        "trace_analyze_compute_bound",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_compute_bound_reprofile_still_rows_the_attempt(tmp_path, monkeypatch):
+    """An attempt that raises must still appear in the event's ``runs``."""
+    from hyperloom.inference_optimizer.session.sbd_v6 import read_timeline_events
+    from hyperloom.inference_optimizer.breakdown.recorder.roofline_event import PROFILE_ATTEMPT_COMPUTE_BOUND
+
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\n", encoding="utf-8")
+    host_bound = _ta_ok(report_md=md)
+    host_bound["trace_health_warnings"] = [{"code": "high_gpu_idle_pct", "severity": "warning"}]
+    profile_calls = {"n": 0}
+
+    async def fake_profile(ctx):
+        profile_calls["n"] += 1
+        if profile_calls["n"] == 1:
+            return _profile_ok()
+        raise RuntimeError("server boot failed on the compute-bound retry")
+
+    async def fake_ta(payload, *, session_dir):
+        return host_bound
+
+    monkeypatch.setattr(roofline_mod, "is_multi_node", lambda: True)
+
+    executor = RooflineExecutor(shared_state=_state())
+    with (
+        patch(
+            "hyperloom.orchestrator.actions.executors.profile.profile_executor",
+            new=fake_profile,
+        ),
+        patch(
+            "hyperloom.orchestrator.actions.executors.trace_analyze.trace_analyze_handler",
+            new=fake_ta,
+        ),
+    ):
+        result = await executor(_n26_ctx(tmp_path))
+
+    # Fail-soft is preserved: the host-bound analysis remains the outcome.
+    assert result["status"] == "succeeded"
+
+    event = next(e for e in read_timeline_events(tmp_path) if e.get("type") == "roofline")
+    action = event["ext"]["actions"][0]
+    profile = action["profile"]
+    assert profile["attempt_count"] == 2
+    raised = profile["runs"][-1]
+    assert raised["attempt_reason"] == PROFILE_ATTEMPT_COMPUTE_BOUND
+    assert raised["status"] == "failed"
+    assert "server boot failed" in raised["failure"]["message"]
+    assert action["analysis"]["compute_bound_reprofile"]["adopted"] is False
+
+
+@pytest.mark.asyncio
+async def test_431_nonzero_hot_never_flags_degraded(tmp_path):
+    """Even if trace_health says degraded, a non-empty hot_kernels list proves attribution worked — do NOT append the warning."""
+    state = _state()
+    ctx = _ctx(tmp_path)
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\n", encoding="utf-8")
+
+    profile = _profile_success("/tmp/trace.gz")
+    profile["trace_health"] = {
+        "per_kernel_attribution_degraded": True,
+        "capture_traces_present": False,
+        "issues": [],
+    }
+    ta = _trace_analyze_success()
+    ta["hot_kernels"] = [
+        {"kernel_id": "k001", "name": "fused_moe", "gpu_pct": 30.0},
+    ]
+    ta["trace_report_path"] = str(md)
+
+    p1, p2 = _patch_subs(profile, ta)
+    executor = RooflineExecutor(shared_state=state)
+    with p1, p2:
+        result = await executor(ctx)
+
+    assert result["status"] == "succeeded"
+    assert result["kernel_attribution_degraded"] is False
+    warnings = state.last_trace_analyze.get("trace_health_warnings") or []
+    codes = [w.get("code") for w in warnings if isinstance(w, dict)]
+    assert "cuda_graph_attribution_degraded" not in codes

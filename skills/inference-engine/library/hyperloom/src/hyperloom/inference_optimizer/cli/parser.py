@@ -1,0 +1,1170 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""CLI argument parser — ``_build_parser`` and its purely-computational helpers."""
+
+from __future__ import annotations
+
+from .benchmark_config import add_benchmark_argument
+
+import argparse
+import os
+from pathlib import Path
+from typing import NoReturn
+
+from .. import framework_registry
+from .constraint_args import add_constraint_arguments
+from .gpu_power_args import add_gpu_power_arguments
+from .backends import CRITIC_PROTOCOL_CHOICES
+from .recover import add_recover_subparser
+from .session_target import add_session_dir_argument
+from hyperloom.common import predictor_config
+from hyperloom_common.gpu_identity import AMD_GPU_BOARDS
+from hyperloom_common.llm.llm_config import is_anthropic_only, is_openai_only, provider_model_defaults
+
+# Workload knob fallbacks live in ``hyperloom.common`` so that the orchestrator
+# can read the same numbers without importing this module, which would close a
+# cycle. Only the ones this module quotes in help text are pulled in here.
+from hyperloom.common.workload_defaults import (
+    DEFAULT_CONC,
+    DEFAULT_ISL,
+    DEFAULT_OSL,
+    DEFAULT_PRECISION,
+    DEFAULT_TP,
+)
+from hyperloom_common.llm.llm_config import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+)
+from hyperloom.orchestrator.scoring.proposal_scorer import DEFAULT_SCORER_MODELS
+
+#: Fallback wall-clock budget. Named because ``--resume-from`` reads it back as
+#: the "operator did not set this" signal: unlike the target flags, this one has
+#: a real default, so the value alone cannot say whether it was asked for.
+DEFAULT_MAX_HOURS = 2.0
+
+# Substrings that mark a flag or a NAME=VALUE name as carrying a credential.
+_SECRET_NAME_HINTS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "key",
+    "auth",
+)
+_REDACTED = "***"
+
+
+def _is_secret_name(name: str) -> bool:
+    """Report whether a flag or variable name suggests a credential."""
+    lowered = name.lstrip("-").lower()
+    return any(hint in lowered for hint in _SECRET_NAME_HINTS)
+
+
+def _redact_unknown_args(tokens: list[str]) -> str:
+    """Render unrecognised CLI tokens for logging with credential values masked."""
+
+    def _mask(value: str, flag_is_secret: bool) -> str:
+        name, sep, _ = value.partition("=")
+        if sep and _is_secret_name(name):
+            return f"{name}={_REDACTED}"
+        return _REDACTED if flag_is_secret else value
+
+    rendered: list[str] = []
+    # A bare value belongs to the flag before it, so its sensitivity carries over.
+    flag_is_secret = False
+    for token in tokens:
+        if token.startswith("-"):
+            flag, sep, inline = token.partition("=")
+            flag_is_secret = _is_secret_name(flag)
+            if sep:
+                rendered.append(f"{flag}={_mask(inline, flag_is_secret)}")
+                flag_is_secret = False
+            else:
+                rendered.append(flag)
+        else:
+            rendered.append(_mask(token, flag_is_secret))
+            flag_is_secret = False
+    return " ".join(rendered)
+
+
+class RedactingArgumentParser(argparse.ArgumentParser):
+    """Parser whose unrecognised-argument error cannot print a credential."""
+
+    _UNRECOGNIZED_PREFIX = "unrecognized arguments: "
+
+    def error(self, message: str) -> NoReturn:
+        """Exit 2 like argparse, with credential values masked."""
+        if message.startswith(self._UNRECOGNIZED_PREFIX):
+            tail = message[len(self._UNRECOGNIZED_PREFIX) :]
+            message = self._UNRECOGNIZED_PREFIX + _redact_unknown_args(tail.split())
+        super().error(message)
+
+
+def _positive_int_arg(value: str) -> int:
+    """argparse type for positive integer knobs."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _default_claude_model_env() -> str:
+    """Resolve the default Claude model from env."""
+    explicit = (os.environ.get("CLAUDE_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    gateway_model = provider_model_defaults().get("CLAUDE_MODEL", "")
+    if gateway_model:
+        return gateway_model
+    if is_openai_only():
+        return (os.environ.get("CODEX_MODEL") or "").strip() or DEFAULT_CODEX_MODEL
+    return DEFAULT_CLAUDE_MODEL
+
+
+def _default_codex_model_env() -> str:
+    """Resolve the default Codex-style model from env."""
+    if is_anthropic_only():
+        return (os.environ.get("CLAUDE_MODEL") or "").strip() or DEFAULT_CLAUDE_MODEL
+    explicit = (os.environ.get("CODEX_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    gateway_model = provider_model_defaults().get("CODEX_MODEL", "")
+    if gateway_model:
+        return gateway_model
+    return DEFAULT_CODEX_MODEL
+
+
+def _default_research_lane_capacity() -> int:
+    """Default ``--research-lane-capacity`` to the GPU ceiling (2×GPU)."""
+    from hyperloom.orchestrator.policy.gate import research_lane_ceiling
+
+    return research_lane_ceiling()
+
+
+def _default_gpu_specialist_capacity() -> int:
+    """Default ``--gpu-specialist-capacity`` to the whole visible machine."""
+    from hyperloom.common.visible_devices import detect_gpu_count
+
+    return detect_gpu_count()
+
+
+def _add_custom_specialist_args(opt: argparse.ArgumentParser) -> None:
+    """The ``--custom-specialist-*`` flags of ``optimize``."""
+    opt.add_argument(
+        "--custom-specialist-prompt-file",
+        dest="custom_specialist_prompt_file",
+        type=str,
+        default=None,
+        help="Register an operator-defined specialist type (custom_specialist) whose domain focus is this file's "
+        "text (max 16 KiB). Requires --custom-specialist-description. The Coordinator alone dispatches it, once "
+        "per macro cycle in FRAMEWORK_AGENT, ahead of other queued work, and benches its proposals first; "
+        "Orchestration cannot. Persisted for --resume-from; passing it on a "
+        "resume replaces the stored definition. The text is written in clear to state.json and every task's "
+        "prompt.md: do not put credentials in it. HYPERLOOM_CUSTOM_SPECIALIST_ONLY=1 runs FRAMEWORK_AGENT on it alone.",
+    )
+    opt.add_argument(
+        "--custom-specialist-description",
+        dest="custom_specialist_description",
+        type=str,
+        default=None,
+        help="One line (max 200 chars) describing custom_specialist in its own prompt. Requires "
+        "--custom-specialist-prompt-file.",
+    )
+
+
+def _add_resume_arguments(opt: argparse.ArgumentParser) -> None:
+    """The ``--resume-from`` and ``--force-resume`` flags of ``optimize``."""
+    opt.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Per-session subdir to resume; the only way to resume a session. "
+        "Skips the SharedState seed and lets the Coordinator replay the "
+        "prior event log + state.json. Must be an absolute path under "
+        "$USER_DATA_PATH (workspace_root), which MUST stay at workspace "
+        "level (/shared/hyperloom-sessions, not the per-session subdir) so "
+        "runtime/ resolution works.",
+    )
+    opt.add_argument(
+        "--force-resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow ``--resume-from`` to push past a terminal "
+            "``stop_reason='target_reached'``. "
+            "Without this flag the resume aborts (Issue-G guard, per "
+            "SKILL.md 'Run-time signals': that terminal requires an "
+            "operator-side workload / strategy change before resuming). "
+            "No-op without ``--resume-from``."
+        ),
+    )
+
+
+def _add_plug_arguments(opt: argparse.ArgumentParser) -> None:
+    """Add the flags that select which implementation fills each plug socket; absent, every socket stays local."""
+    opt.add_argument(
+        "--plug-profile",
+        dest="plug_profile",
+        default=None,
+        metavar="NAME",
+        help="Built-in plug profile to load (local, hosted-gpu, hosted-cpu). Without it, and without the other plug "
+        "flags, nothing changes from a plain local run.",
+    )
+    opt.add_argument(
+        "--manifest",
+        dest="plug_manifest",
+        default=None,
+        metavar="PATH",
+        help="Custom plug manifest (JSON) laid over the profile. Falls back to $HYPERLOOM_MANIFEST.",
+    )
+    for flag, dest, metavar, text in (
+        (
+            "--plug",
+            "plug",
+            "SOCKET=IMPL",
+            "Choose the implementation of one socket; repeatable. The last layer, over profile, manifest and "
+            "$HYPERLOOM_MANIFEST_OVERRIDES.",
+        ),
+        (
+            "--plug-config",
+            "plug_config",
+            "SOCKET.KEY=VALUE",
+            "Set one configuration key of a socket's implementation; repeatable. VALUE is read as JSON when it "
+            "parses as JSON, as text otherwise.",
+        ),
+    ):
+        opt.add_argument(flag, dest=dest, action="append", default=[], metavar=metavar, help=text)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the top-level CLI argument parser and subcommands."""
+    from hyperloom.orchestrator.specialists.domains import (
+        DEFAULT_SPECIALIST_MAX_TURNS as _DEFAULT_SPECIALIST_MAX_TURNS,
+    )
+
+    p = RedactingArgumentParser(
+        prog="hyperloom",
+        description="Inference Optimizer — multi-agent inference optimization (SGLang/vLLM/Atom/xDiT)",
+    )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--verbose", "-v", action="count", default=0, help="Verbose logging (-v INFO, -vv DEBUG)")
+    sub = p.add_subparsers(dest="command", required=True)
+    opt = sub.add_parser("optimize", parents=[common], help="Drive a multi-agent optimization run on a model")
+    opt.add_argument(
+        "--model",
+        "-m",
+        type=Path,
+        default=None,
+        help="Model path (required for new runs; ignored when "
+        "--resume-from is set — model is read from manifest.json/"
+        "state.json)",
+    )
+    opt.add_argument(
+        "--quantize",
+        type=str,
+        default=None,
+        metavar="PROMPT",
+        help="Optional natural-language quantization request. When set, "
+        "`hyperloom quantize` runs ONCE as a prelude before the "
+        "optimization loop: it drives AMD Quark PTQ from this prompt, "
+        "then rewrites --model to the exported quantized model so the "
+        "rest of the run optimizes the quantized model. Ignored on "
+        "--resume-from.",
+    )
+    from hyperloom.orchestrator.phases.quantization_schemes import QUANT_SCHEME_CHOICES
+
+    opt.add_argument(
+        "--quantize-scheme",
+        choices=QUANT_SCHEME_CHOICES,
+        default=None,
+        metavar="SCHEME",
+        help="Structured alternative to --quantize for UI/backends: pick a "
+        "curated quantization scheme (resolved to a prompt internally). "
+        f"Choices: {', '.join(QUANT_SCHEME_CHOICES)}. 'none' or omit = no "
+        "quantization. Ignored if --quantize (free text) is also given.",
+    )
+    opt.add_argument(
+        "--gpu-type",
+        type=str.lower,
+        # Sorted for a stable --help listing, and derived so a board added to the board table is accepted here
+        # without a second edit.
+        choices=sorted(AMD_GPU_BOARDS),
+        default=None,
+        help="Hint for the real target GPU. The rocm-smi probe always "
+        "wins when both are present and disagree; a WARN is "
+        "emitted to stderr so the operator sees the typo. Used "
+        "verbatim only when the probe fails (CPU sandbox / no "
+        "rocm-smi). Magpie runner_type is derived separately; "
+        "mi308x and mi325x currently run with mi300x runner scripts because "
+        "Magpie does not yet ship MI308X/MI325X-specific SGLang/vLLM scripts.",
+    )
+    opt.add_argument(
+        "--compute-partition-mode",
+        type=str,
+        default=None,
+        metavar="MODE",
+        help="Declare the compute-partition mode the GPU is already in: SPX "
+        "(whole card), DPX (2), QPX (4) or CPX (8). This is an assertion, not "
+        "a request -- nothing in the optimizer changes the mode, because doing "
+        "so is privileged, evicts every process on the card, and renumbers its "
+        "devices. Set the mode with amd-smi before launching this command: the "
+        "shape is checked and recorded at launch, so a mode applied later is "
+        "too late to be either. Passing this flag makes the session "
+        "refuse to start if the card is in a different mode, which is what "
+        "catches an external set that did not take effect before three hours "
+        "are spent recording the numbers under the wrong topology. The mode is "
+        "recorded in the platform fingerprint whether or not this flag is "
+        "passed. See also --streams-per-partition.",
+    )
+    opt.add_argument(
+        "--streams-per-partition",
+        type=int,
+        # None, not 2, so a resume can tell "not passed" from "passed 2" and let the persisted value stand.
+        default=None,
+        metavar="N",
+        help="Concurrent streams to place on each partition when the card is "
+        "partitioned. Defaults to 2, which is where every mode measured on "
+        "MI355X peaked: one stream leaves each partition idle through the "
+        "fixed per-pass cost, a second fills it, a third only adds queueing. "
+        "Raise it only with evidence, and note that every stream on a "
+        "partition holds its own copy of the weights -- so this multiplies "
+        "the memory the workload has to fit, and the session refuses to start "
+        "when it provably will not. A value below 1 is refused rather than "
+        "quietly replaced by the default. Only a scriptable framework's "
+        "benchmark places work per partition; passing this with a serving "
+        "framework warns, because nothing would act on it.",
+    )
+    opt.add_argument(
+        "--framework",
+        choices=list(framework_registry.names()),
+        default=None,
+        help="Inference framework to benchmark / optimize. Resolution order: "
+        "--framework > sglang (default). Selection is "
+        "session-wide; mixing frameworks in a single session is not "
+        "supported: --resume-from uses the framework the session was "
+        "created with, and refuses a --framework that differs. NOTE: --framework atom is single-node-only "
+        "(``--nodes>=2`` fails fast); profile / roofline, "
+        "kernel-agent, and framework-agent are all enabled on atom. "
+        "The auto-tighten guard only enforces ``--nodes 1``. "
+        "--framework xdit is a server-less (scriptable) diffusion "
+        "workload (xDiT): no serving server, throughput is img/s, and "
+        "the accuracy gate is an image-quality gate (LPIPS/SSIM/MSE). "
+        "--framework custom is your own workload: pass --framework-path and "
+        "--benchmark-scripts-dir instead of shipping a framework definition.",
+    )
+    opt.add_argument(
+        "--framework-path",
+        default=None,
+        metavar="DIR",
+        help="Checkout of the framework to optimize. Sets FRAMEWORK_REPO_PATH, "
+        "which is what puts the tree on PolicyGate's patch allowlist, so a "
+        "specialist may only edit source you pointed at. Required for "
+        "--framework custom; for the built-in frameworks it overrides the "
+        "checkout they would otherwise clone.",
+    )
+    add_benchmark_argument(opt)
+    opt.add_argument(
+        "--benchmark-scripts-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory holding your benchmark entrypoint. Sets "
+        "HYPERLOOM_BYPASS_SCRIPTS_DIR. The entrypoint is taken as "
+        "custom_<gpu-type>.sh, or the single .sh in the directory. It must "
+        "emit a quality_gate block in its report: for a server-less workload "
+        "that gate is the only correctness signal, and a missing one scores "
+        "zero, so every candidate is rejected.",
+    )
+    opt.add_argument(
+        "--xdit-model-name",
+        default=None,
+        metavar="NAME",
+        help="xDiT HuggingFace repo ID (e.g., 'black-forest-labs/FLUX.2-dev'). Required for xDiT runs.",
+    )
+    opt.add_argument(
+        "--nodes",
+        type=int,
+        default=1,
+        help="Total number of GPU nodes for the inference cluster. "
+        "1 (default) keeps the legacy single-pod path. "
+        ">=2: `optimize` adopts the cluster the platform provisioned and handed "
+        "over via HYPERLOOM_MN_EXT_* (see multi_node/SKILL.md), runs bootstrap "
+        "once, and exports RAY_ADDRESS for kernel-agent. It never creates or "
+        "releases the cluster; without a hand-off it exits 2. "
+        "Default: 1.",
+    )
+    opt.add_argument(
+        "--mn-backend",
+        choices=("rayjob", "infera"),
+        default=None,
+        help="Multi-node backend when --nodes>=2: 'rayjob' (default, Ray "
+        "head+workers) or 'infera' (idle InferaDeployment + SSH control "
+        "plane). Defaults to rayjob when omitted. Single-node runs ignore "
+        "this flag.",
+    )
+    opt.add_argument(
+        "--gpus-per-node",
+        type=int,
+        default=None,
+        help="GPUs per multi-node pod (Infera worker/prefill/decode or RayJob "
+        "head+workers). Defaults to 8 when omitted.",
+    )
+    # Platform-owned, inert here.
+    opt.add_argument("--mn-image", default=None, help=argparse.SUPPRESS)
+    opt.add_argument("--cpus-per-node", type=int, default=None, help=argparse.SUPPRESS)
+    opt.add_argument("--mem-per-node", type=int, default=None, help=argparse.SUPPRESS)
+    opt.add_argument("--extra-env", action="append", default=[], help=argparse.SUPPRESS)
+    opt.add_argument(
+        "--tp",
+        type=_positive_int_arg,
+        default=None,
+        help="Tensor parallel size. Pass `--tp N` directly from the prompt's "
+        f"Environment block. Default: {DEFAULT_TP}.",
+    )
+    opt.add_argument(
+        "--conc",
+        type=_positive_int_arg,
+        default=None,
+        help="Magpie client concurrency cap (max in-flight requests). "
+        "Pass `--conc N` directly from the prompt. Use "
+        f"--conc-sweep-concs for a concurrency ladder. Default: {DEFAULT_CONC}.",
+    )
+    opt.add_argument(
+        "--max-model-len",
+        dest="max_model_len",
+        type=_positive_int_arg,
+        default=None,
+        help="Explicit server-facing MAX_MODEL_LEN. Resolution: "
+        "--max-model-len > $MAX_MODEL_LEN > auto(ISL+OSL+headroom, "
+        "clamped to native context). Explicit values must fit the known native context and are "
+        "exported into the materialized Magpie YAML.",
+    )
+    opt.add_argument(
+        "--server-args",
+        dest="server_args",
+        type=str,
+        default="",
+        help="Framework server args to apply in every phase. Routed through "
+        "the framework-specific EXTRA_*_ARGS env in Magpie YAMLs "
+        "(EXTRA_VLLM_ARGS / EXTRA_SGLANG_ARGS / EXTRA_ATOM_ARGS). "
+        'Example: --server-args "--kv-cache-dtype fp8_e4m3 '
+        '--gpu-memory-utilization 0.85".',
+    )
+    opt.add_argument(
+        "--ep",
+        type=int,
+        default=None,
+        help="Expert-parallel size for MoE inference. 1 (default) keeps "
+        "experts sharded by TP (legacy behaviour). >=2 enables true "
+        "expert parallelism: sglang adds `--ep-size N`, vllm and atom "
+        "add `--enable-expert-parallel` (EP then spans all TP ranks). "
+        "Typical: EP=TP. Default: 1. On a single node an EP that does "
+        "not divide TP is dropped with a warning; on multi-node EP > TP "
+        "is rejected at server-restart time.",
+    )
+    opt.add_argument(
+        "--pd-mode",
+        choices=("aggregated", "disaggregated"),
+        default="aggregated",
+        help="Prefill-Decode disaggregation mode. ALWAYS defaults to "
+        "`aggregated` regardless of any inherited $PD_MODE env, so "
+        "PD only turns on when the agent explicitly passes "
+        "`--pd-mode disaggregated` (driven by the prompt's "
+        "Environment block having a PD_MODE=disaggregated line). "
+        "Stale env from a previous restart cannot accidentally "
+        "re-enable PD.",
+    )
+    opt.add_argument(
+        "--pd-prefill-nodes",
+        type=int,
+        default=0,
+        help="Number of prefill nodes (disaggregated only); pn+dn=nodes",
+    )
+    opt.add_argument(
+        "--pd-decode-nodes",
+        type=int,
+        default=0,
+        help="Number of decode nodes (disaggregated only)",
+    )
+    opt.add_argument(
+        "--pd-prefill-tp",
+        type=int,
+        default=0,
+        help="TP for prefill group (disaggregated only); default = --tp",
+    )
+    opt.add_argument(
+        "--pd-decode-tp",
+        type=int,
+        default=0,
+        help="TP for decode group (disaggregated only); default = --tp",
+    )
+    opt.add_argument(
+        "--pd-transfer-backend",
+        type=str,
+        default="",
+        help="sglang: mooncake|nixl ; vllm: NixlConnector|...; empty = default",
+    )
+    opt.add_argument(
+        "--pd-ib-device",
+        type=str,
+        default="",
+        help="comma-separated IB/RoCE device list (e.g. mlx5_0,mlx5_1). "
+        "Empty = use $NCCL_IB_HCA from RayJob pod env at server-launch time.",
+    )
+    opt.add_argument(
+        "--pd-prefill-ep",
+        type=int,
+        default=0,
+        help="EP for the prefill group (disaggregated only); 0 = fall back to --ep. Multi-node PD only.",
+    )
+    opt.add_argument(
+        "--pd-decode-ep",
+        type=int,
+        default=0,
+        help="EP for the decode group (disaggregated only); 0 = fall back to --ep. Multi-node PD only.",
+    )
+    opt.add_argument(
+        "--pd-prefill-extra-args",
+        type=str,
+        default="",
+        help="Per-role sglang server args for the prefill group, appended after "
+        "the shared server args (disaggregated only). Multi-node PD only.",
+    )
+    opt.add_argument(
+        "--pd-decode-extra-args",
+        type=str,
+        default="",
+        help="Per-role sglang server args for the decode group, appended after "
+        "the shared server args (disaggregated only). Multi-node PD only.",
+    )
+    opt.add_argument(
+        "--skip-variants",
+        type=str,
+        default="",
+        help="Comma/whitespace-separated list of variant names or fnmatch "
+        "globs to drop from the backends/params grids before launch. "
+        "Examples: `attn_aiter` (exact), `attn_aiter,sched_dfs` (two "
+        "exacts), `attn_*,vllm_aiter_*` (globs). Exported into "
+        "the internal SKIP_VARIANTS handoff so all executors and the multi-node orchestrator "
+        "subprocess see the same value. Dropped variants surface in "
+        "state.json under `explore_search.last_round.skipped_dup`, and in the "
+        "action's per-variant outcomes, tagged `user_skip`.",
+    )
+    opt.add_argument(
+        "--max-hours",
+        type=float,
+        # No argparse default: ``--resume-from`` must tell "the operator asked
+        # for this many hours" from "the operator said nothing", and a default
+        # would make an explicit value indistinguishable from absence.
+        default=None,
+        help=f"Wall-clock budget in hours (default {DEFAULT_MAX_HOURS})",
+    )
+    opt.add_argument(
+        "--extend-hours",
+        dest="extend_hours",
+        type=float,
+        default=0.0,
+        help="On --resume-from, grant this many additional hours to the "
+        "session budget. Elapsed time is summed forward across every leg and "
+        "never reset, so this is the only way to lengthen a run that has "
+        "already spent its budget. The grant is recorded in the session state "
+        "with its reason.",
+    )
+    opt.add_argument(
+        "--closing-grace-sec",
+        type=float,
+        default=None,
+        help=(
+            "Extra seconds after the wall-clock deadline for Coordinator to "
+            "flush a deterministic report task (no LLM). Default: "
+            "min(120, max_hours * 60 * 0.02). Pass 0 to disable closing phase."
+        ),
+    )
+    opt.add_argument("--isl", type=int, default=None, help=f"Input sequence length (default {DEFAULT_ISL})")
+    opt.add_argument("--osl", type=int, default=None, help=f"Output sequence length (default {DEFAULT_OSL})")
+    opt.add_argument(
+        "--profile-osl",
+        dest="profile_osl",
+        type=int,
+        default=None,
+        help=(
+            "Profiling-phase output sequence length. When set, it overrides "
+            "--osl for the roofline/profile server ONLY, so its torch-profiler "
+            "trace stays serializable; baseline/optimize phases still run at "
+            "--osl. When unset the profile phase uses "
+            "min(--osl, 1024) and is auto-lowered further if needed to keep the "
+            "capture window within the serialization cap."
+        ),
+    )
+    opt.add_argument(
+        "--reference-script",
+        dest="reference_script",
+        type=str,
+        default=None,
+        help=(
+            "Reference launch recipe (.sh path or http(s) URL). Its serve "
+            "flags plus the exports the denylist allows seed the baseline "
+            "server args at lowest priority (the config arm can override); shell-unsafe, "
+            "credential-shaped and optimizer-owned workload variables are "
+            "dropped. The recipe is applied as given — there is no model gate "
+            "and no auto-discovery — so a path that cannot be read, or that "
+            "yields neither a flag nor an export, exits 2 instead of falling "
+            "back. Omit the flag to leave the baseline unchanged."
+        ),
+    )
+    opt.add_argument("--precision", type=str, default=None, help=f"Model precision (default {DEFAULT_PRECISION})")
+    opt.add_argument(
+        "--framework-version",
+        dest="framework_version",
+        type=str,
+        default=None,
+        help=(
+            "Framework version slug for the recipe-snapshot canonical id "
+            "(scopes recipes to a specific framework release — sglang 0.4.5 "
+            "and sglang 0.5.x have different scheduler defaults so they "
+            "deserve separate KB rows). When omitted, auto-detected from "
+            "the interpreter preflight resolved to serve the framework, "
+            "else by importing the framework's top-level package and "
+            "reading ``__version__`` (sglang/vllm/atom supported); auto-detect "
+            "failure degrades to 'unknown_version'. Override with "
+            "--framework-version=0.4.5 to pin a specific tag for the run."
+        ),
+    )
+    grp = opt.add_mutually_exclusive_group()
+    grp.add_argument(
+        "--target-gain",
+        type=float,
+        default=None,
+        help="Stop when cumulative_gain_validated >= N%% over baseline",
+    )
+    grp.add_argument(
+        "--target-tput",
+        type=float,
+        default=None,
+        help="Stop when current best reaches N, whole-server total (serving: tok/s; xDiT: img/s)",
+    )
+    grp.add_argument(
+        "--target-baseline-dir", type=str, default=None, help="Stop when current best matches the baseline in DIR"
+    )
+    # Outside the group: it measures a different axis, so it ORs with whichever of the three above is set rather than
+    # competing with them.
+    opt.add_argument(
+        "--target-roofline",
+        type=float,
+        default=None,
+        help=(
+            "Stop when the latest roofline snapshot reaches N%% of its modelled ceiling. Inert until a roofline "
+            "has been measured or when the workload has no ceiling, and satisfied independently of "
+            "--target-gain / --target-tput / --target-baseline-dir."
+        ),
+    )
+    add_constraint_arguments(opt)
+    add_gpu_power_arguments(opt)
+    _add_resume_arguments(opt)
+    _add_plug_arguments(opt)
+    opt.add_argument(
+        "--model-class",
+        type=str,
+        default=None,
+        help=(
+            "Categorical model-class key. It is the deterministic key for "
+            "several consumers: the atom explore seed grid "
+            "(action_executors/explore.py), the framework-agent gap search "
+            "token (action_executors/_framework_gap_composer.py), the recipe "
+            "key, and the orchestration prompt label. Recognised values "
+            "(case-insensitive, with -/+/space tolerated): dense / moe_mla / "
+            "moe_swa / moe_mla_nsa. When unset, Coordinator boot infers and "
+            "persists it from config.json (num_experts / architectures) or "
+            "model-path family keywords, replacing the deleted ``classify`` "
+            "action's lightweight state-write role. For richer *advisory* "
+            "model context (attention variant, KV/token, experts, MTP, ...) "
+            "the SKILL launcher writes <session_dir>/model_arch.json, which "
+            "is injected into prompts but drives no gating."
+        ),
+    )
+    opt.add_argument(
+        "--compare-against-gpu",
+        type=str,
+        default=None,
+        help=(
+            "Reference GPU hardware key for external baseline comparison "
+            "(e.g. b300 / mi355x / h200). target_analysis ALWAYS runs first, "
+            "before baseline, and always writes "
+            "$SESSION_DIR/target_analysis/target_baseline.json + a short "
+            "MD report. When this flag is set, the JSON carries the "
+            "matching InferenceX (https://inferencex.semianalysis.com) "
+            "reference data point; when unset, the JSON carries a "
+            "structured reason='no_target_gpu_configured' marker so the "
+            "report still has a deterministic 'External baseline' "
+            "section. The reference is API-measured and never influences "
+            "the Objective, scoring, or any KEEP/REVERT gate; a matching "
+            "row is surfaced to the gap advisory as direction only. "
+            "Other dimensions (model / framework / precision / ISL / OSL) "
+            "are derived from the corresponding CLI arguments."
+        ),
+    )
+    opt.add_argument("--max-ticks", type=int, default=None, help="Hard tick cap (None = unlimited; mostly for tests)")
+    opt.add_argument("--tick-interval-sec", type=float, default=0.0, help="Sleep between ticks (0 = no sleep)")
+    opt.add_argument("--claude-model", type=str, default=_default_claude_model_env())
+    opt.add_argument("--codex-model", type=str, default=_default_codex_model_env())
+    opt.add_argument(
+        "--allow-mm-text-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When a model carries a multimodal signal (e.g. vision_config) "
+        "but exposes a text-generation path, run it on the TEXT path with "
+        "a degraded-mode warning instead of fail-fasting. Image/audio "
+        "inputs are ignored, so numbers reflect the text decoder alone. "
+        "True VLMs with no text path (Llava / PaliGemma / Qwen-VL / "
+        "Phi3V) still fail-fast regardless of this flag. Pass "
+        "--no-allow-mm-text-fallback to fail-fast on text-coercible "
+        "models too. Default: enabled.",
+    )
+    opt.add_argument(
+        "--no-kernel",
+        action="store_true",
+        default=False,
+        help="Disable the Kernel-agent entirely. The run will "
+        "only do baseline + explore + sweep (pure "
+        "parameter search). Useful when GEAK/GPU "
+        "compile env is unavailable or you just want the "
+        "quick-win parameter path. Default: kernel enabled.",
+    )
+    opt.add_argument(
+        "--launch-info-file",
+        type=str,
+        default=None,
+        help="Write a JSON file with the launched session's pid, "
+        "session_dir, session_id, run_log, manifest path, gpu_type, "
+        "framework and model. Launcher scripts can ``jq -r .pid`` / "
+        "``jq -r .session_dir`` instead of grepping stdout or "
+        "pgrep'ing. Always emitted alongside the ``HYPERLOOM_LAUNCH "
+        "<key=value> ...`` single-line sentinel that is printed to "
+        "stdout for stream-based parsers.",
+    )
+    opt.add_argument(
+        "--no-framework-agent",
+        action="store_true",
+        default=False,
+        help="Skip the optimisation phase (PRELUDE → KERNEL_AGENT "
+        "directly). The phase runs both levers: configuration grids, and "
+        "upstream PRs plus specialist-authored source patches. Disable "
+        "when the framework-agent toolchain is unavailable or you want a "
+        "faster cold start. Default: enabled.",
+    )
+    opt.add_argument(
+        "--enablement",
+        dest="enablement",
+        choices=["off", "launch", "eval", "all"],
+        default="all",
+        help="Admit the enablement self-heal lanes, which author framework "
+        "patches when the baseline cannot be established. 'launch' handles a "
+        "baseline that fails to boot; 'eval' handles one that boots but misses "
+        "the accuracy floor; 'all' (default) handles both. Set 'off' to skip "
+        "self-heal entirely: a baseline that keeps failing then terminates the "
+        "run with stop_reason='baseline_failed' instead of opening an authoring "
+        "loop, which is what you want for a quick triage run or when the model "
+        "is already known to serve.",
+    )
+    opt.add_argument(
+        "--no-framework-local-explore",
+        dest="no_framework_local_explore",
+        action="store_true",
+        default=False,
+        help="Disable the FRAMEWORK_AGENT local-exploration arm. By default, "
+        "when PR discovery is empty/exhausted (or the ranker prefers it), the "
+        "phase dispatches a write-capable specialist that authors a throughput "
+        "patch from the live source + profiling evidence (and may web-search "
+        "the latest upstream code) instead of skipping the phase. Disabling "
+        "restores the historical behavior of exiting after "
+        "DISCOVER_FAILURE_RETRY_LIMIT (3) empty/failed discoveries. Requires "
+        "the authoring track (has no effect under diff-only mode).",
+    )
+    # Critic backend selection; flags are aliases setting the same dest.
+    opt.add_argument(
+        "--critic-mock",
+        dest="critic_backend",
+        action="store_const",
+        const="mock",
+        default=None,
+        help="Force the always-approve mock Critic (offline / smoke tests).",
+    )
+    opt.add_argument(
+        "--critic-agent",
+        dest="critic_backend",
+        action="store_const",
+        const="agent",
+        help="Force the critic-agent runtime backend (KB + session memory + "
+        "review_constraints). Requires CRITIC_AGENT_ROOT or a sibling "
+        "$REPO_ROOT/critic-agent/ directory.",
+    )
+    opt.add_argument(
+        "--critic-protocol",
+        dest="critic_protocol",
+        choices=CRITIC_PROTOCOL_CHOICES,
+        default="auto",
+        help="Protocol for the Critic's review inference. 'openai' uses the "
+        "OpenAI SDK; 'anthropic' uses the Messages API, or the Claude CLI when a "
+        "CLAUDE_CODE_OAUTH_TOKEN subscription is the only credential. "
+        "'auto' (default) reviews with the orchestration model over the protocol "
+        "orchestration runs on; an explicit value reviews with that side's model "
+        "(CLAUDE_MODEL or CODEX_MODEL) and fails at startup when that side has no "
+        "credential. Preflight sends the review model one request and refuses to "
+        "start when it does not answer; there is no fallback model. "
+        "Ignored (with a warning) under --critic-mock, which runs no review "
+        "inference.",
+    )
+    opt.add_argument(
+        "--orch-prompt", type=str, default=None, help="Override Orchestration system prompt (file path or inline)"
+    )
+    opt.add_argument("--critic-prompt", type=str, default=None, help="Override Critic system prompt")
+    _add_custom_specialist_args(opt)
+    opt.add_argument(
+        "--degraded-kb",
+        dest="degraded_kb",
+        action="store_true",
+        default=False,
+        help="Skip the recipe KB integration entirely (T0/T2/T3/T4 become "
+        "no-ops). Also short-circuits any legacy IR-3 KB probe marker. "
+        "Manifest records the reason as ``explicit_flag`` when set "
+        "explicitly.",
+    )
+    # Warm-recipe replay: PRELUDE auto-applies KB best_config before optimising.
+    opt.add_argument(
+        "--no-warm-replay",
+        dest="no_warm_replay",
+        action="store_true",
+        default=False,
+        help="Disable the PRELUDE auto-replay of KB warm-start "
+        "``best_config``. The warm_start_recipe is still rendered "
+        "into the specialist prompt as priors, but the Coordinator "
+        "will NOT auto-run the historical best_config. Use this "
+        "for cold debugging / ablation runs.",
+    )
+    opt.add_argument(
+        "--warm-replay-min-confidence",
+        dest="warm_replay_min_confidence",
+        type=float,
+        default=None,
+        help="Minimum ``warm_start_recipe.confidence`` required to "
+        "trigger the auto-replay. Default 0.7 means an ``exact`` "
+        "seven-tuple hit (conf 1.0) and a server-returned ``relative`` "
+        "match (conf 0.7) both fire, while a ``miss`` (conf 0.0) "
+        "does not. Raise it above 0.7 to require an exact hit "
+        "before spending a verify on the warm config.",
+    )
+    # PrimaTune predictor: off unless an endpoint is given, so a session that passes none behaves as before.
+    opt.add_argument(
+        "--primatune-endpoint",
+        dest="primatune_endpoint",
+        type=str,
+        default=None,
+        help="Base URL of a PrimaTune predictor service, asked once per FRAMEWORK_AGENT decision point. "
+        "Its proposals join the untested-proposal queue beside the specialists' and are graded by the "
+        "same KEEP threshold. Exported as $HYPERLOOM_PREDICTOR_ENDPOINT. "
+        "See docs/reference/primatune-predictor.md.",
+    )
+    opt.add_argument(
+        "--primatune-mode",
+        dest="primatune_mode",
+        type=str,
+        choices=predictor_config.MODES,
+        default=None,
+        help="'shadow' (the default once an endpoint is set) asks and logs, queueing nothing; "
+        "'active' queues the answer for benchmarking; 'off' disables. "
+        "Exported as $HYPERLOOM_PREDICTOR_MODE.",
+    )
+    # PR Monitor REST + MCP are co-hosted by KB Store and derived from $KB_STORE_URL.
+    opt.add_argument(
+        "--degraded-pr",
+        dest="degraded_pr",
+        action="store_true",
+        default=False,
+        help="Disable the PR Monitor integration entirely. "
+        "The specialist tool whitelist drops mcp__pr_monitor__* tools. "
+        "Short-circuits the IR-3 PR Monitor probe; IR-3 sets this "
+        "automatically when PR Monitor is unreachable (soft degrade).",
+    )
+    # specialist research_lane capacity (locked at session start).
+    opt.add_argument(
+        "--research-lane-capacity",
+        dest="research_lane_capacity",
+        type=int,
+        default=_default_research_lane_capacity(),
+        help="Max concurrent LLM specialist sub-agents on the "
+        "research_lane. 0 disables specialist "
+        "dispatch entirely (degrades to LLM-direct grid). The "
+        "default is the research-lane ceiling (2 x visible GPU "
+        "count, falling back to a conservative value when no GPU "
+        "is detected); values above the ceiling are silently "
+        "clamped down. Locked at session start.",
+    )
+    opt.add_argument(
+        "--gpu-specialist-capacity",
+        dest="gpu_specialist_capacity",
+        type=int,
+        default=_default_gpu_specialist_capacity(),
+        help="Number of GPUs available to specialists that request "
+        "needs_gpu=true. Defaults to the whole machine (visible GPU "
+        "count on the launch host); set "
+        "--gpu-specialist-capacity 0 to disable GPU specialists. GPU specialists serialize against the "
+        "serving lanes via gpu_research_lane. "
+        "Set INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES to a "
+        "comma-separated GPU id pool when the specialist pool should "
+        "not use device ids 0..N-1. Locked at session start.",
+    )
+    # Advisory specialist-proposal scorer (ProposalScorer): scores each proposal_set with gateway models as a
+    # reference for Orchestration; never gates.
+    opt.add_argument(
+        "--proposal-scorer-models",
+        dest="proposal_scorer_models",
+        type=str,
+        default=",".join(DEFAULT_SCORER_MODELS),
+        help="Comma-separated gateway model slugs that independently "
+        "score each specialist proposal_set (advisory only; never "
+        "gates; rater identities are anonymized in the orchestration "
+        "prompt). Only takes effect when --proposal-scoring is also "
+        "passed (scoring is OFF by default); this flag alone does not "
+        "enable scoring. Default '%(default)s'. "
+        "Add a model by appending its slug. Empty list disables scoring "
+        "even when enabled.",
+    )
+    opt.add_argument(
+        "--proposal-scoring",
+        dest="proposal_scoring",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the advisory specialist-proposal scorer (disabled by "
+        "default). Use --no-proposal-scoring to keep it off explicitly. "
+        "Even when enabled it is skipped in Anthropic-only deployments "
+        "(OpenAI-compatible only) or when the model list is empty. "
+        "Advisory only; never gates.",
+    )
+    # Specialist model override; provider shape selects Claude or Codex.
+    opt.add_argument(
+        "--specialist-model",
+        dest="specialist_model",
+        type=str,
+        default=None,
+        help="Generic model override for the selected specialist backend. "
+        "When omitted, Codex specialists use --codex-model and Claude "
+        "specialists use --claude-model. KB_design §3.5 §6.",
+    )
+    opt.add_argument(
+        "--specialist-max-turns",
+        dest="specialist_max_turns",
+        type=int,
+        default=_DEFAULT_SPECIALIST_MAX_TURNS,
+        help="Hard cap on LLM turns per specialist task (KB_design "
+        "§3.5 §6). On exhaustion the runner synthesises an empty "
+        "specialist_done (Inv-5.3).",
+    )
+    opt.add_argument(
+        "--specialist-mcp-config",
+        dest="specialist_mcp_config",
+        type=str,
+        default=None,
+        help="Optional MCP config JSON for specialist subprocesses. Claude "
+        "receives it via --mcp-config; Codex translates supported HTTP/stdio "
+        "servers into private task-local config. Default: None.",
+    )
+
+    # Integration toggles.
+    opt.add_argument(
+        "--enable-roofline",
+        dest="enable_roofline",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Select which analysis action the Coordinator enqueues at "
+        "PRELUDE bootstrap and on every +10%% watermark crossing. "
+        "Default on: ``roofline`` (composite profile + "
+        "trace_analyze + analysis.md). Pass ``--no-enable-roofline`` "
+        "to use plain ``profile`` instead (lighter — captures the "
+        "trace only, skips trace_analyze). Behaviour is otherwise "
+        "identical (same idempotency keys, same pending-task "
+        "dispatch gate, same watermark anchor update).",
+    )
+    opt.add_argument(
+        "--research-scout",
+        dest="research_scout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-dispatch a read-only research scout at PRELUDE (and "
+        "every --research-scout-interval optimisation rounds) that "
+        "collects proven priors — reference launch scripts, model "
+        "config.json architecture features, and cross-framework / "
+        "NVIDIA research — into ``research_hints.md`` and seeds "
+        "high-priority gaps. Default on; pass ``--no-research-scout`` "
+        "to disable the whole feature.",
+    )
+    opt.add_argument(
+        "--research-scout-interval",
+        dest="research_scout_interval",
+        type=int,
+        default=3,
+        help="Re-dispatch the research scout every N optimisation rounds with "
+        "the current bottleneck context (append-only). Default 3. "
+        "Ignored when ``--no-research-scout`` is set.",
+    )
+    opt.add_argument(
+        "--static-recon",
+        dest="static_recon",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-dispatch a read-only static-recon specialist at PRELUDE, and "
+        "again once per macro-cycle when the configuration arm plateaus, "
+        "that greps the framework source for un-bridged capability "
+        "switches (predicates that silently disable a faster path for "
+        "this model/GPU/precision, e.g. a CUDA-only ``*_supported()`` "
+        "on ROCm) and seeds bridge candidates as gaps[]. Default on; "
+        "pass ``--no-static-recon`` to disable.",
+    )
+    opt.add_argument(
+        "--recipe-sediment",
+        dest="recipe_sediment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sediment KEEP/REVERT provenance into the persistent recipe: "
+        "KEEP optimizations traceable to a research hint carry their "
+        "source + measured gain into ``what_worked``; REVERTs land in "
+        "``what_failed`` so the next warm-start avoids re-testing them. "
+        "Default on; pass ``--no-recipe-sediment`` to keep the recipe "
+        "purely ephemeral.",
+    )
+    opt.add_argument(
+        "--target-advisory",
+        dest="target_advisory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Inject an advisory 'External target gap' block (throughput / "
+        "TPOT / interactivity gap vs the LLM-authored competitor "
+        "target) into the orchestration and specialist prompts; when "
+        "the TPOT ratio dominates it nudges toward latency-reducing "
+        "directions. Advisory only — never gates Objective or scoring. "
+        "Default on; pass ``--no-target-advisory`` to disable.",
+    )
+    # Post-optimization concurrency sweep: a baseline-vs-optimized Magpie grid across CONC values (see
+    # orchestrator/conc_sweep.py). Defaults to None so bootstrap can pick by benchmark mode.
+    opt.add_argument(
+        "--enable-conc-sweep",
+        dest="enable_conc_sweep",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run a post-optimization concurrency sweep (baseline vs "
+        "current_best across CONC) and write "
+        "reports/conc_sweep_summary.json + conc_sweep_raw.csv. "
+        "On by default for synthetic workloads, off by default for MLPerf. "
+        "Unavailable for native Magpie AgentX: start a separate session for each CONC.",
+    )
+    opt.add_argument(
+        "--conc-sweep-concs",
+        dest="conc_sweep_concs",
+        type=str,
+        default=None,
+        help="Comma-separated CONC ladder for --enable-conc-sweep. Run with --conc first, then cheapest first "
+        "(low-to-high for synthetic, high-to-low for MLPerf), so the order given does not matter. "
+        "Defaults to the ladder for the workload: "
+        "256,128,64,32,16,8,4,2 for synthetic, 1,4,8,10,14,20,28 for MLPerf. "
+        "Unavailable for native Magpie AgentX.",
+    )
+    opt.add_argument(
+        "--conc-sweep-total-budget-sec",
+        dest="conc_sweep_total_budget_sec",
+        type=int,
+        default=9000,
+        help="Total wall-clock budget (seconds) for the whole conc-sweep action, independent of the per-variant "
+        "Magpie timeout. Past its first CONC the baseline arm may spend half of it; the optimized arm runs only the CONCs the "
+        "baseline reached, so a budget that runs out drops whole pairs. Once exhausted, remaining variants are "
+        "recorded as status=skipped / error_class=budget_exhausted and the JSON envelope carries "
+        "budget_exhausted=true. Default 9000 (~2.5h); set to 0 to disable. Also bounded above by the main "
+        "session wall-clock deadline since conc_sweep runs as a SWEEP-phase action.",
+    )
+    # Per-variant explore overtime kill ratio (mirrored to SharedState.explore_overtime_kill_ratio). 0 disables.
+    # Explore variant hard timeout — operator override for the auto-derived cap. 0 (default) keeps auto-derive;
+    # mirrored to SharedState.explore_variant_timeout_sec_override.
+    opt.add_argument(
+        "--reset-state",
+        dest="reset_state",
+        action="store_true",
+        default=False,
+        help="Back up the existing ``state.json`` (if any) to "
+        "``state.json.preReset.<unix_ts>`` and start the session "
+        "from a blank SharedState. Recipe KB is NOT touched.",
+    )
+    # plateau threshold tuning: override defaults; locked at session start.
+    opt.add_argument(
+        "--plateau-explore-keep-gain",
+        dest="plateau_explore_keep_gain",
+        type=float,
+        default=None,
+        help="Config-arm plateau: max cumulative KEEP-gain (%%) across the "
+        "lookback window below which the AND condition fires. "
+        "Default 0.5.",
+    )
+    opt.add_argument(
+        "--plateau-explore-empty-streak",
+        dest="plateau_explore_empty_streak",
+        type=int,
+        default=None,
+        help="Config-arm plateau: required count of *consecutive* specialist "
+        "rounds with empty proposal_set before the AND condition "
+        "fires. Default 5.",
+    )
+    opt.add_argument(
+        "--plateau-explore-lookback",
+        dest="plateau_explore_lookback",
+        type=int,
+        default=None,
+        help="Config-arm plateau: number of trailing rounds the gain sum is computed over. Default 5.",
+    )
+    # phase budget percentages: each phase claims a fraction of the wall-clock budget (caps; may exit earlier).
+    opt.add_argument(
+        "--phase-budget-prelude-pct",
+        dest="phase_budget_prelude_pct",
+        type=float,
+        default=None,
+        help="Wall-clock budget cap for PRELUDE as a fraction of --max-hours. Default: 0.03. "
+        "On --resume-from, any --*-pct flag resets every phase share to its default plus the given overrides; with none, the prior budget is kept.",
+    )
+    opt.add_argument(
+        "--phase-budget-framework-pct",
+        dest="phase_budget_framework_pct",
+        type=float,
+        default=None,
+        help="Wall-clock budget cap for the OPTIMIZE (FRAMEWORK_AGENT) phase, which covers both configuration search "
+        "and source landing. Default: 0.38. "
+        "On --resume-from, any --*-pct flag resets every phase share to its default plus the given overrides; with none, the prior budget is kept.",
+    )
+    opt.add_argument(
+        "--phase-budget-kernel-pct",
+        dest="phase_budget_kernel_pct",
+        type=float,
+        default=None,
+        help="Wall-clock budget cap for KERNEL_AGENT. Default: 0.47. "
+        "On --resume-from, any --*-pct flag resets every phase share to its default plus the given overrides; with none, the prior budget is kept.",
+    )
+    opt.add_argument(
+        "--phase-budget-sweep-pct",
+        dest="phase_budget_sweep_pct",
+        type=float,
+        default=None,
+        help="Wall-clock budget cap for SWEEP. Default: 0.05. "
+        "On --resume-from, any --*-pct flag resets every phase share to its default plus the given overrides; with none, the prior budget is kept.",
+    )
+    opt.add_argument(
+        "--phase-budget-close-pct",
+        dest="phase_budget_close_pct",
+        type=float,
+        default=None,
+        help="Wall-clock budget cap for CLOSE. Default: 0.02. "
+        "On --resume-from, any --*-pct flag resets every phase share to its default plus the given overrides; with none, the prior budget is kept.",
+    )
+
+    add_session_dir_argument(opt)
+    add_recover_subparser(sub, common)
+
+    return p

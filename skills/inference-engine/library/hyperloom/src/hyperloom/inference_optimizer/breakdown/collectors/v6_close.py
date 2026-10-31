@@ -1,0 +1,193 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Session close-out for SBD V6.
+
+``close`` is a top-level V6 key rather than a timeline event: it describes how
+the session was wrapped up, not a stage that competes for wall-clock with the
+others. That fixed position is the point — a timeline event vanishes when it
+does not happen, whereas a session that never closed cleanly is exactly the
+case this key has to be able to state.
+
+The CLOSE sequencer records the close-out as it performs it (see
+:mod:`..recorder.close_out`), and this collector's job is to put that recording
+on the wire. One thing is still done here
+rather than at author time: the step vocabulary is checked so a producer that
+starts emitting a new step name surfaces as a warning instead of passing
+unnoticed.
+
+**The section is written twice, and the first pass is deliberately partial.**
+``session_breakdown`` is itself a step in the middle of the sequence, so when
+the breakdown is written the steps after it have not run yet. The recording
+reports ``running`` at that point — it is the sequencer's own last act that
+records a verdict — and the sequencer then calls
+:func:`~..exporter.patch_breakdown_close` to splice the settled section back
+in. A ``running`` breakdown may be an in-progress snapshot; it does not by
+itself show that close-out terminated before settling.
+
+A reader wanting to know whether a step genuinely failed must look at
+``steps[].status``; the absence of a step is not evidence against it.
+``langfuse_flush`` records ``done`` when the sequencer step returns and
+``failed`` if it raises; ``done`` alone does not attest to live delivery.
+
+The projection below is the fallback for a session with no recorded close
+fragments, and is retained only for the length of the migration.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from hyperloom_common.coerce import dict_rows, to_mapping
+
+from ..recorder.close_out import SESSION_BREAKDOWN_PATH
+from ..workflow_contract import workflow_contract
+
+
+# The step vocabulary the CLOSE sequencer emits, as the workflow contract
+# publishes it; unknown names are passed through and warned about so drift
+# surfaces instead of being silently dropped.
+_KNOWN_STEPS = frozenset(row["step"] for row in workflow_contract()["close_sequence"]["steps"])
+
+# The status vocabulary the sequencer actually writes.
+_KNOWN_STATUSES = frozenset({"running", "done", "failed", "skipped"})
+
+# The section's own status while the sequencer is still working through the
+# steps. Not a verdict: it is what stands until the sequencer records one.
+_STATUS_RUNNING = "running"
+
+
+def _close_step(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one recorded close step to the V6 shape."""
+    step = str(row.get("step") or "")
+    status = str(row.get("status") or "").strip().lower()
+    task_id = str(row.get("task_id") or "") or None
+    detail = str(row.get("detail") or "") or None
+    return {
+        "step": step,
+        # An unrecognized status is passed through rather than coerced into the enum: inventing ``done`` for something
+        # a producer spelled differently would be the one failure mode this key cannot afford.
+        "status": status,
+        "ts": str(row.get("ts") or ""),
+        "task_id": task_id,
+        "detail": detail,
+        **{key: row[key] for key in ("optional", "artifact_path", "artifact_digest", "error") if key in row},
+    }
+
+
+def collect_v6_close(
+    warnings: list[str],
+    recorded: Any = None,
+) -> dict[str, Any]:
+    """Put the sequencer's own recording of the close-out on the wire.
+
+    Args:
+        warnings (list[str]): V6 warning sink (mutated in place).
+        recorded (Any): The recorder's ``close`` fragment. The sequencer states
+            what it did as it does it, so this is the only account of the
+            close-out there is.
+    Returns:
+        dict[str, Any]: The ``close`` object. Always a full object — unlike a
+        timeline event, ``close`` has a fixed place in the payload, so an
+        un-closed session reports ``status: "failed"`` with empty steps rather
+        than vanishing.
+    """
+    if isinstance(recorded, dict) and recorded:
+        if recorded.get("source") == "safety_net" and not recorded.get("status"):
+            return {
+                **_unclosed(),
+                "source": "safety_net",
+                "sequence_schema_version": recorded.get("sequence_schema_version"),
+            }
+        return _recorded_close(recorded, warnings=warnings)
+    return _unclosed()
+
+
+def _recorded_close(
+    recorded: dict[str, Any],
+    *,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Put the recorded close-out on the wire.
+
+    The verdict, the timestamps and the artifact paths are all
+    read straight through: each was stated by the step that knew it. Only the
+    only the step vocabulary is checked.
+    """
+    steps = [_close_step(row) for row in dict_rows(recorded.get("steps"))]
+    _warn_unknown_vocabulary(steps, warnings)
+    artifacts = to_mapping(recorded.get("artifacts"))
+    close: dict[str, Any] = {
+        # A fragment with no status was opened by a producer that then failed
+        # to write one; it is still an un-settled close-out.
+        "status": str(recorded.get("status") or "") or _STATUS_RUNNING,
+        "start_time": str(recorded.get("start_time") or ""),
+        "end_time": str(recorded.get("end_time") or ""),
+        "close_sequence_done": bool(recorded.get("close_sequence_done")),
+        "steps": steps,
+        "artifacts": {
+            "final_json_path": artifacts.get("final_json_path") or None,
+            "final_md_path": artifacts.get("final_md_path") or None,
+            "session_breakdown_path": artifacts.get("session_breakdown_path") or SESSION_BREAKDOWN_PATH,
+            "artifact_package_path": artifacts.get("artifact_package_path") or None,
+        },
+    }
+    for key in ("sequence_schema_version", "source"):
+        if recorded.get(key):
+            close[key] = recorded[key]
+    # Absent when the close-out never got that far, rather than emitted empty: an empty publication claims an attempt
+    # that never happened, and an empty curve and a session that made no progress are different claims.
+    for key in ("kb_write_back", "roofline_progress", "baseline_progress", "geak_candidate", "final_recipe"):
+        section = recorded.get(key)
+        if isinstance(section, dict) and section:
+            close[key] = section
+    return close
+
+
+def _warn_unknown_vocabulary(steps: list[dict[str, Any]], warnings: list[str]) -> None:
+    """Warn about step names and statuses outside the known vocabulary."""
+    unknown = sorted({step["step"] for step in steps if step["step"] and step["step"] not in _KNOWN_STEPS})
+    if unknown:
+        warnings.append(f"v6.close: unrecognized close step(s) {', '.join(unknown)}; passed through unchanged")
+    unknown_statuses = sorted(
+        {step["status"] for step in steps if step["status"] and step["status"] not in _KNOWN_STATUSES}
+    )
+    if unknown_statuses:
+        warnings.append(
+            f"v6.close: unrecognized close step status(es) {', '.join(unknown_statuses)}; "
+            "passed through unchanged and counted as unsettled"
+        )
+
+
+def _unclosed() -> dict[str, Any]:
+    """The close-out of a session that never recorded one.
+
+    Reached by a run that died before CLOSE, and by the ``cli.finally`` safety
+    net that writes a breakdown without the sequencer having run. ``close`` has
+    a fixed place in the payload, so this reports the absence rather than
+    omitting the key: no step happened, so there is nothing to summarize and
+    ``failed`` is the whole of what can be said.
+
+    The export does not derive a verdict by re-reading ``phase_history`` and
+    probing the reports directory: that cannot tell a step that has not
+    happened yet from one that never will, and calls a healthy mid-sequence
+    session ``degraded``. The sequencer records its own verdict instead.
+
+    Returns:
+        dict[str, Any]: The ``close`` object for a session with no close-out.
+    """
+    return {
+        "status": "failed",
+        "start_time": "",
+        "end_time": "",
+        "close_sequence_done": False,
+        "steps": [],
+        "artifacts": {
+            "final_json_path": None,
+            "final_md_path": None,
+            # The breakdown is being written right now, so its own presence
+            # cannot be tested; the path is reported unconditionally.
+            "session_breakdown_path": SESSION_BREAKDOWN_PATH,
+            "artifact_package_path": None,
+        },
+    }

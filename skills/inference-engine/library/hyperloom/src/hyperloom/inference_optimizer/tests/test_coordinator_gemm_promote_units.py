@@ -1,0 +1,2333 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit coverage for the unified GEMM-tuning result handling on Coordinator."""
+
+from __future__ import annotations
+
+import csv
+import json
+import sqlite3
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import hyperloom.orchestrator.kernel.request_handlers as krh_mod
+import hyperloom.orchestrator.phases.kernel_gemm_tuning as kernel_gemm_tuning_mod
+from hyperloom_common.env import EnvValueError
+from hyperloom.orchestrator.knowledge.knowledge_plane import KnowledgePlane
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.inference_optimizer.session.paths import make_session_dir
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.phases.kernel import KernelPhase
+import hyperloom.orchestrator.phases.machine_state as machine_state_mod
+from hyperloom.orchestrator.phases.machine_state import LifecycleMark, record_lifecycle_event
+from hyperloom.orchestrator.roles import MockBackend, ScriptedPlan
+from hyperloom.orchestrator.state.shared_state import SharedState
+from hyperloom.orchestrator.kernel import integrate_accuracy as integrate_accuracy
+from hyperloom.orchestrator.kernel import _integrate_payload as integrate_payload
+from hyperloom.orchestrator.kernel import _integrate_outcomes as integrate_outcomes
+from hyperloom.orchestrator.kernel import _integrate_rebaseline as integrate_rebaseline
+from hyperloom.orchestrator.kernel import request_handlers
+
+
+def _journal_entries(session_dir: Path) -> list[dict]:
+    """Read the optimization_journal entries written under ``session_dir``."""
+    path = session_dir / "reports" / "optimization_journal.json"
+    if not path.exists():
+        return []
+    return list(json.loads(path.read_text(encoding="utf-8")).get("entries") or [])
+
+
+def _make_integrate(responses):
+    """Return an async ``integrate_handler`` double yielding queued responses."""
+    calls: list[dict] = []
+
+    async def _fake(payload, *, session_dir):
+        calls.append(payload)
+        idx = len(calls) - 1
+        return responses[idx] if idx < len(responses) else responses[-1]
+
+    _fake.calls = calls
+    return _fake
+
+
+def _coord(tmp_path: Path, **state_kwargs) -> Coordinator:
+    coord = Coordinator.__new__(Coordinator)
+    coord.session_dir = tmp_path
+    coord.shared_state = SharedState(**state_kwargs)
+    coord.knowledge_plane = None
+    coord.knowledge_plane = KnowledgePlane(recipe_kb=None)
+    return coord
+
+
+def test_syncs_standard_roofline_fallback_into_live_coordinator_state(tmp_path):
+    coord = _coord(tmp_path)
+    coord.shared_state.save(tmp_path)
+    selected_trace = str(tmp_path / "mixed_steady_state.trace.json.gz")
+    persisted = SharedState.load_or_init(tmp_path)
+    persisted.last_profile_trace = str(tmp_path / "profile.trace.json.gz")
+    persisted.last_profile_status = "succeeded"
+    persisted.last_profile_args = "--attention-backend AITER"
+    persisted.last_profile_workload = {"framework": "vllm", "server_args": "--attention-backend AITER"}
+    persisted.last_trace_analyze = {
+        "trace_input": persisted.last_profile_trace,
+        "steady_state_trace": selected_trace,
+        "roofline_snapshot_id": 3,
+    }
+    persisted.roofline_snapshots = [{"snapshot_id": 3}]
+    persisted.baseline_eager_fallback = False
+    persisted.save(tmp_path)
+    coord.shared_state.baseline_eager_fallback = True
+
+    coord.phase_kernel._sync_profile_state_after_gemm_roofline(
+        {
+            "shape_capture": {
+                "capture_mode": "block_fp8_profile",
+                "source_profile_trace": selected_trace,
+            }
+        }
+    )
+
+    assert coord.shared_state.last_profile_trace == persisted.last_profile_trace
+    assert coord.shared_state.last_profile_workload == persisted.last_profile_workload
+    assert coord.shared_state.last_trace_analyze == persisted.last_trace_analyze
+    assert coord.shared_state.roofline_snapshot_id == 3
+    assert coord.shared_state.baseline_eager_fallback is False
+
+
+def test_sync_unions_lifecycle_instead_of_overwriting(tmp_path, monkeypatch):
+    """Neither the live state's nor the inline Roofline's rows may be dropped."""
+    coord = _coord(tmp_path)
+    stamps = iter(["2026-01-01T00:00:00Z", "2026-01-01T00:00:05Z", "2026-01-01T00:00:03Z"])
+    monkeypatch.setattr(machine_state_mod, "_now_iso", lambda: next(stamps))
+    record_lifecycle_event(coord.shared_state, LifecycleMark(step="explore", status="END"))
+    coord.shared_state.save(tmp_path)
+    # Recorded on the live state only; never persisted before the sync.
+    record_lifecycle_event(coord.shared_state, LifecycleMark(step="live_only", status="START"))
+
+    selected_trace = str(tmp_path / "mixed_steady_state.trace.json.gz")
+    persisted = SharedState.load_or_init(tmp_path)
+    persisted.last_trace_analyze = {"steady_state_trace": selected_trace}
+    record_lifecycle_event(persisted, LifecycleMark(step="profile", status="END"))
+    persisted.save(tmp_path)
+
+    result = {
+        "shape_capture": {
+            "capture_mode": "block_fp8_profile",
+            "source_profile_trace": selected_trace,
+        }
+    }
+    coord.phase_kernel._sync_profile_state_after_gemm_roofline(result)
+
+    rows = coord.shared_state.lifecycle
+    assert [row["step"] for row in rows] == ["explore", "profile", "live_only"]
+    assert [row["seq"] for row in rows] == [0, 1, 2]
+
+    # Re-running the merge must not duplicate rows or shuffle seq.
+    before = list(rows)
+    coord.phase_kernel._sync_profile_state_after_gemm_roofline(result)
+    assert coord.shared_state.lifecycle == before
+
+
+def _silent_backends() -> dict[str, object]:
+    silent = ScriptedPlan(
+        turns=[],
+        default_intent=Intent(
+            type=IntentType.SEND_MESSAGE,
+            payload={"topic": "heartbeat", "body_md": "ok"},
+        ),
+    )
+    return {
+        "orchestration": MockBackend(silent, name="o"),
+        "critic": MockBackend(silent, name="c"),
+    }
+
+
+@pytest.fixture
+def coord_session_dir(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
+    return make_session_dir()
+
+
+@pytest.mark.asyncio
+async def test_gemm_roofline_refresh_survives_terminal_lifecycle_save(
+    coord_session_dir,
+    monkeypatch,
+):
+    """The terminal state save must not clobber the inline Roofline refresh."""
+    coord = Coordinator(coord_session_dir, backends=_silent_backends())
+    try:
+        selected_trace = str(coord_session_dir / "mixed_steady_state.trace.json.gz")
+
+        # Mirror the handler-owned inline Roofline: a throwaway SharedState loaded from disk, mutated, and persisted
+        # there -- exactly what the block-FP8 GEMM handler leaves behind before returning.
+        state = SharedState.load_or_init(coord_session_dir)
+        state.last_profile_trace = str(coord_session_dir / "profile.trace.json.gz")
+        state.last_profile_status = "succeeded"
+        state.last_profile_workload = {
+            "framework": "vllm",
+            "server_args": "--attention-backend AITER",
+        }
+        state.last_trace_analyze = {
+            "trace_input": state.last_profile_trace,
+            "steady_state_trace": selected_trace,
+            "roofline_snapshot_id": 7,
+        }
+        state.baseline_eager_fallback = False
+        state.save(coord_session_dir)
+
+        coord.shared_state.baseline_eager_fallback = True
+
+        result = {
+            "status": "ok",
+            "decision": "REVERT",
+            "backend": "geak",
+            "shape_capture": {
+                "capture_mode": "block_fp8_profile",
+                "source_profile_trace": selected_trace,
+            },
+        }
+
+        # The live entrypoint both KERNEL-entry and any resume converge on.
+        await coord.phase_kernel._handle_gemm_tuning_result(result)
+
+        assert coord.shared_state.last_trace_analyze.get("steady_state_trace") == selected_trace
+        assert coord.shared_state.last_profile_status == "succeeded"
+        assert coord.shared_state.baseline_eager_fallback is False
+        # It must also survive on disk so the next run can reuse the trace.
+        reloaded = SharedState.load_or_init(coord_session_dir)
+        assert reloaded.last_trace_analyze.get("steady_state_trace") == selected_trace
+    finally:
+        await coord.stop()
+
+
+class _Bus:
+    def __init__(self) -> None:
+        self.messages = []
+
+    async def append_and_seq(self, message):
+        self.messages.append(message)
+        return message
+
+
+class TestGemmE2eCandidates:
+    """Guard rails deciding which tuning results reach the E2E validator."""
+
+    def test_a_forced_split_k_candidate_reaches_e2e(self, tmp_path):
+        """split-K benefit is e2e-only, so micro reports ``no_improvement``."""
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        cands = coord.phase_kernel._gemm_canonical_candidates(
+            {
+                "backend": "forge",
+                "candidates": [
+                    {
+                        "tuner": "sglang_dense_fp8_splitk",
+                        "env": {"SGLANG_SPLITK_CONFIG": "/tuned/splitk.csv"},
+                        "best_micro_speedup": 1.0,
+                        "requires_e2e_validation": True,
+                    }
+                ],
+                "tuners_run": [
+                    {
+                        "tuner": "sglang_dense_fp8_splitk",
+                        "status": "no_improvement",
+                        "candidate": True,
+                        "env_var": "SGLANG_SPLITK_CONFIG",
+                        "env_value": "/tuned/splitk.csv",
+                        "best_micro_speedup": 1.0,
+                    }
+                ],
+            }
+        )
+        assert cands == [
+            {
+                "tuner": "sglang_dense_fp8_splitk",
+                "env_var": "SGLANG_SPLITK_CONFIG",
+                "env_value": "/tuned/splitk.csv",
+                "envs": {"SGLANG_SPLITK_CONFIG": "/tuned/splitk.csv"},
+                "micro_speedup": 1.0,
+            }
+        ]
+
+    def test_moe_and_dense_stay_independent_candidates(self, tmp_path):
+        """One call tunes both, and each earns its own KEEP/REVERT."""
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        cands = coord.phase_kernel._gemm_canonical_candidates(
+            {
+                "backend": "forge",
+                "candidates": [
+                    {"tuner": "fmoe_ck", "env": {"AITER_CONFIG_FMOE": "/tuned/moe.csv"}, "best_micro_speedup": 1.4},
+                    {"tuner": "sglang_dense_fp8", "env": {"SGLANG_DENSE": "/tuned/d.csv"}, "best_micro_speedup": 1.2},
+                ],
+            }
+        )
+        assert [c["tuner"] for c in cands] == ["fmoe_ck", "sglang_dense_fp8"]
+        assert [c["micro_speedup"] for c in cands] == [1.4, 1.2]
+
+    def test_the_producer_verdict_is_not_re_derived_from_the_tuner_rows(self, tmp_path):
+        """The producer's list is authoritative once it names any candidate."""
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        cands = coord.phase_kernel._gemm_canonical_candidates(
+            {
+                "backend": "forge",
+                "candidates": [
+                    {"tuner": "forced", "env": {"FORCED": "/tuned/f.csv"}, "best_micro_speedup": 1.0},
+                ],
+                "tuners_run": [
+                    {"tuner": "forced", "status": "no_improvement", "env_var": "FORCED", "env_value": "/tuned/f.csv"},
+                    {
+                        "tuner": "no_artifact",
+                        "status": "ok",
+                        "improved_shapes": 3,
+                        "env_var": "LOOKS_PROMOTABLE",
+                        "env_value": "/tuned/none.csv",
+                        "best_micro_speedup": 1.6,
+                    },
+                ],
+            }
+        )
+        assert [c["tuner"] for c in cands] == ["forced"]
+
+    def test_a_candidate_with_no_env_is_not_offered(self, tmp_path):
+        """Nothing to apply means nothing an e2e run could validate."""
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        cands = coord.phase_kernel._gemm_canonical_candidates(
+            {
+                "backend": "forge",
+                "candidates": [
+                    {"tuner": "empty", "env": {}, "best_micro_speedup": 1.5},
+                    {"tuner": "usable", "env": {"OK": "/tuned/ok.csv"}, "best_micro_speedup": 1.1},
+                ],
+            }
+        )
+        assert [c["tuner"] for c in cands] == ["usable"]
+
+    def test_a_multi_variable_candidate_leaves_the_singular_pair_empty(self, tmp_path):
+        """The singular pair is only unambiguous for a one-variable candidate."""
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        (cand,) = coord.phase_kernel._gemm_canonical_candidates(
+            {
+                "backend": "forge",
+                "candidates": [
+                    {"tuner": "pair", "env": {"A": "1", "B": "2"}, "best_micro_speedup": 1.3},
+                ],
+            }
+        )
+        assert cand["envs"] == {"A": "1", "B": "2"}
+        assert cand["env_var"] == ""
+        assert cand["env_value"] == ""
+
+
+class TestQueueFusionSiblings:
+    """A KEPT fusion nomination is queued as sibling records, not integrated inline."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override, expected", [(None, 1.0), ("2.5", 2.5)])
+    async def test_queues_one_pending_record_per_nominated_sibling(self, tmp_path, monkeypatch, override, expected):
+        monkeypatch.delenv("HYPERLOOM_FUSION_KEEP_PCT", raising=False)
+        if override is not None:
+            monkeypatch.setenv("HYPERLOOM_FUSION_KEEP_PCT", override)
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+
+        await phase._integrate_fusion(
+            {
+                "patches": [
+                    {
+                        "kernel_name": "fuse_a",
+                        "patch_path": "/out/fuse_a.patch",
+                        "target_file": "/repo/a.py",
+                        "kernel_repo": "/repo",
+                        "snapshot_dir": "/snap/a",
+                        "base_commit": "abc",
+                        "micro_speedup": 1.4,
+                        "env_flag": "ZAYA_FUSED_A",
+                        "kind": "fusion",
+                    },
+                    {
+                        "kernel_name": "fuse_b",
+                        "patch_path": "/out/fuse_b.patch",
+                        "target_file": "/repo/b.py",
+                        "kernel_repo": "/repo",
+                        "micro_speedup": 1.2,
+                        "env_flag": "ZAYA_FUSED_B",
+                        "kind": "fusion",
+                    },
+                ],
+                "nomination": {"candidates_seen": 3, "resolved": 2, "selected": 2},
+            }
+        )
+
+        queue = coord.shared_state.pending_kernel_integrations
+        assert len(queue) == 2
+        by_source = {str(r["source_file"]): r for r in queue.values()}
+        assert set(by_source) == {"/repo/a.py", "/repo/b.py"}
+        rec_a = by_source["/repo/a.py"]
+        assert rec_a["status"] == "pending"
+        assert rec_a["source"] == "forge_fusion"
+        assert rec_a["action_label"] == "fusion"
+        assert rec_a["artifact_path"] == "/out/fuse_a.patch"
+        assert rec_a["fusion_env_flags"] == {"ZAYA_FUSED_A": "1"}
+        # The fusion-specific keep bar rides on the record rather than the integrate default.
+        assert rec_a["keep_threshold_pct"] == pytest.approx(expected)
+        assert by_source["/repo/b.py"]["fusion_env_flags"] == {"ZAYA_FUSED_B": "1"}
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_keep_pct_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HYPERLOOM_FUSION_KEEP_PCT", "invalid")
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+
+        with pytest.raises(EnvValueError, match="HYPERLOOM_FUSION_KEEP_PCT"):
+            await phase._integrate_fusion(
+                {
+                    "patches": [
+                        {
+                            "kernel_name": "fuse_a",
+                            "patch_path": "/out/fuse_a.patch",
+                            "target_file": "/repo/a.py",
+                            "micro_speedup": 1.4,
+                            "kind": "fusion",
+                        }
+                    ]
+                }
+            )
+
+    @pytest.mark.asyncio
+    async def test_empty_nomination_is_a_clean_no_op(self, tmp_path):
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+
+        # A run that kept nothing: patches present but empty, plus the legacy singular shape with no patches[] at all
+        # -- both queue nothing.
+        await phase._integrate_fusion({"patches": [], "nomination": {"selected": 0}})
+        await phase._integrate_fusion({"kept": True})
+
+        assert coord.shared_state.pending_kernel_integrations == {}
+
+    @pytest.mark.asyncio
+    async def test_sibling_missing_patch_or_target_is_dropped(self, tmp_path):
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+
+        await phase._integrate_fusion(
+            {
+                "patches": [
+                    {"kernel_name": "no_patch", "patch_path": "", "target_file": "/repo/a.py"},
+                    {"kernel_name": "no_target", "patch_path": "/out/x.patch", "target_file": ""},
+                    {
+                        "kernel_name": "good",
+                        "patch_path": "/out/good.patch",
+                        "target_file": "/repo/g.py",
+                        "micro_speedup": 1.1,
+                    },
+                ]
+            }
+        )
+
+        queue = coord.shared_state.pending_kernel_integrations
+        assert len(queue) == 1
+        assert next(iter(queue.values()))["source_file"] == "/repo/g.py"
+
+    @pytest.mark.asyncio
+    async def test_a_fusion_record_that_cannot_be_persisted_fails_the_kernel_entry_with_its_siblings_queued(
+        self, tmp_path, monkeypatch
+    ):
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+        result = {
+            "status": "ok",
+            "kept": True,
+            "requires_e2e_validation": True,
+            "engine": "forge_fusion",
+            "patches": [
+                {
+                    "kernel_name": "fuse_a",
+                    "patch_path": "/out/fuse_a.patch",
+                    "target_file": "/repo/a.py",
+                    "micro_speedup": 1.4,
+                    "kind": "fusion",
+                }
+            ],
+        }
+
+        def _disk_full(_session_dir):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(coord.shared_state, "save", _disk_full)
+
+        with pytest.raises(OSError, match="No space left on device"):
+            await phase._handle_fusion_result(result)
+        # The kept fusion is recorded only together with its queued sibling, so the KEEP survives the failed save.
+        assert coord.shared_state.last_fusion["kept"] is True
+        queued = [str(r["source_file"]) for r in coord.shared_state.pending_kernel_integrations.values()]
+        assert queued == ["/repo/a.py"]
+
+    @pytest.mark.asyncio
+    async def test_handle_fusion_result_posts_and_integrates_kept_candidate(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+        integrated: list[dict] = []
+
+        async def _fake_integrate(result):
+            integrated.append(result)
+
+        monkeypatch.setattr(phase, "_integrate_fusion", _fake_integrate)
+        result = {
+            "status": "ok",
+            "kept": True,
+            "requires_e2e_validation": True,
+            "engine": "forge_fusion",
+        }
+
+        await phase._handle_fusion_result(result)
+
+        assert coord.shared_state.last_fusion == result
+        assert integrated == [result]
+        assert coord.bus.messages[0].payload["kind"] == "run_fusion_done"
+
+    @pytest.mark.asyncio
+    async def test_handle_fusion_result_tolerates_non_dict_and_bus_failure(self, tmp_path):
+        coord = _coord(tmp_path)
+
+        class BadBus:
+            async def append_and_seq(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("bus down")
+
+        coord.bus = BadBus()
+        phase = KernelPhase(coord)
+
+        await phase._handle_fusion_result("not-dict")  # type: ignore[arg-type]
+
+        assert coord.shared_state.last_fusion == {"status": "failed"}
+
+    @pytest.mark.asyncio
+    async def test_run_forge_fusion_handles_handler_exception(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path)
+        coord.bus = _Bus()
+        phase = KernelPhase(coord)
+
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError("fusion boom")
+
+        monkeypatch.setattr(krh_mod, "run_fusion_handler", _raise)
+
+        await phase._run_forge_fusion()
+
+        assert coord.shared_state.last_fusion["decision"] == "REVERT"
+        assert coord.shared_state.last_fusion["error_class"] == "RuntimeError"
+
+
+class TestForgeGemmRuntimeConfigMerge:
+    def test_merges_candidate_with_aiter_source_configs_when_runtime_cache_is_absent(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, framework="sglang")
+        phase = KernelPhase(coord)
+        aiter_root = tmp_path / "aiter-source"
+        configs_dir = aiter_root / "aiter" / "configs"
+        model_configs_dir = configs_dir / "model_configs"
+        model_configs_dir.mkdir(parents=True)
+        header = "gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName\n"
+        (configs_dir / "a8w8_blockscale_bpreshuffle_tuned_gemm.csv").write_text(
+            header
+            + "gfx950,256,16,512,7168,asm,1,1,10.0,base_kernel\n"
+            + "gfx950,256,32,512,7168,asm,5,1,12.0,base_duplicate\n",
+            encoding="utf-8",
+        )
+        (model_configs_dir / "qwen3_14b_a8w8_blockscale_bpreshuffle_tuned_gemm.csv").write_text(
+            header + "gfx950,256,32,512,7168,asm,2,1,9.0,model_kernel\n",
+            encoding="utf-8",
+        )
+        candidate = tmp_path / "candidate.csv"
+        candidate.write_text(
+            header
+            + "gfx950,256,16,512,7168,asm,3,1,7.0,tuned_kernel\n"
+            + "gfx950,256,64,512,7168,asm,4,1,8.0,new_kernel\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AITER_ROOT_DIR", str(aiter_root))
+        monkeypatch.setenv(
+            "INFERENCE_OPTIMIZER_AITER_CONFIG_CACHE_DIR",
+            str(tmp_path / "missing-runtime-cache"),
+        )
+
+        merged_path = phase._merge_gemm_candidate_with_runtime(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE", str(candidate)
+        )
+
+        assert merged_path is not None
+        with Path(merged_path).open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 3
+        assert {(row["M"], row["kernelName"]) for row in rows} == {
+            ("16", "tuned_kernel"),
+            ("32", "model_kernel"),
+            ("64", "new_kernel"),
+        }
+
+    def test_merges_fmoe_candidate_by_full_untuned_dispatch_schema(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, framework="sglang")
+        phase = KernelPhase(coord)
+        aiter_root = tmp_path / "aiter-source"
+        configs_dir = aiter_root / "aiter" / "configs"
+        configs_dir.mkdir(parents=True)
+        key_header = (
+            "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+        )
+        tuned_header = f"gfx,cu_num,{key_header},kernelId,us,kernelName\n"
+        (configs_dir / "untuned_fmoe.csv").write_text(f"{key_header}\n", encoding="utf-8")
+        (configs_dir / "tuned_fmoe.csv").write_text(
+            tuned_header + "gfx950,256,64,7168,2048,128,8,Silu,bf16,fp8,fp8,"
+            "per_token,1,0,1,10.0,base_per_token\n" + "gfx950,256,64,7168,2048,128,8,Silu,bf16,fp8,fp8,"
+            "per_tensor,1,0,2,11.0,base_per_tensor\n",
+            encoding="utf-8",
+        )
+        candidate = tmp_path / "candidate_fmoe.csv"
+        candidate.write_text(
+            tuned_header + "gfx950,256,64,7168,2048,128,8,Silu,bf16,fp8,fp8,per_token,1,0,3,7.0,tuned_per_token\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AITER_ROOT_DIR", str(aiter_root))
+        monkeypatch.setenv(
+            "INFERENCE_OPTIMIZER_AITER_CONFIG_CACHE_DIR",
+            str(tmp_path / "missing-runtime-cache"),
+        )
+
+        merged_path = phase._merge_gemm_candidate_with_runtime("AITER_CONFIG_FMOE", str(candidate))
+
+        assert merged_path is not None
+        with Path(merged_path).open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        assert {(row["q_type"], row["kernelName"]) for row in rows} == {
+            ("per_token", "tuned_per_token"),
+            ("per_tensor", "base_per_tensor"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_does_not_e2e_validate_sparse_aiter_candidate_without_base_configs(self, tmp_path, monkeypatch):
+        coord = _coord(
+            tmp_path,
+            framework="sglang",
+            baseline_tput=100.0,
+            current_best={"tput": 100.0},
+        )
+        phase = KernelPhase(coord)
+        candidate = tmp_path / "candidate.csv"
+        candidate.write_text(
+            "gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName\ngfx950,256,16,512,7168,asm,3,1,7.0,tuned_kernel\n",
+            encoding="utf-8",
+        )
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 110.0, "gain_pct": 10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        monkeypatch.setattr("importlib.util.find_spec", lambda _name: None)
+        monkeypatch.delenv("AITER_ROOT_DIR", raising=False)
+        # The merge also probes the baked-in container config dir, which really exists on an aiter image.
+        monkeypatch.setattr(
+            kernel_gemm_tuning_mod,
+            "_CONTAINER_AITER_CONFIG_DIR",
+            tmp_path / "missing-container-configs",
+        )
+        monkeypatch.setenv(
+            "INFERENCE_OPTIMIZER_AITER_CONFIG_CACHE_DIR",
+            str(tmp_path / "missing-runtime-cache"),
+        )
+        # Point the last-resort container config dir at a non-existent path so the "no complete aiter config anywhere"
+        # branch is exercised even on a dev box that has the real /sgl-workspace/aiter checkout mounted.
+        monkeypatch.setattr(
+            "hyperloom.orchestrator.phases.kernel_gemm_tuning._CONTAINER_AITER_CONFIG_DIR",
+            tmp_path / "missing-container-aiter-configs",
+        )
+        result = {
+            "backend": "forge",
+            "precision": "bf16",
+            "candidates": [
+                {
+                    "tuner": "a8w8_blockscale_bpreshuffle",
+                    "env": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": str(candidate)},
+                }
+            ],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert fake.calls == []
+        assert result["e2e_results"]["reverted"][0]["reason"] == ("complete_aiter_config_unavailable")
+
+    @pytest.mark.asyncio
+    async def test_does_not_e2e_validate_missing_aiter_candidate(self, tmp_path, monkeypatch):
+        coord = _coord(
+            tmp_path,
+            framework="sglang",
+            baseline_tput=100.0,
+            current_best={"tput": 100.0},
+        )
+        phase = KernelPhase(coord)
+        missing_candidate = tmp_path / "missing-candidate.csv"
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 110.0, "gain_pct": 10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        result = {
+            "backend": "forge",
+            "precision": "fp8",
+            "candidates": [
+                {"tuner": "a8w8_blockscale", "env": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE": str(missing_candidate)}}
+            ],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert fake.calls == []
+        assert result["e2e_results"]["reverted"][0]["reason"] == ("candidate_artifact_missing")
+
+    @pytest.mark.asyncio
+    async def test_integrate_bench_fault_not_recorded_as_zero_gain_revert(self, tmp_path, monkeypatch):
+        """A server that never booted is an integrate fault, not a 0% REVERT."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        phase = KernelPhase(coord)
+        fmoe_candidate = tmp_path / "fmoe.csv"
+        dense_candidate = tmp_path / "dense.csv"
+        fmoe_candidate.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        dense_candidate.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+        calls: list[dict] = []
+
+        async def _fake_integrate(payload, *, session_dir):
+            calls.append(payload)
+            if payload["kernel_id"] == "gemm_tune_fmoe_ck":
+                return {
+                    "status": "failed",
+                    "error_class": "bench_exception",
+                    "decision": "REVERT",
+                    "error": "re-baseline did not succeed",
+                }
+            return {"status": "ok", "decision": "KEEP", "new_tput": 120.0, "gain_pct": 9.09}
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", _fake_integrate)
+        monkeypatch.setattr(
+            phase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _env_var, env_value: env_value,
+        )
+
+        result = {
+            "backend": "forge",
+            "candidates": [
+                {"tuner": "fmoe_ck", "env": {"AITER_CONFIG_FMOE": str(fmoe_candidate)}},
+                {"tuner": "dense_bf16", "env": {"AITER_CONFIG_DENSE": str(dense_candidate)}},
+            ],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert len(calls) == 3
+        assert result["e2e_results"]["faults"][0]["reason"] == "integrate_fault:bench_exception"
+        assert result["e2e_results"]["faults"][0]["fault_attempts"] == 2
+        assert result["e2e_results"]["reverted"] == []
+        assert result["e2e_results"]["kept"][0]["tuner"] == "dense_bf16"
+        assert result["decision"] == "KEEP"
+
+    @pytest.mark.asyncio
+    async def test_integrate_fault_retries_once_before_verdict(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        phase = KernelPhase(coord)
+        dense_candidate = tmp_path / "dense.csv"
+        dense_candidate.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+        calls: list[dict] = []
+
+        async def _fake_integrate(payload, *, session_dir):
+            calls.append(payload)
+            if len(calls) == 1:
+                return {
+                    "status": "failed",
+                    "error_class": "bench_exception",
+                    "decision": "REVERT",
+                    "error": "re-baseline did not succeed",
+                }
+            return {"status": "ok", "decision": "KEEP", "new_tput": 110.0, "gain_pct": 10.0}
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", _fake_integrate)
+        monkeypatch.setattr(
+            phase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _env_var, env_value: env_value,
+        )
+        result = {
+            "backend": "forge",
+            "candidates": [{"tuner": "dense_bf16", "env": {"AITER_CONFIG_DENSE": str(dense_candidate)}}],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert len(calls) == 2
+        assert result["e2e_results"]["faults"] == []
+        assert result["e2e_results"]["kept"][0]["tuner"] == "dense_bf16"
+        assert result["decision"] == "KEEP"
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_run_leaves_its_tuners_unjudged(self, tmp_path, monkeypatch):
+        """A clock that ran out is not a verdict on the tuners it interrupted."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        phase = KernelPhase(coord)
+        first = tmp_path / "fmoe.csv"
+        second = tmp_path / "dense.csv"
+        first.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        second.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+        calls: list[dict] = []
+
+        async def _fake_integrate(payload, *, session_dir):
+            calls.append(payload)
+            return {
+                "status": "failed",
+                "error_class": "session_time_exhausted",
+                "decision": "NEEDS_REVIEW",
+            }
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", _fake_integrate)
+        monkeypatch.setattr(
+            phase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _env_var, env_value: env_value,
+        )
+
+        result = {
+            "backend": "forge",
+            "candidates": [
+                {"tuner": "fmoe_ck", "env": {"AITER_CONFIG_FMOE": str(first)}},
+                {"tuner": "dense_bf16", "env": {"AITER_CONFIG_DENSE": str(second)}},
+            ],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert len(calls) == 1
+        assert result["e2e_results"]["kept"] == []
+        assert result["e2e_results"]["reverted"] == []
+        assert coord.shared_state.optimization_stack == []
+
+    @pytest.mark.asyncio
+    async def test_a_round_the_phase_cannot_fit_is_never_started(self, tmp_path, monkeypatch):
+        """With less KERNEL time left than one measured round, no candidate is measured and none is judged."""
+        from hyperloom.orchestrator.phases import machine_state
+
+        coord = _coord(tmp_path, baseline_tput=100.0, baseline_runtime_sec=600.0, framework="sglang")
+        phase = KernelPhase(coord)
+        candidate = tmp_path / "dense.csv"
+        candidate.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+        fake = _make_integrate([{"status": "ok", "decision": "KEEP", "new_tput": 120.0, "gain_pct": 20.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        monkeypatch.setattr(machine_state, "phase_budget_remaining_seconds", lambda _state, **_kw: 60.0)
+        monkeypatch.setattr(phase, "_merge_gemm_candidate_with_runtime", lambda _env_var, env_value: env_value)
+        result = {
+            "backend": "forge",
+            "candidates": [{"tuner": "dense_bf16", "env": {"AITER_CONFIG_DENSE": str(candidate)}}],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert fake.calls == []
+        assert result["e2e_results"]["kept"] == []
+        assert result["e2e_results"]["reverted"] == []
+        assert coord.shared_state.optimization_stack == []
+
+    @pytest.mark.asyncio
+    async def test_stacks_keeps_and_reverts(self, tmp_path, monkeypatch):
+        coord = _coord(
+            tmp_path,
+            baseline_tput=100.0,
+            baseline_runtime_sec=10.0,
+            framework="sglang",
+            current_best={"action": "warm_replay", "tput": 110.0},
+        )
+        phase = KernelPhase(coord)
+        fmoe_candidate = tmp_path / "fmoe.csv"
+        dense_candidate = tmp_path / "dense.csv"
+        fmoe_candidate.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        dense_candidate.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+        calls: list[dict] = []
+        responses = [
+            {"decision": "KEEP", "new_tput": 130.0, "gain_pct": 18.18},
+            {"decision": "REVERT", "new_tput": 125.0, "gain_pct": -3.8},
+        ]
+
+        async def _fake_integrate(payload, *, session_dir):
+            assert session_dir == tmp_path
+            calls.append(payload)
+            return responses[len(calls) - 1]
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", _fake_integrate)
+        monkeypatch.setattr(
+            phase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _env_var, env_value: env_value,
+        )
+
+        result = {
+            "backend": "forge",
+            "precision": "bf16",
+            "workspace": str(tmp_path / "gemm"),
+            "recommended_env": {"AITER_CONFIG_FMOE": "/raw.csv"},
+            "extra_envs": {"AITER_CONFIG_FMOE": "/raw.csv"},
+            "candidates": [
+                {"tuner": "fmoe_ck", "env": {"AITER_CONFIG_FMOE": str(fmoe_candidate)}, "best_micro_speedup": 1.2},
+                {"tuner": "dense_bf16", "env": {"AITER_CONFIG_DENSE": str(dense_candidate)}, "best_micro_speedup": 1.1},
+            ],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert [c["kernel_id"] for c in calls] == [
+            "gemm_tune_fmoe_ck",
+            "gemm_tune_dense_bf16",
+        ]
+        assert calls[0]["keep_threshold_pct"] == pytest.approx(1.0)
+        assert calls[1]["keep_threshold_pct"] == pytest.approx(1.0)
+        assert calls[0]["base_tput"] == 110.0
+        assert calls[0]["extra_server_args"] == "--moe-runner-backend aiter"
+        assert calls[0]["extra_envs"] == {"AITER_CONFIG_FMOE": str(fmoe_candidate)}
+        assert calls[1]["base_tput"] == 130.0
+        assert calls[1]["extra_envs"] == {
+            "AITER_CONFIG_FMOE": str(fmoe_candidate),
+            "AITER_CONFIG_DENSE": str(dense_candidate),
+        }
+        assert coord.shared_state.current_best["variant_name"] == "forge_fmoe_ck"
+        assert coord.shared_state.current_best["tput"] == 130.0
+        assert coord.shared_state.optimization_stack[0]["variant_name"] == "forge_fmoe_ck"
+        assert coord.shared_state.optimization_stack[0]["backend"] == "forge"
+        assert result["decision"] == "KEEP"
+        assert result["recommended_env"] == {"AITER_CONFIG_FMOE": str(fmoe_candidate)}
+        assert result["e2e_results"]["kept"][0]["tuner"] == "fmoe_ck"
+        assert result["e2e_results"]["reverted"][0]["tuner"] == "dense_bf16"
+
+    @pytest.mark.asyncio
+    async def test_handles_no_candidates_without_rewriting_raw_result(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        phase = KernelPhase(coord)
+        result = {
+            "backend": "forge",
+            "precision": "bf16",
+            "recommended_env": {"AITER_CONFIG": "/raw.csv"},
+            "extra_envs": {"AITER_CONFIG": "/raw.csv"},
+            "candidates": [],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert result["recommended_env"] == {"AITER_CONFIG": "/raw.csv"}
+        assert coord.shared_state.optimization_stack == []
+
+    @pytest.mark.asyncio
+    async def test_records_integrate_exception_as_fault(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        phase = KernelPhase(coord)
+        dense_candidate = tmp_path / "dense.csv"
+        dense_candidate.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+
+        async def _raise_integrate(*_args, **_kwargs):
+            raise RuntimeError("integrate failed")
+
+        calls: list[str] = []
+
+        async def _counting_raise(*_args, **_kwargs):
+            calls.append("boom")
+            raise RuntimeError("integrate failed")
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", _counting_raise)
+        monkeypatch.setattr(
+            phase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _env_var, env_value: env_value,
+        )
+        result = {
+            "backend": "forge",
+            "precision": "bf16",
+            "candidates": [{"tuner": "dense_bf16", "env": {"AITER_CONFIG_DENSE": str(dense_candidate)}}],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert result["status"] == "failed"
+        assert result["micro_decision"] == "integrate_fault"
+        assert result["e2e_gain_pct"] is None
+        fault = result["e2e_results"]["faults"][0]
+        assert fault["reason"] == "integrate_fault:handler_exception"
+        assert fault["fault"] is True
+        assert fault["fault_attempts"] == 2
+        assert len(calls) == 2
+        assert result["e2e_results"]["reverted"] == []
+
+
+class TestBf16DenseFallbackIsInternalToForge:
+    """Change 3: the fp8->bf16 dense retry moved down into forge's tuner router."""
+
+    @pytest.mark.asyncio
+    async def test_kernel_entry_makes_exactly_one_gemm_call(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, framework="sglang")
+
+        async def _append_and_seq(*_args, **_kwargs):
+            return None
+
+        coord.bus = type("Bus", (), {})()
+        coord.bus.append_and_seq = _append_and_seq
+        coord.shared_state.kernel_enabled = True
+        coord.phase_kernel.geak_enabled = lambda: False
+        coord.phase_kernel._gemm_tuning_required_before_kernel_opt = lambda: True
+        coord.phase_machine.record_phase_entry_evidence = lambda **_kwargs: None
+
+        async def _noop(*_args, **_kwargs):
+            return None
+
+        coord.phase_kernel._maybe_reprofile_for_kernel = _noop
+        # KERNEL entry ends by handing rewrite control to a controller subprocess.
+        coord.phase_kernel._run_kernel_rewrite_controller = _noop
+
+        calls: list[dict] = []
+
+        async def _fake_run_gemm(payload, *, session_dir):
+            assert session_dir == tmp_path
+            calls.append(payload)
+            # An fp8 dense tuning that came back empty.
+            return {
+                "status": "ok",
+                "decision": "REVERT",
+                "backend": "forge",
+                "engine": "forge",
+                "precision": "fp8",
+                "framework": "sglang",
+                "micro_decision": "no_improvement",
+                "candidates": [],
+            }
+
+        monkeypatch.setattr(krh_mod, "run_gemm_tuning_handler", _fake_run_gemm)
+
+        await coord.phase_kernel.run_agent(
+            SimpleNamespace(task=SimpleNamespace(params={"from_phase": "FRAMEWORK_AGENT"}))
+        )
+
+        assert [c["task_id"] for c in calls] == ["kernel_entry_gemm_tuning"]
+        # No second, bf16-flavoured subprocess is launched.
+        assert not any(c["task_id"].endswith("_bf16_fallback") for c in calls)
+        assert "bf16_fallback" not in coord.shared_state.last_gemm_tuning.get("task_id", "")
+
+    def test_deleted_fallback_machinery_is_gone(self, tmp_path):
+        """The dedicated bf16-fallback methods no longer exist on the coordinator."""
+        coord = _coord(tmp_path, framework="sglang")
+        for name in (
+            "_run_bf16_dense_gemm_fallback",
+            "_should_run_bf16_dense_gemm_fallback",
+            "_bf16_dense_gemm_fallback_pending",
+            "_bf16_dense_gemm_fallback_attempted",
+            "_is_bf16_dense_gemm_fallback_attempt",
+        ):
+            assert not hasattr(coord, name), f"{name} should have been removed by Change 3"
+
+
+class TestHandleGemmTuningResult:
+    @pytest.mark.asyncio
+    async def test_forge_requires_e2e_routes_to_validator(self, tmp_path):
+        coord = _coord(tmp_path, baseline_tput=100.0)
+        called: dict[str, object] = {}
+
+        async def _fake_validate(result):
+            called["result"] = result
+
+        coord.phase_kernel._validate_gemm_tuning_e2e = _fake_validate  # type: ignore[assignment]
+
+        await coord.phase_kernel._handle_gemm_tuning_result(
+            {
+                "status": "ok",
+                "decision": "KEEP",
+                "best_speedup": 1.3,
+                "backend": "forge",
+                "requires_e2e_validation": True,
+                "extra_envs": {"AITER_CONFIG": "/cfg/tuned.json"},
+            }
+        )
+
+        assert "result" in called
+        # Validator owns promotion; inline promote must not have run.
+        assert coord.shared_state.optimization_stack == []
+
+    @pytest.mark.asyncio
+    async def test_forge_e2e_rewrites_latest_attempt_history(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fake = _make_integrate([{"decision": "REVERT", "new_tput": 90.0, "gain_pct": -10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        await coord.phase_kernel._handle_gemm_tuning_result(
+            {
+                "status": "ok",
+                "decision": "KEEP",
+                "best_speedup": 1.5,
+                "backend": "forge",
+                "engine": "forge",
+                "requires_e2e_validation": True,
+                "recommended_env": {"AITER_DENSE": "/dense.json"},
+                "extra_envs": {"AITER_DENSE": "/dense.json"},
+                "candidates": [{"tuner": "dense_gemm", "env": {"AITER_DENSE": "/dense.json"}}],
+            }
+        )
+
+        attempts = coord.shared_state.gemm_tuning_attempts
+        assert len(attempts) == 1
+        assert attempts[0]["engine"] == "forge"
+        assert attempts[0]["e2e_validated"] is True
+        assert attempts[0]["decision"] == "REVERT"
+        assert attempts[0]["best_speedup"] == 1.5
+        assert coord.shared_state.last_gemm_tuning["decision"] == "REVERT"
+
+    @pytest.mark.asyncio
+    async def test_forge_e2e_keep_names_the_artifact_the_stack_recorded(self, tmp_path, monkeypatch):
+        """The history row and the stack entry must name the same artifact."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 130.0, "gain_pct": 30.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        await coord.phase_kernel._handle_gemm_tuning_result(
+            {
+                "status": "ok",
+                "decision": "KEEP",
+                "best_speedup": 1.5,
+                "backend": "forge",
+                "engine": "forge",
+                "requires_e2e_validation": True,
+                "recommended_env": {"AITER_DENSE": "/dense.json"},
+                "extra_envs": {"AITER_DENSE": "/dense.json"},
+                "candidates": [{"tuner": "dense_gemm", "env": {"AITER_DENSE": "/dense.json"}}],
+            }
+        )
+
+        stack = coord.shared_state.optimization_stack
+        assert stack, "a KEEP must land on the stack"
+        assert stack[-1]["action"] == "gemm_tuning"
+        attempts = coord.shared_state.gemm_tuning_attempts
+        assert attempts[0]["decision"] == "KEEP"
+        assert attempts[0]["tuned_file"], "history row must name the artifact"
+        assert attempts[0]["tuned_file"] == stack[-1]["tuned_file"]
+
+    @pytest.mark.asyncio
+    async def test_a_second_round_claims_its_own_artifact(self, tmp_path, monkeypatch):
+        """Re-tuning the same tuner must not inherit the earlier round's path."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        # Keep the candidate env value verbatim so each round's path is distinct and the assertion is about
+        # provenance, not about merging.
+        monkeypatch.setattr(
+            KernelPhase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _self, _env_var, env_value: env_value,
+        )
+
+        def _result(env_value: str) -> dict:
+            return {
+                "status": "ok",
+                "decision": "KEEP",
+                "best_speedup": 1.5,
+                "backend": "forge",
+                "engine": "forge",
+                "requires_e2e_validation": True,
+                "recommended_env": {"AITER_DENSE": env_value},
+                "extra_envs": {"AITER_DENSE": env_value},
+                "candidates": [{"tuner": "dense_gemm", "env": {"AITER_DENSE": env_value}}],
+            }
+
+        monkeypatch.setattr(
+            krh_mod,
+            "integrate_handler",
+            _make_integrate([{"decision": "KEEP", "new_tput": 130.0, "gain_pct": 30.0}]),
+        )
+        await coord.phase_kernel._handle_gemm_tuning_result(_result("/round1.json"))
+
+        first_file = coord.shared_state.gemm_tuning_attempts[-1]["tuned_file"]
+        assert first_file, "round one must name its artifact"
+        stack_len = len(coord.shared_state.optimization_stack)
+
+        monkeypatch.setattr(
+            krh_mod,
+            "integrate_handler",
+            _make_integrate([{"decision": "KEEP", "new_tput": 160.0, "gain_pct": 23.1}]),
+        )
+        await coord.phase_kernel._handle_gemm_tuning_result(_result("/round2.json"))
+
+        # Same (action, variant_name): the append is skipped by design.
+        assert len(coord.shared_state.optimization_stack) == stack_len
+        second_file = coord.shared_state.gemm_tuning_attempts[-1]["tuned_file"]
+        assert second_file and second_file != first_file
+
+    @pytest.mark.asyncio
+    async def test_forge_e2e_revert_does_not_claim_an_artifact(self, tmp_path, monkeypatch):
+        """A REVERT has nothing on the stack, so it must not name one."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fake = _make_integrate([{"decision": "REVERT", "new_tput": 90.0, "gain_pct": -10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        await coord.phase_kernel._handle_gemm_tuning_result(
+            {
+                "status": "ok",
+                "decision": "KEEP",
+                "backend": "forge",
+                "engine": "forge",
+                "requires_e2e_validation": True,
+                "recommended_env": {"AITER_DENSE": "/dense.json"},
+                "extra_envs": {"AITER_DENSE": "/dense.json"},
+                "candidates": [{"tuner": "dense_gemm", "env": {"AITER_DENSE": "/dense.json"}}],
+            }
+        )
+
+        assert coord.shared_state.optimization_stack == []
+        assert not coord.shared_state.gemm_tuning_attempts[0].get("tuned_file")
+
+    @pytest.mark.asyncio
+    async def test_promotes_on_the_measured_tput_not_the_micro_speedup(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        tuned = tmp_path / "gemm.csv"
+        tuned.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 150.0, "gain_pct": 50.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        monkeypatch.setattr(
+            KernelPhase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _self, _env_var, env_value: env_value,
+        )
+
+        await coord.phase_kernel._handle_gemm_tuning_result(
+            {
+                "status": "ok",
+                "decision": "KEEP",
+                "backend": "forge",
+                "candidates": [
+                    {
+                        "tuner": "a8w8_blockscale_tuned_gemm",
+                        "env": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE": str(tuned)},
+                        "best_micro_speedup": 1.4,
+                    }
+                ],
+            }
+        )
+
+        assert len(fake.calls) == 1
+        stack = coord.shared_state.optimization_stack
+        assert len(stack) == 1
+        assert stack[0]["variant_name"] == "forge_a8w8_blockscale_tuned_gemm"
+        # 150.0 measured, not baseline * best_speedup (140.0).
+        assert stack[0]["tput"] == pytest.approx(150.0)
+        assert coord.shared_state.current_best["tput"] == pytest.approx(150.0)
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(50.0)
+
+
+class TestKernelE2EMeasurementPromotion:
+    @pytest.fixture
+    def coord(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HYPERLOOM_PERF_METRIC", raising=False)
+        monkeypatch.delenv("HYPERLOOM_PERF_NOISE_PCT", raising=False)
+        monkeypatch.delenv("HYPERLOOM_GEMM_PAIRED_PAIRS", raising=False)
+        coord = _coord(
+            tmp_path,
+            framework="sglang",
+            benchmark_mode="agentx",
+            baseline_tput=100.0,
+            baseline_perf={
+                "total_throughput": 1000.0,
+                "e2e_norm_intvty_p90": 100.0,
+                "e2e_norm_intvty_p50": 100.0,
+                "duration_seconds": 900.0,
+                "request_error_rate": 0.0,
+            },
+            current_best={
+                "tput": 100.0,
+                "total_throughput": 1000.0,
+                "e2e_norm_intvty_p90": 100.0,
+                "e2e_norm_intvty_p50": 100.0,
+                "duration_seconds": 900.0,
+                "request_error_rate": 0.0,
+                "extra_envs": {"BASE_ENV": "1"},
+            },
+        )
+        coord.shared_state.save(tmp_path)
+        return coord
+
+    @staticmethod
+    def _bench(output=98.0, total=1200.0, *, name="first", intvty=120.0):
+        return {
+            "status": "succeeded",
+            "output_throughput": output,
+            "total_token_throughput": total,
+            "input_throughput": total - output,
+            "e2e_norm_intvty_p90": intvty,
+            "e2e_norm_intvty_p50": intvty,
+            "duration_seconds": 900.0,
+            "request_error_rate": 0.0,
+            "intvty_p90": 100.0,
+            "tpot_p90_ms": 10.0,
+            "ttft_mean_ms": 12.0,
+            "e2el_mean_ms": 23.0,
+            "tpot_mean_ms": 4.0,
+            "workspace": f"/e2e/{name}",
+            "raw_result_path": f"/e2e/{name}/raw.json",
+            "report_path": f"/e2e/{name}/report.json",
+            "materialized_config": f"/e2e/{name}/config.yaml",
+            "launch_evidence": {
+                "framework": "sglang",
+                "observed_server_identity": {"model_path": "/models/e2e", "tp_size": 2},
+                "observed_server_launch_flags": "--model-path /models/e2e --tp-size 2",
+            },
+            "launch_evidence_path": f"/e2e/{name}/launch_evidence.json",
+            "server_log_path": f"/e2e/{name}/server.log",
+            "extra_envs": {"MEASURED_ENV_NOT_CANDIDATE": "1"},
+            "extra_server_args": "--stale-measured-args",
+            "source_snapshot": "/stale/measured-snapshot",
+        }
+
+    @classmethod
+    def _result(cls):
+        return {
+            **cls._bench(9999.0, 99999.0, name="micro", intvty=9999.0),
+            "backend": "forge",
+            "requires_e2e_validation": True,
+            "recommended_env": {"GEMM_CONFIG": "/candidate.csv"},
+            "extra_envs": {"GEMM_CONFIG": "/candidate.csv"},
+            "candidates": [{"tuner": "dense", "env": {"GEMM_CONFIG": "/candidate.csv"}}],
+        }
+
+    @staticmethod
+    def _assert_measurement(coord, bench):
+        cb = coord.shared_state.current_best
+        assert cb["tput"] == bench["output_throughput"]
+        for key in ("ttft_mean_ms", "e2el_mean_ms", "tpot_mean_ms", "workspace", "e2e_norm_intvty_p90"):
+            assert cb[key] == bench[key]
+        measurement = coord.shared_state.current_best_measurement
+        assert measurement["benchmark_workspace"] == bench["workspace"]
+        for key in ("launch_evidence", "launch_evidence_path", "server_log_path"):
+            assert measurement[key] == bench[key]
+        assert measurement["identity_verification_status"] == "verified_observed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outer_output", [90.0, 9000.0])
+    async def test_gemm_nested_measurement_owns_the_verdict(self, coord, monkeypatch, outer_output):
+        bench = self._bench(output=98.0, total=1080.0)
+        fake = _make_integrate(
+            [{"decision": "KEEP", "new_tput": outer_output, "gain_pct": 20.0, "bench_result": bench}]
+        )
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        result = self._result()
+        phase = KernelPhase(coord)
+        lifted_variants = []
+        real_lift = coord.writeback.lift_to_current_best
+
+        def capture_lift(action, tput, variant, **kwargs):
+            lifted_variants.append(variant)
+            return real_lift(action, tput, variant, **kwargs)
+
+        monkeypatch.setattr(coord.writeback, "lift_to_current_best", capture_lift)
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == "KEEP"
+        assert result["e2e_gain_pct"] == pytest.approx(20.0)
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(20.0)
+        assert coord.shared_state.cumulative_gain_validated_stack_len == 1
+        assert coord.shared_state.current_best["total_throughput"] == 1080.0
+        assert coord.shared_state.current_best["input_throughput"] == 982.0
+        assert coord.shared_state.current_best["e2e_norm_intvty_p90"] == 120.0
+        assert coord.shared_state.current_best["extra_envs"] == {"BASE_ENV": "1", "GEMM_CONFIG": "/candidate.csv"}
+        assert coord.shared_state.current_best["extra_server_args"] == ""
+        assert result["tuned_file"] == "/candidate.csv"
+        assert result["e2e_results"]["kept"][0]["tput"] == 98.0
+        assert coord.shared_state.optimization_stack[0]["extra_envs"] == {"GEMM_CONFIG": "/candidate.csv"}
+        assert "source_snapshot" not in coord.shared_state.optimization_stack[0]
+        self._assert_measurement(coord, bench)
+        [variant] = lifted_variants
+        for key in ("raw_result_path", "report_path", "materialized_config", "tpot_p90_ms"):
+            assert variant[key] == bench[key]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("explicit_output", [False, True], ids=["intvty", "explicit_output"])
+    async def test_promotion_recorder_keeps_gain_objective_separate_from_output(
+        self, coord, monkeypatch, explicit_output
+    ):
+        from hyperloom.inference_optimizer.breakdown.recorder.assembler import event_parts
+        from hyperloom.inference_optimizer.breakdown.recorder.sections import KERNEL_EVENT_SECTIONS
+        from hyperloom.inference_optimizer.breakdown.recorder.kernel_event import (
+            ROUTE_FORGE,
+            SOURCE_GEMM_TUNING,
+            assemble_kernel_ext,
+        )
+        from hyperloom.inference_optimizer.session.session_binding import session_scope
+
+        if explicit_output:
+            monkeypatch.setenv("HYPERLOOM_PERF_METRIC", "output_throughput")
+        bench = self._bench(150.0, 1080.0)
+        gain = 50.0 if explicit_output else 20.0
+        integrate = {
+            "status": "ok",
+            "decision": "KEEP",
+            "new_tput": 150.0,
+            "gain_pct": gain,
+            "bench_result": bench,
+            "apply_result": {"status": "ok", "manifest_path": "/candidate/manifest.json"},
+        }
+        phase = KernelPhase(coord)
+        monkeypatch.setattr(krh_mod, "integrate_handler", _make_integrate([integrate]))
+        result = {
+            "status": "ok",
+            "backend": "forge",
+            "baseline_tput": 100.0,
+            "new_tput": 150.0,
+            "candidates": [{"tuner": "dense", "env": {"GEMM_CONFIG": "/candidate.csv"}}],
+        }
+        with session_scope(coord.session_dir):
+            phase._open_kernel_timeline(route=ROUTE_FORGE, route_reason="unit", from_phase="")
+            await phase._handle_gemm_tuning_result(result)
+            recorder = phase.timeline()
+            ext, _status = assemble_kernel_ext(event_parts(KERNEL_EVENT_SECTIONS), event=recorder.event_id)
+
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(gain)
+        # The gain is graded on the session's own axis, and the run says which
+        # one, so an interactivity gain is never read back as an output gain.
+        [run] = [row for row in ext["attempts"] if row["source_kind"] == SOURCE_GEMM_TUNING]
+        assert run["detail"]["graded_objective"] == ("output_throughput" if explicit_output else "e2e_norm_intvty_p50")
+
+    @pytest.mark.asyncio
+    async def test_gemm_local_keep_without_baseline_axes_does_not_publish_prior_gain(self, coord, monkeypatch):
+        state = coord.shared_state
+        state.baseline_perf = {}
+        state.cumulative_gain_validated = 37.0
+        state.cumulative_gain_validated_ts = "2026-01-01T00:00:00+00:00"
+        bench = self._bench()
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 90.0, "gain_pct": 20.0, "bench_result": bench}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        result = self._result()
+
+        await KernelPhase(coord)._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == "KEEP"
+        assert result["e2e_gain_pct"] is None
+        assert result["e2e_results"]["kept"][0]["gain_pct"] == 20.0
+        assert result["tuned_file"] == "/candidate.csv"
+        assert state.current_best["total_throughput"] == 1200.0
+        assert len(state.optimization_stack) == 1
+        assert state.cumulative_gain_validated == 37.0
+        assert state.cumulative_gain_validated_ts == "2026-01-01T00:00:00+00:00"
+        assert state.cumulative_gain_validated_stack_len == 0
+        self._assert_measurement(coord, bench)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("last_has_axes", [True, False])
+    async def test_gemm_sequential_keeps_persist_live_anchor_and_last_measurement(
+        self, coord, monkeypatch, last_has_axes
+    ):
+        from hyperloom.orchestrator.state.shared_state import resolve_graded_comparison
+
+        first = self._bench(110.0, 1080.0)
+        last = self._bench(115.0, 1120.0, name="last", intvty=132.0)
+        if not last_has_axes:
+            for key in ("input_throughput", "total_token_throughput", "e2e_norm_intvty_p90", "tpot_p90_ms"):
+                last.pop(key)
+        fake = _make_integrate(
+            [
+                {"decision": "KEEP", "new_tput": 110.0, "gain_pct": 20.0, "bench_result": first},
+                {"decision": "KEEP", "new_tput": 115.0, "gain_pct": 10.0, "bench_result": last},
+            ]
+        )
+        anchors = []
+
+        async def integrate(payload, *, session_dir):
+            persisted = SharedState.load_or_init(session_dir)
+            response = await fake(payload, session_dir=session_dir)
+            graded = resolve_graded_comparison(persisted, response["bench_result"])
+            anchors.append((persisted.current_best, persisted.current_best_measurement, graded.reference))
+            return response
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", integrate)
+        result = self._result()
+        result["candidates"].append({"tuner": "second", "env": {"SECOND_CONFIG": "/second.csv"}})
+        await KernelPhase(coord)._validate_gemm_tuning_e2e(result)
+
+        assert len(fake.calls) == 2
+        assert fake.calls[1]["base_tput"] == 110.0
+        assert fake.calls[1]["extra_envs"] == {"GEMM_CONFIG": "/candidate.csv", "SECOND_CONFIG": "/second.csv"}
+        anchor, identity, reference = anchors[1]
+        assert anchor["tput"] == 110.0
+        assert anchor["total_throughput"] == 1080.0
+        assert anchor["e2e_norm_intvty_p90"] == 120.0
+        assert anchor["extra_envs"] == {"BASE_ENV": "1", "GEMM_CONFIG": "/candidate.csv"}
+        assert identity["benchmark_workspace"] == first["workspace"]
+        assert len(coord.shared_state.optimization_stack) == (2 if last_has_axes else 1)
+        assert reference == (120.0 if last_has_axes else 110.0)
+        assert [row["tput"] for row in result["e2e_results"]["kept"]] == ([110.0, 115.0] if last_has_axes else [110.0])
+        assert result["tuned_file"] == ("/second.csv" if last_has_axes else "/candidate.csv")
+        gain = 32.0 if last_has_axes else 20.0
+        assert result["e2e_gain_pct"] == pytest.approx(gain)
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(gain)
+        assert coord.shared_state.cumulative_gain_validated_stack_len == (2 if last_has_axes else 1)
+        expected = last if last_has_axes else first
+        assert coord.shared_state.current_best["total_throughput"] == expected["total_token_throughput"]
+        assert coord.shared_state.current_best["e2e_norm_intvty_p90"] == expected["e2e_norm_intvty_p90"]
+        if last_has_axes:
+            assert result["e2e_results"]["reverted"] == []
+        else:
+            assert [row["tuner"] for row in result["e2e_results"]["reverted"]] == ["second"]
+            assert result["recommended_env"] == result["extra_envs"] == {"GEMM_CONFIG": "/candidate.csv"}
+            assert "SECOND_CONFIG" not in coord.shared_state.current_best["extra_envs"]
+        self._assert_measurement(coord, expected)
+
+    @pytest.fixture
+    def paired_handler(self, monkeypatch):
+        from hyperloom.orchestrator.actions.executors import _multi_node_env, benchmark_backend
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("Paired measurements must not resolve, apply, or grade a patch")
+
+        monkeypatch.setenv("FRAMEWORK", "sglang")
+        monkeypatch.setattr(request_handlers, "_resolve_integrate_payload", unexpected)
+        monkeypatch.setattr(integrate_payload, "repo_relative_manifest", unexpected)
+        monkeypatch.setattr(
+            integrate_rebaseline, "patch_jit_cache", SimpleNamespace(verify_cpp_itfs_rebuilt=unexpected)
+        )
+        monkeypatch.setattr(integrate_accuracy, "grade_integrate_accuracy", unexpected)
+        monkeypatch.setattr(integrate_outcomes, "_maybe_finalize_kernel_patch", unexpected)
+        monkeypatch.setattr(integrate_rebaseline, "_sweep_integrate_aiter_locks", lambda **kwargs: {})
+        monkeypatch.setattr(benchmark_backend, "resolve_benchmark_interpreter", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(_multi_node_env, "is_multi_node", lambda: False)
+        return krh_mod.integrate_handler
+
+    @pytest.fixture
+    def paired_empty_recipe(self, coord):
+        state = coord.shared_state
+        state.current_best.update(extra_server_args="--page-size 32", extra_envs={"TUNED_ENV": "1"})
+        state.baseline_config_path = "/live/base.yaml"
+        state.save(coord.session_dir)
+        return {
+            "source": "forge_gemm_paired",
+            "mode": "env_only",
+            "kernel_id": "gemm_paired_A0",
+            "paired_reference": {"tput": 110.0, "extra_envs": {}},
+            "config_path": "/entry/base.yaml",
+            "extra_server_args": "",
+            "extra_envs": {},
+            "keep_threshold_pct": 0.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_gemm_paired_pairs_rejects_an_invalid_value(self, coord, monkeypatch):
+        monkeypatch.setenv("HYPERLOOM_GEMM_PAIRED_PAIRS", "invalid")
+
+        with pytest.raises(EnvValueError, match="HYPERLOOM_GEMM_PAIRED_PAIRS"):
+            await KernelPhase(coord)._confirm_gemm_gain_paired({}, {}, config_path="")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("second_keep", [False, True], ids=["keep-revert", "keep-keep"])
+    async def test_gemm_paired_defaults_keep_entry_reference(self, coord, monkeypatch, paired_handler, second_keep):
+        from hyperloom.orchestrator.actions.executors.baseline import BaselineExecutor
+
+        monkeypatch.setenv("HYPERLOOM_GEMM_PAIRED_PAIRS", "2")
+        state = coord.shared_state
+        entry_envs = {"BASE_ENV": "1", "PYTHONPATH": "/prior/source"}
+        state.current_best.update(
+            tput=110.0,
+            total_throughput=1100.0,
+            e2e_norm_intvty_p90=110.0,
+            e2e_norm_intvty_p50=110.0,
+            duration_seconds=900.0,
+            request_error_rate=0.0,
+            extra_server_args="--page-size 16",
+            extra_envs=dict(entry_envs),
+            final_overlay="/prior/overlay",
+        )
+        state.baseline_config_path = "/entry/base.yaml"
+        coord.writeback._stamp_current_best_measurement(self._bench(110.0, 1100.0, name="entry", intvty=110.0))
+        entry_reference = deepcopy(state.current_best)
+        state.save(coord.session_dir)
+        candidate = coord.session_dir / "candidate-fmoe.csv"
+        candidate.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        first = self._bench(120.0, 1150.0, intvty=132.0)
+        last = (
+            self._bench(130.0, 1200.0, name="last", intvty=145.2)
+            if second_keep
+            else self._bench(110.0, 1050.0, intvty=110.0)
+        )
+        candidate_integrate = _make_integrate(
+            [
+                {"decision": "KEEP", "new_tput": 120.0, "gain_pct": 20.0, "bench_result": first},
+                {
+                    "decision": "KEEP" if second_keep else "REVERT",
+                    "new_tput": last["output_throughput"],
+                    "gain_pct": 10.0 if second_keep else -16.6667,
+                    "bench_result": last,
+                },
+            ]
+        )
+        calls = []
+        paired_payloads = []
+        paired_params = []
+        disk_during_pairs = []
+        live_during_pairs = []
+        paired_state_changes = []
+
+        async def integrate(payload, *, session_dir):
+            calls.append(payload["kernel_id"])
+            if payload["source"] != "forge_gemm_paired":
+                resolved = integrate_payload._fill_integrate_defaults_from_state(payload, session_dir=session_dir)
+                response = await candidate_integrate(resolved, session_dir=session_dir)
+                state.baseline_config_path = "/live/base.yaml"
+                return response
+            paired_payloads.append(deepcopy(payload))
+            before = SharedState.state_path(session_dir).read_bytes()
+            live_before = deepcopy((state.current_best, state.optimization_stack, state.baseline_config_path))
+            live_during_pairs.append(live_before[0])
+            response = await paired_handler(payload, session_dir=session_dir)
+            paired_state_changes.append(
+                (
+                    SharedState.state_path(session_dir).read_bytes() != before,
+                    (state.current_best, state.optimization_stack, state.baseline_config_path) != live_before,
+                )
+            )
+            return response
+
+        async def measure(executor, ctx):
+            params = deepcopy(ctx.task.params)
+            paired_params.append(params)
+            disk_during_pairs.append(deepcopy(executor.shared_state.current_best))
+            tuned = "AITER_CONFIG_FMOE" in params["extra_envs"]
+            output = (130.0 if second_keep else 120.0) if tuned else 110.0
+            intvty = (145.2 if second_keep else 132.0) if tuned else 110.0
+            return {**self._bench(output, output * 10, name="paired", intvty=intvty), "completed_requests": 2}
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", integrate)
+        monkeypatch.setattr(BaselineExecutor, "__call__", measure)
+        phase = KernelPhase(coord)
+        monkeypatch.setattr(phase, "_merge_gemm_candidate_with_runtime", lambda _var, value: value)
+        result = self._result()
+        result["candidates"] = [
+            {"tuner": "fmoe_ck", "env": {"AITER_CONFIG_FMOE": str(candidate)}},
+            {"tuner": "second", "env": {"SECOND_CONFIG": "/second.csv"}},
+        ]
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert calls == [
+            "gemm_tune_fmoe_ck",
+            "gemm_tune_second",
+            "gemm_paired_A0",
+            "gemm_paired_B1",
+            "gemm_paired_A2",
+            "gemm_paired_B3",
+        ]
+        assert len(paired_params) == 4
+        assert paired_state_changes == [(False, False)] * 4
+        expected_tuned_envs = {**entry_envs, "AITER_CONFIG_FMOE": str(candidate)}
+        if second_keep:
+            expected_tuned_envs["SECOND_CONFIG"] = "/second.csv"
+        for index, params in enumerate(paired_params):
+            recipe_envs = entry_envs if index % 2 == 0 else expected_tuned_envs
+            assert params["extra_envs"] == {**recipe_envs, "PYTHONPATH": "/prior/overlay:/prior/source"}
+            assert params["extra_server_args"] == (
+                "--page-size 16" if index % 2 == 0 else "--page-size 16 --moe-runner-backend aiter"
+            )
+            assert params["config_path"] == "/entry/base.yaml"
+            assert paired_payloads[index]["base_tput"] == 110.0
+            reference = paired_payloads[index]["paired_reference"]
+            assert reference == entry_reference
+            assert reference["tput"] == 110.0
+            assert reference["total_throughput"] == 1100.0
+            assert reference["e2e_norm_intvty_p90"] == 110.0
+            assert reference["measurement"]["benchmark_workspace"] == "/e2e/entry"
+            assert live_during_pairs[index] == state.current_best
+            # Disk still holds the first KEEP; B must explicitly carry the last KEEP.
+            assert disk_during_pairs[index]["tput"] == 120.0
+            assert disk_during_pairs[index]["extra_envs"] == {**entry_envs, "AITER_CONFIG_FMOE": str(candidate)}
+        accepted = last if second_keep else first
+        expected_gain = 45.2 if second_keep else 32.0
+        assert result["decision"] == "KEEP"
+        assert result["e2e_gain_pct"] == pytest.approx(expected_gain)
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(expected_gain)
+        assert coord.shared_state.cumulative_gain_validated_stack_len == (2 if second_keep else 1)
+        assert len(state.optimization_stack) == (2 if second_keep else 1)
+        assert len(result["e2e_results"]["reverted"]) == (0 if second_keep else 1)
+        assert state.current_best["extra_envs"] == expected_tuned_envs
+        assert state.current_best["extra_server_args"] == "--page-size 16 --moe-runner-backend aiter"
+        assert state.current_best["final_overlay"] == "/prior/overlay"
+        assert state.current_best["total_throughput"] == accepted["total_token_throughput"]
+        assert state.baseline_config_path == "/live/base.yaml"
+        self._assert_measurement(coord, accepted)
+
+    @pytest.mark.asyncio
+    async def test_gemm_paired_native_handler_measures_explicit_empty_recipe(
+        self, coord, monkeypatch, paired_handler, paired_empty_recipe
+    ):
+        from hyperloom.orchestrator.actions.executors.baseline import BaselineExecutor
+
+        before = SharedState.state_path(coord.session_dir).read_bytes()
+        measured = []
+        bench = {**self._bench(300.0, 3000.0), "completed_requests": 2}
+
+        async def measure(executor, ctx):
+            measured.append((deepcopy(ctx.task.params), deepcopy(executor.shared_state.current_best)))
+            return bench
+
+        monkeypatch.setattr(BaselineExecutor, "__call__", measure)
+        result = await paired_handler(paired_empty_recipe, session_dir=coord.session_dir)
+
+        [(params, anchor)] = measured
+        assert params["config_path"] == "/entry/base.yaml"
+        assert params["extra_server_args"] == ""
+        assert params["extra_envs"] == {}
+        assert "disable_run_eval" not in params
+        assert params["defer_accuracy_until_after_measure"] is True
+        assert params["quality_ref_exempt"] is True
+        assert anchor == coord.shared_state.current_best
+        assert result["status"] == "ok"
+        assert result["decision"] == "NEEDS_REVIEW"
+        assert result["base_tput"] == 110.0
+        assert result["new_tput"] == 300.0
+        assert result["bench_result"] == bench
+        assert SharedState.state_path(coord.session_dir).read_bytes() == before
+        for missing in ("paired_reference", "config_path", "extra_server_args", "extra_envs"):
+            incomplete = {key: value for key, value in paired_empty_recipe.items() if key != missing}
+            with pytest.raises(ValueError, match="explicit entry reference"):
+                await paired_handler(incomplete, session_dir=coord.session_dir)
+        with pytest.raises(AssertionError, match="must not resolve"):
+            await paired_handler(
+                {
+                    **paired_empty_recipe,
+                    "source": "arbitrary_source",
+                    "mode": "patch",
+                    "patch_path": "/unrelated.patch",
+                },
+                session_dir=coord.session_dir,
+            )
+        assert len(measured) == 1
+        assert SharedState.state_path(coord.session_dir).read_bytes() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            pytest.param(
+                {"status": "failed", "error_class": "subprocess_nonzero", "returncode": 1, "completed_requests": 0},
+                id="nonzeroexit",
+            ),
+            pytest.param({"status": "failed", "output_throughput": 0.0}, id="failed"),
+        ],
+    )
+    async def test_gemm_paired_native_handler_rejects_invalid_measurement(
+        self, coord, monkeypatch, paired_handler, paired_empty_recipe, invalid
+    ):
+        from hyperloom.orchestrator.actions.executors.baseline import BaselineExecutor
+
+        before = SharedState.state_path(coord.session_dir).read_bytes()
+        bench = {**self._bench(300.0, 3000.0), "completed_requests": 2, **invalid}
+        measured = []
+
+        async def measure(executor, ctx):
+            measured.append(ctx.task.params)
+            return bench
+
+        monkeypatch.setattr(BaselineExecutor, "__call__", measure)
+        result = await paired_handler(paired_empty_recipe, session_dir=coord.session_dir)
+
+        assert len(measured) == 1
+        assert result["status"] == "failed"
+        assert result["decision"] == "REVERT"
+        assert result["rebaseline_detail"] == bench
+        assert not result.get("new_tput")
+        assert SharedState.state_path(coord.session_dir).read_bytes() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "artifact",
+        [
+            pytest.param({"patch_path": "/unexpected.patch"}, id="patch_path"),
+            pytest.param({"target_file": "/unexpected.py"}, id="target_file"),
+            pytest.param({"source_file": "/unexpected.py"}, id="source_file"),
+            pytest.param({"snapshot_dir": "/unexpected-snapshot"}, id="snapshot_dir"),
+        ],
+    )
+    async def test_gemm_paired_native_handler_rejects_artifacts(
+        self, coord, monkeypatch, paired_handler, paired_empty_recipe, artifact
+    ):
+        from hyperloom.orchestrator.actions.executors.baseline import BaselineExecutor
+
+        before = SharedState.state_path(coord.session_dir).read_bytes()
+        measured = []
+
+        async def measure(executor, ctx):
+            measured.append(ctx.task.params)
+            return {**self._bench(300.0, 3000.0), "completed_requests": 2}
+
+        monkeypatch.setattr(BaselineExecutor, "__call__", measure)
+        with pytest.raises(ValueError, match="cannot apply"):
+            await paired_handler({**paired_empty_recipe, **artifact}, session_dir=coord.session_dir)
+
+        assert measured == []
+        assert SharedState.state_path(coord.session_dir).read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_gemm_refused_lift_does_not_claim_keep(self, coord, monkeypatch):
+        bench = self._bench(130.0, 1200.0, intvty=50.0)
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 130.0, "gain_pct": 20.0, "bench_result": bench}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        phase = KernelPhase(coord)
+        real_lift = coord.writeback.lift_to_current_best
+        lifts = []
+
+        def capture_lift(*args, **kwargs):
+            lifted = real_lift(*args, **kwargs)
+            lifts.append(lifted)
+            return lifted
+
+        monkeypatch.setattr(coord.writeback, "lift_to_current_best", capture_lift)
+        result = self._result()
+        result["e2e_norm_intvty_p90"] = 50.0
+        anchor = dict(coord.shared_state.current_best)
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert lifts == [False]
+        assert result["decision"] == "REVERT"
+        assert result["e2e_results"]["kept"] == []
+        assert len(result["e2e_results"]["reverted"]) == 1
+        assert result["recommended_env"] == result["extra_envs"] == {}
+        assert "tuned_file" not in result
+        assert coord.shared_state.current_best == anchor
+        assert coord.shared_state.current_best_measurement == {}
+        assert coord.shared_state.optimization_stack == []
+        assert coord.shared_state.cumulative_gain_validated == 0.0
+        assert _journal_entries(coord.session_dir) == []
+
+    @pytest.mark.asyncio
+    async def test_gemm_runtime_artifact_not_applied_blocks_nested_keep(self, coord, monkeypatch):
+        candidate = coord.session_dir / "candidate.csv"
+        candidate.write_text("M,N,K\n32,64,128\n", encoding="utf-8")
+        server_log = coord.session_dir / "runs" / "integrate" / "integrate-gemm_tune_dense" / "server.log"
+        server_log.parent.mkdir(parents=True)
+        server_log.write_text(
+            "[aiter] shape is M:32, N:64, K:128, not found tuned config in "
+            "/runtime/a8w8_tuned_gemm.csv, will use default config!\n",
+            encoding="utf-8",
+        )
+        fake = _make_integrate(
+            [{"decision": "KEEP", "new_tput": 90.0, "gain_pct": 20.0, "bench_result": self._bench()}]
+        )
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        phase = KernelPhase(coord)
+        monkeypatch.setattr(phase, "_merge_gemm_candidate_with_runtime", lambda _var, value: value)
+        result = self._result()
+        result["candidates"] = [{"tuner": "dense", "env": {"AITER_CONFIG_GEMM_BF16": str(candidate)}}]
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == "REVERT"
+        [reverted] = result["e2e_results"]["reverted"]
+        assert reverted["tuned_config_coverage"]["artifact_applied"] is False
+        assert "artifact_table_not_consulted" in reverted["reason"]
+        assert reverted["apply_verdict"]["blocks_keep"] is True
+        assert coord.shared_state.optimization_stack == []
+        assert coord.shared_state.cumulative_gain_validated == 0.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("explicit_output", [False, True], ids=["required_intvty", "explicit_output"])
+    async def test_gemm_legacy_measurement_does_not_borrow_micro_axes(self, coord, monkeypatch, explicit_output):
+        if explicit_output:
+            monkeypatch.setenv("HYPERLOOM_PERF_METRIC", "output_throughput")
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 110.0, "gain_pct": 10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        result = self._result()
+        anchor = deepcopy(coord.shared_state.current_best)
+        await KernelPhase(coord)._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == ("KEEP" if explicit_output else "REVERT")
+        if explicit_output:
+            assert result["e2e_gain_pct"] == pytest.approx(10.0)
+            assert coord.shared_state.cumulative_gain_validated == pytest.approx(10.0)
+            assert coord.shared_state.current_best["tput"] == 110.0
+            assert "total_throughput" not in coord.shared_state.current_best
+            assert "e2e_norm_intvty_p90" not in coord.shared_state.current_best
+            assert coord.shared_state.current_best_measurement["benchmark_workspace"] == ""
+        else:
+            assert result["e2e_results"]["kept"] == []
+            assert [row["tuner"] for row in result["e2e_results"]["reverted"]] == ["dense"]
+            assert result["recommended_env"] == result["extra_envs"] == {}
+            assert "tuned_file" not in result
+            assert coord.shared_state.current_best == anchor
+            assert coord.shared_state.current_best_measurement == {}
+            assert coord.shared_state.optimization_stack == []
+            assert coord.shared_state.cumulative_gain_validated == 0.0
+            assert coord.shared_state.cumulative_gain_validated_ts == ""
+            assert coord.shared_state.cumulative_gain_validated_stack_len == 0
+            assert _journal_entries(coord.session_dir) == []
+
+
+class TestValidateForgeGemmTuningE2E:
+    @pytest.mark.asyncio
+    async def test_no_candidates_returns_early(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 200.0, "gain_pct": 100.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        result = {
+            "recommended_env": {"X": "1"},
+            "extra_envs": {"X": "1"},
+            "requires_e2e_validation": True,
+            "candidates": [{"tuner": "unknown", "env": {"": ""}}],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert fake.calls == []
+        assert coord.shared_state.optimization_stack == []
+        # No sweep ran, but the books still get closed.
+        assert result["requires_e2e_validation"] is False
+        assert result["e2e_validated"] is False
+        assert result["decision"] == "REVERT"
+        assert result["micro_decision"] == "no_e2e_candidates"
+
+    @pytest.mark.asyncio
+    async def test_closing_the_books_does_not_overwrite_a_tuner_verdict(self, tmp_path, monkeypatch):
+        """``micro_decision`` is a routing key, not a label."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fake = _make_integrate([])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        result = {
+            "requires_e2e_validation": True,
+            "micro_decision": "no_improvement",
+            "candidates": [],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert result["micro_decision"] == "no_improvement"
+        assert result["requires_e2e_validation"] is False
+
+    @pytest.mark.asyncio
+    async def test_vllm_candidate_without_micro_count_validates_full_env_bundle(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="vllm")
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 112.0, "gain_pct": 12.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        result = {
+            "workspace": str(tmp_path),
+            "recommended_env": {
+                "PYTHONPATH": "/candidate/site",
+                "HL_TUNABLEOP_MODE": "candidate",
+                "HL_TUNABLEOP_FILE": "/tunableop.csv",
+                "PYTORCH_TUNABLEOP_FILENAME": "/tunableop.csv",
+            },
+            "extra_envs": {},
+            "requires_e2e_validation": True,
+            "candidates": [
+                {
+                    "tuner": "vllm_dense_tunableop",
+                    "env": {
+                        "PYTHONPATH": "/candidate/site",
+                        "HL_TUNABLEOP_MODE": "candidate",
+                        "HL_TUNABLEOP_FILE": "/tunableop.csv",
+                        "PYTORCH_TUNABLEOP_FILENAME": "/tunableop.csv",
+                    },
+                }
+            ],
+        }
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert len(fake.calls) == 1
+        assert fake.calls[0]["extra_envs"] == {
+            "PYTHONPATH": "/candidate/site",
+            "HL_TUNABLEOP_MODE": "candidate",
+            "HL_TUNABLEOP_FILE": "/tunableop.csv",
+            "PYTORCH_TUNABLEOP_FILENAME": "/tunableop.csv",
+        }
+        assert result["decision"] == "KEEP"
+        assert result["e2e_gain_pct"] == pytest.approx(12.0)
+
+    @pytest.mark.asyncio
+    async def test_merges_every_aiter_config_in_candidate_env_bundle(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        phase = KernelPhase(coord)
+        dense = tmp_path / "dense.csv"
+        moe = tmp_path / "moe.csv"
+        dense.write_text("M,N,K\n1,2,3\n", encoding="utf-8")
+        moe.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        merged_dense = tmp_path / "merged-dense.csv"
+        merged_moe = tmp_path / "merged-moe.csv"
+        merge_calls: list[tuple[str, str]] = []
+
+        def _merge(env_var, env_value):
+            merge_calls.append((env_var, env_value))
+            return str(merged_dense if env_var == "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE" else merged_moe)
+
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 112.0, "gain_pct": 12.0}])
+        monkeypatch.setattr(phase, "_merge_gemm_candidate_with_runtime", _merge)
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        result = {
+            "workspace": str(tmp_path),
+            "candidates": [
+                {
+                    "tuner": "combined_aiter",
+                    "env": {
+                        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE": str(dense),
+                        "AITER_CONFIG_FMOE": str(moe),
+                    },
+                }
+            ],
+        }
+
+        await phase._validate_gemm_tuning_e2e(result)
+
+        assert set(merge_calls) == {
+            ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", str(dense)),
+            ("AITER_CONFIG_FMOE", str(moe)),
+        }
+        assert fake.calls[0]["extra_envs"] == {
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE": str(merged_dense),
+            "AITER_CONFIG_FMOE": str(merged_moe),
+        }
+
+    @pytest.mark.asyncio
+    async def test_keep_stacks_envs_and_rewrites_result(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fmoe_candidate = tmp_path / "fmoe.json"
+        fmoe_candidate.write_text("token,model_dim\n1,2\n", encoding="utf-8")
+        fake = _make_integrate(
+            [
+                {"decision": "KEEP", "new_tput": 120.0, "gain_pct": 20.0},
+                {"decision": "KEEP", "new_tput": 132.0, "gain_pct": 10.0},
+            ]
+        )
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        monkeypatch.setattr(
+            KernelPhase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _self, _env_var, env_value: env_value,
+        )
+
+        result = {
+            "workspace": str(tmp_path),
+            "backend": "forge",
+            "recommended_env": {
+                "AITER_CONFIG_FMOE": str(fmoe_candidate),
+                "AITER_DENSE": "/dense.json",
+            },
+            "extra_envs": {
+                "AITER_CONFIG_FMOE": str(fmoe_candidate),
+                "AITER_DENSE": "/dense.json",
+            },
+            "requires_e2e_validation": True,
+            "candidates": [
+                {"tuner": "fmoe_ck", "env": {"AITER_CONFIG_FMOE": str(fmoe_candidate)}, "best_micro_speedup": 1.2},
+                {"tuner": "dense_gemm", "env": {"AITER_DENSE": "/dense.json"}, "best_micro_speedup": 1.1},
+            ],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        # fmoe_ck on sglang carries the aiter MoE runner arg; dense does not.
+        assert fake.calls[0]["extra_server_args"] == "--moe-runner-backend aiter"
+        assert fake.calls[1]["extra_server_args"] == ""
+        assert fake.calls[0]["extra_envs"] == {"AITER_CONFIG_FMOE": str(fmoe_candidate)}
+        assert fake.calls[1]["extra_envs"] == {
+            "AITER_CONFIG_FMOE": str(fmoe_candidate),
+            "AITER_DENSE": "/dense.json",
+        }
+        # base_tput advances after the first KEEP.
+        assert fake.calls[1]["base_tput"] == pytest.approx(120.0)
+
+        assert len(coord.shared_state.optimization_stack) == 2
+        # Each kept tuner lands as a gemm_tuning KEEP journal event.
+        gj = [e for e in _journal_entries(tmp_path) if e.get("kind") == "gemm_tuning"]
+        assert [e["throughput_after"] for e in gj] == pytest.approx([120.0, 132.0])
+        assert {e["task_id"] for e in gj} == {
+            "gemm_tune_e2e_fmoe_ck",
+            "gemm_tune_e2e_dense_gemm",
+        }
+        cb = coord.shared_state.current_best
+        assert cb["variant_name"] == "forge_dense_gemm"
+        assert cb["tput"] == pytest.approx(132.0)
+        assert cb["extra_server_args"] == "--moe-runner-backend aiter"
+        # Both tuners' envs accumulate onto current_best, one lift each.
+        assert cb["extra_envs"] == {
+            "AITER_CONFIG_FMOE": str(fmoe_candidate),
+            "AITER_DENSE": "/dense.json",
+        }
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(32.0)
+
+        # Result rewritten to the E2E-validated outcome.
+        assert result["e2e_validated"] is True
+        assert result["requires_e2e_validation"] is False
+        assert result["decision"] == "KEEP"
+        assert result["status"] == "complete"
+        assert result["e2e_gain_pct"] == pytest.approx(32.0)
+        assert result["recommended_env"] == {
+            "AITER_CONFIG_FMOE": str(fmoe_candidate),
+            "AITER_DENSE": "/dense.json",
+        }
+        # Raw (pre-validation) envs are preserved.
+        assert result["recommended_env_raw"] == {
+            "AITER_CONFIG_FMOE": str(fmoe_candidate),
+            "AITER_DENSE": "/dense.json",
+        }
+
+    @pytest.mark.asyncio
+    async def test_keep_only_when_tput_improves(self, tmp_path, monkeypatch):
+        # decision==KEEP but new_tput not above running_tput → treated as REVERT.
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 100.0, "gain_pct": 0.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        result = {
+            "recommended_env": {"X": "1"},
+            "extra_envs": {"X": "1"},
+            "requires_e2e_validation": True,
+            "candidates": [{"tuner": "dense", "env": {"X": "1"}, "best_micro_speedup": 1.05}],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert coord.shared_state.optimization_stack == []
+        assert result["decision"] == "REVERT"
+        assert result["micro_decision"] == "candidate_no_e2e_gain"
+
+    @pytest.mark.asyncio
+    async def test_all_revert_resets_and_marks_no_gain(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="vllm")
+        fake = _make_integrate([{"decision": "REVERT", "new_tput": 90.0, "gain_pct": -10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        result = {
+            "recommended_env": {"X": "1"},
+            "extra_envs": {"X": "1"},
+            "requires_e2e_validation": True,
+            "candidates": [{"tuner": "dense", "env": {"X": "1"}, "best_micro_speedup": 1.05}],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert coord.shared_state.optimization_stack == []
+        assert result["decision"] == "REVERT"
+        assert result["micro_decision"] == "candidate_no_e2e_gain"
+        assert result["e2e_gain_pct"] == 0.0
+        assert result["recommended_env"] == {}
+        assert result["requires_e2e_validation"] is False
+
+    @pytest.mark.asyncio
+    async def test_integrate_exception_records_fault_not_revert(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+
+        async def _boom(payload, *, session_dir):
+            raise RuntimeError("integrate crashed")
+
+        monkeypatch.setattr(krh_mod, "integrate_handler", _boom)
+
+        result = {
+            "recommended_env": {"X": "1"},
+            "extra_envs": {"X": "1"},
+            "requires_e2e_validation": True,
+            "candidates": [{"tuner": "dense", "env": {"X": "1"}, "best_micro_speedup": 1.1}],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert result["status"] == "failed"
+        assert result["micro_decision"] == "integrate_fault"
+        assert result["e2e_gain_pct"] is None
+        faults = result["e2e_results"]["faults"]
+        assert len(faults) == 1
+        assert faults[0]["reason"] == "integrate_fault:handler_exception"
+        assert result["e2e_results"]["reverted"] == []
+
+    @pytest.mark.asyncio
+    async def test_prepares_serving_so_before_e2e_and_drops_it_on_revert(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        candidate = tmp_path / "candidate.csv"
+        candidate.write_text("kernelName\nnew_k\n", encoding="utf-8")
+        prepared: list[dict] = []
+        dropped: list[dict] = []
+
+        def _prepare(envs, backup_dir=None):
+            prepared.append(dict(envs))
+            return {"action": "skip"}
+
+        def _drop(envs=None, backup_dir=None):
+            dropped.append(dict(envs or {}))
+            return {"action": "invalidate"}
+
+        monkeypatch.setattr(
+            "hyperloom.orchestrator.actions.executors._aiter_jit.prepare_serving_so_for_csvs",
+            _prepare,
+        )
+        monkeypatch.setattr(
+            "hyperloom.orchestrator.actions.executors._aiter_jit.drop_serving_so_for_envs",
+            _drop,
+        )
+        monkeypatch.setattr(
+            KernelPhase,
+            "_merge_gemm_candidate_with_runtime",
+            lambda _self, _env_var, env_value: env_value,
+        )
+        fake = _make_integrate([{"decision": "REVERT", "new_tput": 90.0, "gain_pct": -10.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+
+        result = {
+            "workspace": str(tmp_path),
+            "requires_e2e_validation": True,
+            "candidates": [
+                {
+                    "tuner": "a8w8_blockscale_bpreshuffle",
+                    "env": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": str(candidate)},
+                    "best_micro_speedup": 1.2,
+                }
+            ],
+        }
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert prepared
+        assert prepared[0]["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"] == str(candidate)
+        assert dropped
+
+
+class TestForgeGemmE2EApplyGate:
+    """A measured gain is only creditable if the artifact was actually used."""
+
+    @staticmethod
+    def _result():
+        return {
+            "recommended_env": {"X": "1"},
+            "extra_envs": {"X": "1"},
+            "requires_e2e_validation": True,
+            "candidates": [{"tuner": "dense", "env": {"X": "1"}, "best_micro_speedup": 1.1}],
+        }
+
+    @staticmethod
+    def _wire(monkeypatch, *, coverage, verdict):
+        fake = _make_integrate([{"decision": "KEEP", "new_tput": 130.0, "gain_pct": 30.0}])
+        monkeypatch.setattr(krh_mod, "integrate_handler", fake)
+        monkeypatch.setattr(KernelPhase, "_gemm_tuned_config_coverage", lambda self, *a, **k: coverage)
+        monkeypatch.setattr(KernelPhase, "_gemm_apply_verdict", lambda self, *a, **k: verdict)
+        return fake
+
+    @pytest.mark.asyncio
+    async def test_unmerged_artifact_blocks_a_measured_keep(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        self._wire(
+            monkeypatch,
+            coverage=None,
+            verdict={
+                "verdict": "not_merged",
+                "blocks_keep": True,
+                "conclusive": True,
+                "detail": "1 tuned table(s) absent from the server's merge list",
+            },
+        )
+        result = self._result()
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        # +30% was measured, and is still refused: the server was running its bundled default table, so the delta is
+        # drift, not tuning.
+        assert coord.shared_state.optimization_stack == []
+        assert coord.shared_state.cumulative_gain_validated == 0.0
+        assert result["decision"] == "REVERT"
+        reverted = result["e2e_results"]["reverted"]
+        assert len(reverted) == 1
+        assert "tuned_config_never_applied[not_merged]" in reverted[0]["reason"]
+        assert reverted[0]["apply_verdict"]["verdict"] == "not_merged"
+
+    @pytest.mark.asyncio
+    async def test_unreachable_shape_keys_block_a_measured_keep(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        self._wire(
+            monkeypatch,
+            coverage={
+                "artifact_applied": False,
+                "not_applied_reason": "no_shape_key_matched",
+                "requested": 42,
+                "covered": 0,
+            },
+            verdict=None,
+        )
+        result = self._result()
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert coord.shared_state.optimization_stack == []
+        assert result["decision"] == "REVERT"
+        reason = result["e2e_results"]["reverted"][0]["reason"]
+        assert "tuned_config_never_applied[no_shape_key_matched]" in reason
+
+    @pytest.mark.asyncio
+    async def test_both_blockers_are_named(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        self._wire(
+            monkeypatch,
+            coverage={
+                "artifact_applied": False,
+                "not_applied_reason": "artifact_table_not_consulted",
+                "requested": 7,
+                "covered": 0,
+            },
+            verdict={"verdict": "not_merged", "blocks_keep": True, "conclusive": True},
+        )
+        result = self._result()
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        reason = result["e2e_results"]["reverted"][0]["reason"]
+        assert "artifact_table_not_consulted+not_merged" in reason
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_verdict_does_not_block(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        self._wire(
+            monkeypatch,
+            coverage={"artifact_applied": True, "coverage_pct": 88.0, "covered": 7, "requested": 8},
+            verdict={
+                "verdict": "inconclusive_no_hit_logging",
+                "blocks_keep": False,
+                "conclusive": False,
+                "detail": "misses logged but hit logging was off",
+            },
+        )
+        result = self._result()
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == "KEEP"
+        assert len(coord.shared_state.optimization_stack) == 1
+        assert coord.shared_state.current_best["tput"] == 130.0
+
+    @pytest.mark.asyncio
+    async def test_served_verdict_keeps(self, tmp_path, monkeypatch):
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        self._wire(
+            monkeypatch,
+            coverage={"artifact_applied": True, "coverage_pct": 100.0, "covered": 8, "requested": 8},
+            verdict={
+                "verdict": "served",
+                "blocks_keep": False,
+                "conclusive": True,
+                "hits": 512,
+            },
+        )
+        result = self._result()
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == "KEEP"
+        kept = result["e2e_results"]["kept"]
+        assert kept[0]["apply_verdict"]["hits"] == 512
+        assert coord.shared_state.cumulative_gain_validated == pytest.approx(30.0)
+
+    @pytest.mark.asyncio
+    async def test_missing_evidence_leaves_the_decision_alone(self, tmp_path, monkeypatch):
+        """No server log at all must not turn into an accusation."""
+        coord = _coord(tmp_path, baseline_tput=100.0, framework="sglang")
+        self._wire(monkeypatch, coverage=None, verdict=None)
+        result = self._result()
+
+        await coord.phase_kernel._validate_gemm_tuning_e2e(result)
+
+        assert result["decision"] == "KEEP"
+        assert len(coord.shared_state.optimization_stack) == 1

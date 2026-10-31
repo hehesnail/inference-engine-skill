@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""The loop driven end to end over mock backends."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.inference_optimizer.session.paths import make_session_dir
+from hyperloom.orchestrator.phases import machine_state as ps
+from hyperloom.orchestrator.state.shared_state import SharedState
+from hyperloom.orchestrator.state.task_registry import TASK_STATES
+
+from ._geak_helpers import stop_geak_before_launch
+
+
+def _coordinator(session_dir: Path):
+    from hyperloom.orchestrator.loop.coordinator import Coordinator
+    from hyperloom.orchestrator.roles import (
+        MockBackend,
+        MockCriticBackend,
+        ScriptedPlan,
+    )
+
+    # Orchestration says nothing: what the phases do on their own is the point.
+    silent = ScriptedPlan(
+        turns=[],
+        default_intent=Intent(
+            type=IntentType.SEND_MESSAGE,
+            payload={"topic": "heartbeat", "body_md": "ok"},
+        ),
+    )
+    coord = Coordinator(
+        session_dir,
+        backends={
+            "orchestration": MockBackend(silent, name="orch"),
+            "critic": MockCriticBackend(),
+        },
+    )
+    coord.sub.register_executor("kernel_agent", coord.phase_kernel.run_agent)
+    return coord
+
+
+async def _settle_unjoined_actions(coord: Any) -> None:
+    """Let the actions the pump dispatched without joining run to completion."""
+    handles = [entry.atask for entry in coord.dispatcher._inflight_actions.values()]
+    if handles:
+        await asyncio.gather(*handles)
+
+
+def _no_controller_run(**kwargs: Any) -> dict[str, Any]:
+    return {"status": "no_opportunity", "patch_count": 0, "task_count": 0, "output_dir": str(kwargs["output_dir"])}
+
+
+@pytest.fixture
+def session_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from hyperloom.orchestrator.kernel import controller_submit
+
+    monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
+    # KERNEL entry would otherwise launch a real GEAK runner or Controller process on its route.
+    stop_geak_before_launch(monkeypatch)
+    monkeypatch.setattr(controller_submit, "run_controller_subprocess", _no_controller_run)
+    session_dir = make_session_dir()
+    # The CLI seeds a registered framework before the Coordinator ever loads the state.
+    SharedState(framework="sglang").save(session_dir)
+    return session_dir
+
+
+def _chain(state: Any) -> list[tuple[str, str, str]]:
+    return [
+        (str(row.get("from_phase") or ""), str(row.get("to_phase") or ""), str(row.get("reason") or ""))
+        for row in state.phase_history
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_baseline_carries_the_run_into_the_optimisation_phase_with_work(session_dir: Path):
+    """Entering the phase must produce dispatches, not just a history row."""
+    coord = _coordinator(session_dir)
+    try:
+        coord.shared_state.baseline_tput = 1500.0
+        coord.shared_state.max_minutes = 180
+        coord.shared_state.save(session_dir)
+
+        for tick in range(1, 25):
+            await coord.tick(tick)
+
+        state = coord.shared_state
+        assert state.phase == ps.PHASE_FRAMEWORK_AGENT
+        assert state.phase_budget_pct[ps.PHASE_FRAMEWORK_AGENT] > 0.0
+        tasks = [task for task_state in TASK_STATES for task in await coord.tasks.by_state(task_state)]
+        kinds = {str((t.params or {}).get("task_kind") or "") for t in tasks}
+        assert kinds & {"candidate_discovery", "framework_local_explore"}
+    finally:
+        await coord.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kernel_optimizer", "result_field", "result_key", "expected"),
+    # GEAK is skipped for want of KERNEL budget. The forge controller starts on what is left of the KERNEL slice after
+    # one benchmark round (the hard cap, with no measured baseline) and finds no opportunity.
+    [
+        ("geak", "geak_result", "error_class", "insufficient_budget"),
+        ("forge", "kernel_rewrite_controller_result", "status", "no_opportunity"),
+    ],
+    ids=["geak", "forge"],
+)
+async def test_both_arms_dry_walks_the_rest_of_the_chain(
+    session_dir: Path,
+    kernel_optimizer: str,
+    result_field: str,
+    result_key: str,
+    expected: str,
+):
+    """With nothing left to try, the run reaches CLOSE through every phase, on either kernel route."""
+    from hyperloom.orchestrator.lever import LEVER_CONFIG
+    from hyperloom.orchestrator.state.attempt_ledger import AttemptRow, record_attempt_row
+
+    coord = _coordinator(session_dir)
+    try:
+        state = coord.shared_state
+        state.kernel_optimizer = kernel_optimizer
+        state.baseline_tput = 1500.0
+        state.max_minutes = 180
+        # Source arm: no local exploration, and discovery past its retries.
+        state.framework_local_explore_enabled = False
+        state.framework_agent_empty_discoveries = 99
+        # Config arm: a run of benched variants past the streak floor, none adopted.
+        for i in range(ps.DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK + 1):
+            record_attempt_row(
+                state,
+                AttemptRow(
+                    lever_kind=LEVER_CONFIG,
+                    task_id=f"explore-{i}",
+                    round_id=f"round-{i}",
+                    fingerprint=f"fp-{i}",
+                    variant_name=f"variant-{i}",
+                    outcome="REVERT",
+                    adopted=False,
+                    gain_pct=0.01,
+                    before_tput=1500.0,
+                    after_tput=1500.15,
+                    provenance="default_grid",
+                ),
+            )
+        state.save(session_dir)
+
+        for tick in range(1, 12):
+            await coord.tick(tick)
+            # The kernel_agent task is not joined by the pump and holds the phase until it returns.
+            await _settle_unjoined_actions(coord)
+
+        assert state.phase == ps.PHASE_CLOSE
+        assert getattr(state, result_field)[result_key] == expected
+        visited = [to_phase for _, to_phase, _ in _chain(state)]
+        assert visited[:2] == [ps.PHASE_PRELUDE, ps.PHASE_FRAMEWORK_AGENT]
+        assert visited[-3:] == [ps.PHASE_KERNEL_AGENT, ps.PHASE_SWEEP, ps.PHASE_CLOSE]
+        reasons = {reason for _, _, reason in _chain(state)}
+        assert "optimize_no_more_leverage" in reasons
+    finally:
+        await coord.stop()

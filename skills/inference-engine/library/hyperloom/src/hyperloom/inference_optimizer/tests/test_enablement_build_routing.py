@@ -1,0 +1,855 @@
+# SPDX-FileCopyrightText: 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Targeted-build <-> enablement integration in the framework phase."""
+
+from __future__ import annotations
+
+import json
+import types as _types
+from pathlib import Path
+
+import pytest
+
+from hyperloom_common.gpu_identity import AMD_GPU_BOARDS
+from hyperloom.orchestrator.actions.executors.targeted_build_executor import TargetedBuildExecutor
+from hyperloom.orchestrator.enablement.runtime.build_actions import TargetedBuildAction, BuildResult, FrameworkRuntime
+from hyperloom.orchestrator.loop.build_lifecycle import BuildLifecycleCollaborator
+from hyperloom.orchestrator.enablement.recipe.steps import select_linked_build
+from hyperloom.orchestrator.enablement.build import _repo_matches_targeted_build_component
+from hyperloom.inference_optimizer.gpu_types import targeted_build_validated
+from hyperloom.orchestrator.state._shared_state.enablement_round import EnablementRound
+from hyperloom.orchestrator.enablement.params import EnablementParams
+
+
+# Fixture: extend the shared build_coord with framework-phase routing methods
+
+
+@pytest.fixture
+def coord(build_coord):
+    """``build_coord`` augmented with the routing-method surface the framework phase delegates to (launch-probe enqueue, rearm capture, build lifecycle)."""
+    from hyperloom.orchestrator.enablement.revalidation import EnablementRevalidation
+
+    build_coord._rearm_calls = []
+    # Bind EnablementBuild methods directly onto build_coord so that test code calling
+    # coord.enablement_build._method(...) works with build_coord as self.
+    # open_row_past_spent_generations lives on enablement_revalidation; bind the real method there.
+    build_coord.enablement_revalidation.open_row_past_spent_generations = _types.MethodType(
+        EnablementRevalidation.open_row_past_spent_generations, build_coord.enablement_revalidation
+    )
+
+    async def _maybe_rearm_enablement(res):
+        build_coord._rearm_calls.append(dict(res) if isinstance(res, dict) else {})
+
+    build_coord.enablement_lane.maybe_rearm_enablement = _maybe_rearm_enablement
+    # Patch build_lifecycle collaborator so the enqueue routes back to the test's _bl.
+    build_coord._bl = BuildLifecycleCollaborator(build_coord)
+    build_coord.build_lifecycle.enqueue_targeted_build = build_coord._bl.enqueue_targeted_build
+    # gpu_lanes stub: trivial lanes for tests that don't care about GPU dispatch.
+    build_coord.gpu_lanes.framework_authoring_lanes_ttl = lambda params, *, base_ttl_sec: (
+        ["research_lane"],
+        base_ttl_sec,
+    )
+    build_coord.dispatcher.registry_lanes_ttl = lambda kind: (
+        ["server_lifecycle", "workspace_mutation", "benchmark_lane"],
+        3600,
+    )
+    return build_coord
+
+
+def test_targeted_build_repo_match_ignores_origin():
+    assert _repo_matches_targeted_build_component("https://example.test/forks/aiter.git", "aiter")
+    assert _repo_matches_targeted_build_component("git@example.test:team/vllm.git", "vllm_source")
+
+
+def test_targeted_build_repo_match_rejects_wrong_component():
+    assert not _repo_matches_targeted_build_component(
+        "https://example.test/forks/unrelated.git",
+        "aiter",
+    )
+
+
+# maybe_escalate_to_targeted_build
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gpu_type", "arch"),
+    sorted((product, board.gfx) for product, board in AMD_GPU_BOARDS.items() if targeted_build_validated(product)),
+)
+async def test_escalate_enqueues_for_compiled_gap(coord, monkeypatch, gpu_type, arch):
+    """A build with no arch is refused at preflight, so every accepted board has to carry one."""
+    coord.shared_state.gpu_type = gpu_type
+    coord.shared_state.framework = "vllm"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    hip_kernel_log = "hipErrorNoBinaryForGpu: no kernel image is available"
+    await coord.enablement_build.maybe_escalate_to_targeted_build(hip_kernel_log)
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    assert action.component == "aiter"
+    assert action.gpu_arch == arch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["escalate", "route"])
+async def test_build_pumps_propagate_their_failures(coord, monkeypatch, entry):
+    """A failing pump reaches the lane's recording handler instead of dying at debug level."""
+    coord.shared_state.framework = "vllm"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(coord.build_lifecycle, "enqueue_targeted_build", _boom)
+    monkeypatch.setattr(coord.tasks, "by_state", _boom)
+    build = coord.enablement_build
+
+    with pytest.raises(RuntimeError, match="store down"):
+        if entry == "escalate":
+            await build.maybe_escalate_to_targeted_build("hipErrorNoBinaryForGpu")
+        else:
+            await build.maybe_route_build_outcomes()
+
+
+@pytest.mark.asyncio
+async def test_escalate_skipped_for_pure_python_gap(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    python_log = "Model architecture 'DeepseekV4ForCausalLM' is not supported"
+    await coord.enablement_build.maybe_escalate_to_targeted_build(python_log)
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 0
+
+
+@pytest.mark.asyncio
+async def test_escalate_skipped_for_r9700(coord, monkeypatch, caplog):
+    coord.shared_state.gpu_type = "r9700"
+    coord.shared_state.framework = "vllm"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    with caplog.at_level("WARNING", logger="hyperloom.orchestrator.enablement.build"):
+        await coord.enablement_build.maybe_escalate_to_targeted_build(
+            "hipErrorNoBinaryForGpu: no kernel image is available"
+        )
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+    assert "targeted_build skipped" in caplog.text and "gpu_type=r9700" in caplog.text
+    assert coord.shared_state.enablement.last_build_failure["failure_class"] == "preflight_toolchain"
+    assert "r9700" in coord.shared_state.enablement.last_build_failure["failure_summary"]
+
+
+@pytest.mark.asyncio
+async def test_escalate_skipped_on_multi_node(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: True)
+
+    log = "hipErrorNoBinaryForGpu"
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log)
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_escalate_idempotent_same_gap(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi300x"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    log = "hipErrorNoBinaryForGpu"
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log)
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log)
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1  # idempotent, not two rows
+
+
+@pytest.mark.asyncio
+async def test_escalate_disabled_by_env(coord, monkeypatch):
+    monkeypatch.setenv("HYPERLOOM_ENABLEMENT_DISABLE_TARGETED_BUILD", "1")
+    coord.shared_state.framework = "vllm"
+    log = "hipErrorNoBinaryForGpu"
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log)
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+
+
+# maybe_escalate_to_targeted_build: vLLM arch/weight deep-failure -> vllm_source (source patches keep hitting the
+# arch wall)
+
+
+@pytest.mark.asyncio
+async def test_arch_stall_escalates_to_vllm_source_after_attempts(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi355x"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    log = "Model architecture 'DeepseekV4ForCausalLM' is not supported"
+    # attempt 0: give the cheap source-patch path first crack -> no build yet.
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log, attempt=0)
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+
+    # attempt 1: source patches still hit the arch wall -> from-source vLLM build.
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log, attempt=1)
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    assert action.component == "vllm_source"
+    assert action.gpu_arch == "gfx950"
+
+
+@pytest.mark.asyncio
+async def test_arch_stall_not_escalated_on_non_vllm(coord, monkeypatch):
+    coord.shared_state.framework = "sglang"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    log = "Model architecture 'FooForCausalLM' is not supported"
+    # Even at a high attempt count, the from-source vLLM recipe is vLLM-only.
+    await coord.enablement_build.maybe_escalate_to_targeted_build(log, attempt=5)
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+
+
+# maybe_enqueue_specialist_requested_build (specialist asks for a compiled / from-source build in specialist_done)
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_enqueued(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi355x"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    tid = "spec-abc123"
+    wd = coord.session_dir / "runs" / "specialist" / tid
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "specialist_done.json").write_text(
+        json.dumps(
+            {
+                "needs_targeted_build": {
+                    "component": "aiter",
+                    "capability": "deepseek_v4_nsa",
+                    "repo_url": "https://github.com/ROCm/aiter",
+                    "ref": "PR:1234",
+                    "reason": "NSA index op missing on ROCm",
+                }
+            }
+        )
+    )
+    coord.shared_state.enablement.last_specialist_task_id = tid
+
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build()
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    assert action.component == "aiter"
+    assert action.capability == "deepseek_v4_nsa"
+    assert action.ref == "PR:1234"
+    assert action.gpu_arch == "gfx950"
+    # Consume-once: the marker is cleared so the next tick does not re-enqueue.
+    assert coord.shared_state.enablement.last_specialist_task_id == ""
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_skipped_for_r9700(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "r9700"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    tid = "spec-r9700"
+    coord.shared_state.enablement.last_specialist_task_id = tid
+
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build(
+        task_id=tid,
+        payload={
+            "needs_targeted_build": {
+                "component": "aiter",
+                "capability": "deepseek_v4_nsa",
+                "repo_url": "https://github.com/ROCm/aiter",
+                "ref": "PR:1234",
+            }
+        },
+    )
+
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+    # The request is consumed so the next tick does not retry it.
+    assert coord.shared_state.enablement.last_specialist_task_id == ""
+    assert coord.shared_state.enablement.last_build_failure["failure_class"] == "preflight_toolchain"
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_enqueued_from_payload(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi355x"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    payload = {
+        "needs_targeted_build": {
+            "component": "aiter",
+            "capability": "deepseek_v4_decode",
+            "repo_url": "https://github.com/ROCm/aiter",
+            "ref": "v0.1.15.post2",
+        }
+    }
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build(
+        task_id="spec-direct",
+        payload=payload,
+    )
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    assert TargetedBuildAction.from_state(queued[0].params).ref == "v0.1.15.post2"
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_rejects_repo_component_mismatch(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi355x"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    tid = "spec-wrong-repo"
+    wd = coord.session_dir / "runs" / "specialist" / tid
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "specialist_done.json").write_text(
+        json.dumps(
+            {
+                "needs_targeted_build": {
+                    "component": "aiter",
+                    "repo_url": "https://example.test/forks/unrelated.git",
+                }
+            }
+        )
+    )
+    coord.shared_state.enablement.last_specialist_task_id = tid
+
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build()
+
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_defaults_component_to_vllm_source(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi300x"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    tid = "spec-nocomp"
+    wd = coord.session_dir / "runs" / "specialist" / tid
+    wd.mkdir(parents=True, exist_ok=True)
+    # A request with no (or invalid) component defaults to a from-source vLLM build.
+    (wd / "specialist_done.json").write_text(
+        json.dumps({"needs_targeted_build": {"capability": "deepseek_v4", "reason": "new arch"}})
+    )
+    coord.shared_state.enablement.last_specialist_task_id = tid
+
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build()
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    assert TargetedBuildAction.from_state(queued[0].params).component == "vllm_source"
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_noop_without_request(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    tid = "spec-plain"
+    wd = coord.session_dir / "runs" / "specialist" / tid
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "specialist_done.json").write_text(json.dumps({"patches_written": ["p.patch"]}))
+    coord.shared_state.enablement.last_specialist_task_id = tid
+
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build()
+
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+    # Marker is still consumed (cleared) even when there is no request.
+    assert coord.shared_state.enablement.last_specialist_task_id == ""
+
+
+@pytest.mark.asyncio
+async def test_specialist_requested_build_noop_when_no_task_id(coord, monkeypatch):
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.enablement.last_specialist_task_id = ""
+    await coord.enablement_build.maybe_enqueue_specialist_requested_build()
+    assert len([t for t in await coord.tasks.queued() if t.kind == "targeted_build"]) == 0
+
+
+# maybe_route_build_outcomes -> maybe_rearm_enablement routing
+
+
+async def _enqueue_and_transition(coord, action, state):
+    task_id = await coord._bl.enqueue_targeted_build(action)
+    await coord.tasks.transition(task_id, "running")
+    await coord.tasks.transition(task_id, state)
+    return task_id
+
+
+async def _verified_build(coord, root, *, gap_id, framework="vllm", ref="v1", runtime_env=None):
+    """A succeeded ``targeted_build`` row whose result.json carries a usable runtime."""
+    root.mkdir(parents=True, exist_ok=True)
+    rt = FrameworkRuntime(pythonpath_prefixes=(str(root),), runtime_env=runtime_env or {})
+    br = BuildResult(ok=True, attempt_root=str(root), runtime=rt)
+    (root / "result.json").write_text(json.dumps(br.to_state()), encoding="utf-8")
+    action = TargetedBuildAction(
+        gap_id=gap_id,
+        framework=framework,
+        component="aiter",
+        capability="fp4_moe",
+        ref=ref,
+        attempt_root=str(root),
+    )
+    return await _enqueue_and_transition(coord, action, "succeeded")
+
+
+async def _recorded_build(coord, *, gap_id, state="succeeded"):
+    """A terminal build whose attempt row the executor already appended.
+
+    ``maybe_route_build_outcomes`` runs against the manifest the executor left,
+    so a routing test that never records the attempt exercises an empty
+    manifest and cannot see a row that shadows the routing sentinel. The attempt
+    directory is the one routing resolves by task id, which is also the join
+    the recipe reads the build back through.
+    """
+    action = TargetedBuildAction(gap_id=gap_id, framework="vllm", component="aiter", capability="fp4_moe", ref="v1")
+    task_id = await _enqueue_and_transition(coord, action, state)
+    root = Path(coord.session_dir) / "enablement" / "builds" / task_id
+    root.mkdir(parents=True, exist_ok=True)
+    rt = FrameworkRuntime(pythonpath_prefixes=(str(root),), runtime_env={"X": "1"})
+    br = BuildResult(ok=state == "succeeded", attempt_root=str(root), runtime=rt)
+    (root / "result.json").write_text(json.dumps(br.to_state()), encoding="utf-8")
+    TargetedBuildExecutor._record_result(br, coord.shared_state, action=action)
+    return task_id
+
+
+async def _queued_probes(coord):
+    """The launch-probe rows currently waiting to be dispatched."""
+    return [t for t in await coord.tasks.queued() if t.kind == "integrate_patch"]
+
+
+def _spend_the_budget(coord, *, minutes=60):
+    """Leave the session with no wall-clock budget for a probe to run in."""
+    coord.shared_state.max_minutes = minutes
+    coord.shared_state.elapsed_minutes = lambda **_kw: float(minutes)
+
+
+def _restore_the_budget(coord):
+    """Give the session a budget a probe fits in again, as a resume would."""
+    coord.shared_state.max_minutes = 600
+    coord.shared_state.elapsed_minutes = lambda **_kw: 0.0
+
+
+@pytest.mark.asyncio
+async def test_route_succeeded_row_enqueues_launch_probe(coord, tmp_path):
+    """A succeeded build must enqueue an integrate_patch launch probe, not call rearm directly."""
+    await _verified_build(coord, tmp_path / "attempt_s", gap_id="g2", runtime_env={"X": "1"})
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    # Must NOT directly rearm with "kept" — KEEP comes from the probe.
+    assert not any(r.get("status") == "kept" for r in coord._rearm_calls)
+    # Must have queued a launch-probe task.
+    probes = await _queued_probes(coord)
+    assert len(probes) == 1
+    probe_params = probes[0].params
+    assert probe_params.get("enablement_launch_only") is True
+    assert probe_params.get("enablement") is True
+    assert isinstance(probe_params.get("runtime_override"), dict)
+    assert probe_params["runtime_override"]  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_route_succeeded_row_probe_carries_config_path(coord, tmp_path):
+    """Launch probe inherits baseline_config_path from shared state."""
+    coord.shared_state.baseline_config_path = "/cfg/bench.yaml"
+    await _verified_build(
+        coord,
+        tmp_path / "attempt_cfg",
+        gap_id="g3",
+        framework="sglang",
+        ref="v2",
+    )
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    probes = await _queued_probes(coord)
+    assert len(probes) == 1
+    assert probes[0].params.get("config_path") == "/cfg/bench.yaml"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", [None, FrameworkRuntime()], ids=["no_result_json", "empty_runtime_override"])
+async def test_a_succeeded_build_with_nothing_to_launch_settles_no_round(coord, tmp_path, runtime):
+    """No launchable runtime means no probe, and no rearm that would settle the held round."""
+    root = tmp_path / "attempt_unlaunchable"
+    root.mkdir(parents=True, exist_ok=True)
+    if runtime is not None:
+        br = BuildResult(ok=True, attempt_root=str(root), runtime=runtime)
+        (root / "result.json").write_text(json.dumps(br.to_state()), encoding="utf-8")
+    action = TargetedBuildAction(
+        gap_id="g4", framework="vllm", component="aiter", capability="fp4_moe", ref="v1", attempt_root=str(root)
+    )
+    task_id = await _enqueue_and_transition(coord, action, "succeeded")
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    assert coord._rearm_calls == []
+    assert await _queued_probes(coord) == []
+    assert coord.enablement_build._build_routing_record(task_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_route_succeeded_probe_idempotent(coord, tmp_path):
+    """Calling maybe_route_build_outcomes twice for the same row only enqueues one probe."""
+    await _verified_build(coord, tmp_path / "attempt_idem", gap_id="g6")
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    probes = await _queued_probes(coord)
+    assert len(probes) == 1  # idempotent
+
+
+@pytest.mark.asyncio
+async def test_a_launch_probe_the_budget_cannot_fit_is_not_enqueued(coord, tmp_path):
+    """A probe opened into a spent budget is cancelled at dispatch and lost."""
+    build_tid = await _verified_build(coord, tmp_path / "attempt_broke", gap_id="g_budget")
+    _spend_the_budget(coord)
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    assert await _queued_probes(coord) == []
+    # Nothing was routed, so the build is still owed a probe.
+    assert coord.enablement_build._build_routing_record(build_tid) is None
+    assert coord._rearm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_build_whose_probe_the_run_cancelled_is_still_unprobed(coord, tmp_path):
+    """A cancelled probe is no evidence about the build, so the build gets another."""
+    build_tid = await _verified_build(coord, tmp_path / "attempt_again", gap_id="g_again")
+    await coord.enablement_build.maybe_route_build_outcomes()
+    first = (await _queued_probes(coord))[0]
+    await coord.tasks.transition(first.task_id, "cancelled", evidence={"reason": "time_budget"})
+    _restore_the_budget(coord)
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    probes = await _queued_probes(coord)
+    assert [p.task_id for p in probes] != [], "the build was left accounted for by a probe that never ran"
+    assert first.task_id not in {p.task_id for p in probes}, "the window resolved to the cancelled row"
+    record = coord.enablement_build._build_routing_record(build_tid) or {}
+    assert record.get("probe_task_id") == probes[0].task_id
+    assert int(record.get("probe_generation") or 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_build_whose_probe_ran_and_failed_is_not_probed_again(coord, tmp_path):
+    """A probe that ran said something about the build; only a cancel says nothing."""
+    await _verified_build(coord, tmp_path / "attempt_failed", gap_id="g_failed")
+    await coord.enablement_build.maybe_route_build_outcomes()
+    probe = (await _queued_probes(coord))[0]
+    await coord.tasks.transition(probe.task_id, "running")
+    await coord.tasks.transition(probe.task_id, "failed")
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    assert await _queued_probes(coord) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_answers_no_round(coord, tmp_path):
+    """A failed build booted nothing: no rearm, and a verified build after it still probes."""
+    await _recorded_build(coord, gap_id="g_failed_build", state="failed")
+    coord.shared_state.enablement.last_build_failure = {"failure_class": "abi_mismatch", "failure_summary": "x"}
+    verified_tid = await _verified_build(coord, tmp_path / "attempt_after", gap_id="g_after", ref="v2")
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    assert coord._rearm_calls == []
+    probes = await _queued_probes(coord)
+    assert len(probes) == 1
+    assert coord.enablement_build._build_routing_record(verified_tid)["probe_task_id"] == probes[0].task_id
+
+
+@pytest.mark.asyncio
+async def test_route_oldest_unrouted_build_when_newer_already_routed(coord, tmp_path):
+    """Older unseen builds must still route when a newer build is already accounted for."""
+    older_tid = await _verified_build(coord, tmp_path / "attempt_older", gap_id="g_older", ref="v-older")
+    newer_tid = await _verified_build(coord, tmp_path / "attempt_newer", gap_id="g_newer", ref="v-newer")
+    coord.enablement_build._note_build_routed(newer_tid)
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    probes = await _queued_probes(coord)
+    assert len(probes) == 1
+    assert coord.enablement_build._build_routing_record(older_tid) is not None
+    assert coord.enablement_build._build_routing_record(newer_tid) is not None
+
+
+# build_enablement_specialist_params injects failure_class into notes/params
+
+
+def _make_params_fake(**kw):
+    import types
+
+    state = types.SimpleNamespace(
+        framework=kw.get("framework", "vllm"),
+        model_name=kw.get("model_name", "deepseek-ai/DeepSeek-V4"),
+        gpu_type=kw.get("gpu_type", "mi355x"),
+        enablement=EnablementRound(
+            kept_patches=[],
+            kept_stack_action={},
+            setup_commands=[],
+            localization_manifest=[],
+            last_build_failure=kw.get("enablement_last_build_failure", {}),
+        ),
+    )
+    fake = types.SimpleNamespace(shared_state=state, session_dir="/tmp")
+    fake.build_enablement_specialist_params = types.MethodType(
+        EnablementParams.build_enablement_specialist_params, fake
+    )
+    fake._discover_enablement_candidate_refs = lambda plan, *, deadline: []
+    fake._read_enablement_source_context = lambda _sig: ""
+    fake._derive_checkpoint_weight_facts = lambda _log: ""
+    return fake
+
+
+def test_build_params_injects_last_build_failure_into_notes():
+    fake = _make_params_fake(
+        enablement_last_build_failure={
+            "failure_class": "timeout",
+            "failure_summary": "AITER ran out of time",
+        }
+    )
+    log = "hipErrorNoBinaryForGpu: no kernel image"
+    params = fake.build_enablement_specialist_params(log, attempt=1)
+    assert params is not None
+    notes = params.get("notes", "")
+    assert "PREVIOUS TARGETED-BUILD" in notes
+    assert "failure_class='timeout'; AITER ran out of time" in notes
+
+
+def test_build_params_no_injection_when_no_build_failure():
+    fake = _make_params_fake(enablement_last_build_failure={})
+    log = "hipErrorNoBinaryForGpu: no kernel image"
+    params = fake.build_enablement_specialist_params(log, attempt=0)
+    assert params is not None
+    notes = params.get("notes", "")
+    assert "PREVIOUS TARGETED-BUILD" not in notes
+
+
+def test_build_params_failure_class_distinguishes_timeout_vs_defect():
+    fake_timeout = _make_params_fake(enablement_last_build_failure={"failure_class": "timeout", "failure_summary": ""})
+    fake_defect = _make_params_fake(
+        enablement_last_build_failure={"failure_class": "compile_error", "failure_summary": "bad code"}
+    )
+    log = "hipErrorNoBinaryForGpu"
+    notes_timeout = fake_timeout.build_enablement_specialist_params(log)["notes"]
+    notes_defect = fake_defect.build_enablement_specialist_params(log)["notes"]
+    # Both should mention the build failure
+    assert "timeout" in notes_timeout
+    assert "compile_error" in notes_defect
+    # The timeout note steers toward a smaller scope
+    assert "smaller component scope" in notes_timeout
+
+
+# maybe_escalate_to_targeted_build: discovery-driven ref selection
+
+
+@pytest.mark.asyncio
+async def test_escalate_uses_discovery_ref_when_no_kept_ref(coord, monkeypatch):
+    """When no kept/operator ref, top matching candidate from discovery is used."""
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi300x"
+    coord.shared_state.enablement.candidate_refs = [
+        "https://github.com/ROCm/aiter/pull/77",
+    ]
+
+    await coord.enablement_build.maybe_escalate_to_targeted_build("hipErrorNoBinaryForGpu")
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    assert action.ref == "PR:77"
+    assert "aiter" in action.repo_url.lower()
+    assert action.source_pr_url == "https://github.com/ROCm/aiter/pull/77"
+
+
+@pytest.mark.asyncio
+async def test_escalate_kept_ref_short_circuits_discovery(coord, monkeypatch):
+    """When a kept stack action has a ref, discovery candidates are ignored."""
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi300x"
+    coord.shared_state.enablement.kept_stack_action = {
+        "ref": "v0.99.0",
+        "repo_url": "https://github.com/ROCm/aiter",
+    }
+    coord.shared_state.enablement.candidate_refs = [
+        "https://github.com/ROCm/aiter/pull/77",
+    ]
+
+    await coord.enablement_build.maybe_escalate_to_targeted_build("hipErrorNoBinaryForGpu")
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    assert action.ref == "v0.99.0"
+    assert action.source_pr_url == ""
+
+
+@pytest.mark.asyncio
+async def test_escalate_skips_candidate_with_wrong_component_repo(coord, monkeypatch):
+    """aiter component only accepts candidates whose repo contains 'aiter'."""
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi300x"
+    coord.shared_state.enablement.candidate_refs = [
+        "https://github.com/sgl-project/sglang/pull/5",  # wrong repo for aiter
+    ]
+
+    await coord.enablement_build.maybe_escalate_to_targeted_build("hipErrorNoBinaryForGpu")
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    # Falls back to empty ref (tag autoselect) since no matching candidate
+    assert action.ref == ""
+    assert action.source_pr_url == ""
+
+
+@pytest.mark.asyncio
+async def test_escalate_moves_past_a_candidate_whose_org_alone_names_the_component(coord, monkeypatch):
+    """The component is matched on the repo name, so an org-only hit is skipped, not escalated and then aborted."""
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as mne
+
+    monkeypatch.setattr(mne, "is_multi_node", lambda: False)
+
+    coord.shared_state.framework = "vllm"
+    coord.shared_state.gpu_type = "mi300x"
+    coord.shared_state.enablement.candidate_refs = [
+        "https://github.com/aiter-fans/vllm/pull/5",
+        "https://github.com/ROCm/aiter/pull/77",
+    ]
+
+    await coord.enablement_build.maybe_escalate_to_targeted_build("hipErrorNoBinaryForGpu")
+
+    queued = [t for t in await coord.tasks.queued() if t.kind == "targeted_build"]
+    assert len(queued) == 1
+    action = TargetedBuildAction.from_state(queued[0].params)
+    assert action.ref == "PR:77"
+    assert action.repo_url == "https://github.com/ROCm/aiter"
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_attempt_row_does_not_shadow_the_routing_sentinel(coord):
+    """The attempt row must not answer "has this build been routed?".
+
+    Routing is tracked by a sentinel keyed on ``task_id``. An attempt row
+    carrying that same key is indistinguishable from one, and since the
+    executor appends it before the build reaches a terminal state it would
+    answer for every build that has not been routed yet.
+    """
+    task_id = await _recorded_build(coord, gap_id="gr")
+
+    assert coord.enablement_build._build_routing_record(task_id) is None
+
+    await coord.enablement_build.maybe_route_build_outcomes()
+
+    assert len(await _queued_probes(coord)) == 1
+    sentinel_probe = str(coord.enablement_build._build_routing_record(task_id).get("probe_task_id") or "")
+    assert sentinel_probe
+
+    # The sentinel routing writes is the one the recipe joins its build step
+    # through, so the two contracts have to agree on the same manifest.
+    sentinel, attempt = select_linked_build(
+        {
+            "build_manifest": list(coord.shared_state.enablement.build_manifest),
+            "last_specialist_task_id": sentinel_probe,
+        }
+    )
+    assert sentinel is not None and attempt is not None
+    assert attempt.get("ok") is True and Path(str(attempt["attempt_root"])).name == task_id
+
+
+@pytest.mark.asyncio
+async def test_an_id_alone_does_not_make_a_row_a_routing_sentinel(coord):
+    """The reader names what it is looking for instead of what it will not find.
+
+    ``BuildResult.to_state`` writes no ``task_id`` today, so an attempt row
+    cannot answer the routing lookup by accident. That is an invariant of a
+    serializer two packages away: if it ever gained one, every completed build
+    would read as already routed and no launch probe would ever be enqueued.
+    The row here is exactly that hypothetical -- an attempt row carrying the
+    id -- and it must not be mistaken for a routing record.
+    """
+    task_id = await _recorded_build(coord, gap_id="gs")
+    manifest = list(coord.shared_state.enablement.build_manifest or [])
+    manifest.append({"task_id": task_id, "ok": True, "attempt_root": "/tmp/x"})
+    coord.shared_state.enablement.build_manifest = manifest
+
+    assert coord.enablement_build._build_routing_record(task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_routing_a_build_with_nothing_to_say_still_marks_it_routed(coord):
+    """The merge path used to take only the caller's fields, and it had none."""
+    task_id = await _recorded_build(coord, gap_id="gt")
+    coord.enablement_build._note_build_routed(task_id)
+
+    record = coord.enablement_build._build_routing_record(task_id)
+    assert record is not None and record.get("routed") is True

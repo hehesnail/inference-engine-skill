@@ -1,0 +1,366 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Shared action-surface constants and the action catalogue."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+
+
+# Actions owned by the Kernel role; requested via request{target_agent="kernel_agent"}.
+KERNEL_AGENT_OWNED_ACTIONS: frozenset[str] = frozenset(
+    {
+        "integrate",
+        "gemm_tuning",
+    }
+)
+
+
+# Kernel-owned action name -> the request ``kind`` that names it.
+KERNEL_ACTION_REQUEST_KINDS: Mapping[str, str] = MappingProxyType(
+    {
+        "gemm_tuning": "run_gemm_tuning",
+        "integrate": "integrate",
+    }
+)
+
+assert set(KERNEL_ACTION_REQUEST_KINDS) == KERNEL_AGENT_OWNED_ACTIONS
+
+
+# Request-kind aliases that route to a kernel-owned handler. apply_patch is an alias of integrate (both dispatch to
+# integrate_handler); PolicyGate resolves the alias to its canonical owned action so the phase-action gate applies
+# identically.
+KERNEL_REQUEST_KIND_ALIASES: dict[str, str] = {
+    "apply_patch": "integrate",
+}
+
+
+# Request ``kind`` -> the kernel-owned action it gates as, derived from the two tables above so a new kind cannot fall
+# out of sync with the catalogue.
+REQUEST_KIND_TO_OWNED_ACTION: Mapping[str, str] = MappingProxyType(
+    {
+        **{kind: action for action, kind in KERNEL_ACTION_REQUEST_KINDS.items()},
+        **KERNEL_REQUEST_KIND_ALIASES,
+    }
+)
+
+
+# Registered kernel lanes the Coordinator dispatches itself, at KERNEL entry and once their own gate passes.
+COORDINATOR_OWNED_KERNEL_REQUEST_KINDS: frozenset[str] = frozenset(
+    {
+        "run_fusion",
+        # Dispatched once at phase entry from a lane budget.
+        "run_gemm_tuning",
+    }
+)
+
+
+# Coordinator-managed actions that agents should not directly propose.
+COORDINATOR_INTERNAL_ACTIONS: frozenset[str] = frozenset(
+    {
+        "conc_sweep",
+        "roofline",
+        "profile",
+        "replay_warm_recipe",
+        # Off-loop compiled-component builds; dispatched by the Coordinator, never by an LLM agent.
+        "targeted_build",
+        # The KERNEL_AGENT phase's whole pipeline, enqueued once at phase entry.
+        "kernel_agent",
+    }
+)
+
+
+# Actions rendered in the Orchestration prompt for full kernel-enabled runs.
+FULL_ENABLED_ACTIONS: tuple[str, ...] = (
+    "target_analysis",
+    "baseline",
+    "roofline",
+    "explore",
+    "specialist",
+    "integrate_patch",
+    "integrate",
+    "gemm_tuning",
+    "report",
+)
+
+
+# Prompt-visible actions for --no-kernel runs.
+NO_KERNEL_AGENT_ENABLED_ACTIONS: tuple[str, ...] = (
+    "target_analysis",
+    "baseline",
+    "explore",
+    "specialist",
+    "integrate_patch",
+    "report",
+)
+
+
+@dataclass(frozen=True)
+class ActionMetadata:
+    """One action's dispatch contract plus its prompt-catalogue copy."""
+
+    name: str
+    family: str
+    pipeline_phase: str
+    verdict_class: str
+    expected_gain_pct: tuple[float, float]
+    accuracy_risk: float
+    crash_risk: float
+    typical_runtime_min: float
+    lease_ttl_sec: int
+    description: str
+    requires_lanes: tuple[str, ...] = ()
+    #: For an action that runs until its grant runs out: how many of the session's measured benchmark rounds the least
+    #: useful run needs. Once a round is measured, the action is admitted on those rather than its catalogue runtime.
+    admission_rounds: int = 0
+
+
+ACTION_CATALOGUE: Mapping[str, ActionMetadata] = MappingProxyType(
+    {
+        "baseline": ActionMetadata(
+            name="baseline",
+            family="prep",
+            pipeline_phase="measure",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.05,
+            typical_runtime_min=5.0,
+            lease_ttl_sec=4200,
+            requires_lanes=("server_lifecycle", "benchmark_lane"),
+            description="Launch a fresh server with NO accepted modifications, run Magpie benchmark, and set baseline_tput.",
+        ),
+        "conc_sweep": ActionMetadata(
+            name="conc_sweep",
+            family="shallow",
+            pipeline_phase="explore",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.05,
+            typical_runtime_min=30.0,
+            lease_ttl_sec=9000,
+            requires_lanes=("server_lifecycle", "benchmark_lane"),
+            # One pair: the anchor rung on each arm.
+            admission_rounds=2,
+            description=(
+                "Post-sweep concurrency comparison: benchmark baseline vs current_best across a CONC ladder. "
+                "On by default, off under AgentX; force with --enable-conc-sweep / --no-enable-conc-sweep; "
+                "bounded by --conc-sweep-total-budget-sec "
+                "(default 2.5h)."
+            ),
+        ),
+        "explore": ActionMetadata(
+            name="explore",
+            family="shallow",
+            pipeline_phase="explore",
+            verdict_class="exploration",
+            expected_gain_pct=(2.0, 12.0),
+            accuracy_risk=0.0,
+            crash_risk=0.1,
+            typical_runtime_min=12.0,
+            lease_ttl_sec=7200,
+            requires_lanes=("server_lifecycle", "benchmark_lane"),
+            description=(
+                "Apply a batch of N candidate variants serially; KEEP/REVERT each, stack onto optimization_stack. "
+                "Each variant is benched on the stack (replaces backends/params/validate_stack)."
+            ),
+        ),
+        "gemm_tuning": ActionMetadata(
+            name="gemm_tuning",
+            family="deep_kernel",
+            pipeline_phase="deep",
+            verdict_class="exploration",
+            expected_gain_pct=(5.0, 20.0),
+            accuracy_risk=0.1,
+            crash_risk=0.1,
+            typical_runtime_min=20.0,
+            lease_ttl_sec=5400,
+            requires_lanes=("server_lifecycle", "workspace_mutation", "benchmark_lane"),
+            description=(
+                "GEMM dispatch tuning request. Current GEAK owns the default KERNEL phase and decides applicability "
+                "internally. Private forge tuning is available only when the operator set exactly "
+                "KERNEL_OPT_BACKEND_ORDER=forge."
+            ),
+        ),
+        "integrate": ActionMetadata(
+            name="integrate",
+            family="deep_kernel",
+            pipeline_phase="deep",
+            verdict_class="promotion",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.15,
+            crash_risk=0.15,
+            typical_runtime_min=25.0,
+            lease_ttl_sec=3600,
+            requires_lanes=("server_lifecycle", "workspace_mutation", "benchmark_lane"),
+            description=(
+                "REQUEST kernel: apply a KEEP'd kernel patch, re-baseline E2E, and emit KEEP / REVERT / NEEDS_REVIEW."
+            ),
+        ),
+        "integrate_patch": ActionMetadata(
+            name="integrate_patch",
+            family="shallow",
+            pipeline_phase="explore",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 12.0),
+            accuracy_risk=0.1,
+            crash_risk=0.15,
+            typical_runtime_min=10.0,
+            lease_ttl_sec=3600,
+            requires_lanes=("server_lifecycle", "workspace_mutation", "benchmark_lane"),
+            description=(
+                "Apply specialist worktree patches to framework_source_roots, restart server, run throughput + "
+                "accuracy gate, KEEP or REVERT. Deterministic executor for FRAMEWORK_AGENT; also serves "
+                "the enablement launch-only build probe and framework-agent authoring lanes."
+            ),
+        ),
+        # typical_runtime_min is a floor, not the expected wall clock: the task runs until the KERNEL phase budget
+        # ends it, so the time-budget gate admits it whenever one benchmark round still fits.
+        "kernel_agent": ActionMetadata(
+            name="kernel_agent",
+            family="deep_kernel",
+            pipeline_phase="deep",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 30.0),
+            accuracy_risk=0.05,
+            crash_risk=0.05,
+            typical_runtime_min=1.0,
+            lease_ttl_sec=21600,
+            requires_lanes=("server_lifecycle", "workspace_mutation", "benchmark_lane"),
+            description=(
+                "Coordinator-internal: the KERNEL_AGENT phase's work as one lane-holding task. Runs the GEAK e2e "
+                "delegation or the Forge pipeline (GEMM tuning, fusion, kernel rewrite controller) per "
+                "kernel_optimizer, so no other benchmark shares the GPUs while it runs."
+            ),
+        ),
+        "profile": ActionMetadata(
+            name="profile",
+            family="analysis",
+            pipeline_phase="analysis",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.05,
+            typical_runtime_min=3.0,
+            lease_ttl_sec=2700,
+            requires_lanes=("profile_lane",),
+            description=(
+                "Coordinator-internal: lightweight roofline alternative — torch_profiler trace only, no analysis.md. "
+                "Enqueued when ``--no-enable-roofline``; LLM-proposed delegate is denied."
+            ),
+        ),
+        "replay_warm_recipe": ActionMetadata(
+            name="replay_warm_recipe",
+            family="prep",
+            pipeline_phase="measure",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 25.0),
+            accuracy_risk=0.0,
+            crash_risk=0.05,
+            typical_runtime_min=5.0,
+            lease_ttl_sec=4200,
+            requires_lanes=("server_lifecycle", "benchmark_lane"),
+            description=(
+                "Coordinator-internal one-shot replay of T0 warm_start_recipe.best_config; "
+                "a measured gain clearing the keep threshold pushes the warm config onto optimization_stack."
+            ),
+        ),
+        "report": ActionMetadata(
+            name="report",
+            family="shallow",
+            pipeline_phase="finalize",
+            verdict_class="archival",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.0,
+            typical_runtime_min=2.0,
+            lease_ttl_sec=300,
+            description=(
+                "Write final.md / final.json under reports/. Coordinator auto-flushes deterministic report at the "
+                "deadline (invariant); the LLM may propose it only in CLOSE, where the Coordinator routes a stopped "
+                "or out-of-time run."
+            ),
+        ),
+        "roofline": ActionMetadata(
+            name="roofline",
+            family="analysis",
+            pipeline_phase="analysis",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.05,
+            typical_runtime_min=10.0,
+            lease_ttl_sec=2700,
+            requires_lanes=("profile_lane",),
+            description=(
+                "Composite action: runs profile + trace_analyze atomically to produce a fresh TraceLens analysis.md "
+                "snapshot. Required prerequisite for explore."
+            ),
+        ),
+        "session_breakdown": ActionMetadata(
+            name="session_breakdown",
+            family="shallow",
+            pipeline_phase="finalize",
+            verdict_class="archival",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.0,
+            typical_runtime_min=0.2,
+            lease_ttl_sec=90,
+            description=(
+                "Refresh $SESSION_DIR/session_breakdown.json for downstream dashboards (cheap, idempotent). "
+                "End-of-session export already runs from cli.py finally; only dispatch mid-run for live consumers."
+            ),
+        ),
+        "specialist": ActionMetadata(
+            name="specialist",
+            family="creative",
+            pipeline_phase="explore",
+            verdict_class="exploration",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.0,
+            typical_runtime_min=6.0,
+            lease_ttl_sec=1800,
+            requires_lanes=("research_lane",),
+            description=(
+                "Dispatch an LLM specialist on research_lane; reads KB / PR feed for knowledge-domain tags, may write "
+                "worktree patches, emits one specialist_done intent."
+            ),
+        ),
+        "target_analysis": ActionMetadata(
+            name="target_analysis",
+            family="prep",
+            pipeline_phase="prep",
+            verdict_class="archival",
+            expected_gain_pct=(0.0, 0.0),
+            accuracy_risk=0.0,
+            crash_risk=0.0,
+            typical_runtime_min=0.1,
+            lease_ttl_sec=60,
+            description=(
+                "Runs first in PRELUDE, before baseline; always writes target_analysis/target_baseline.json. With "
+                "--compare-against-gpu set, fetches InferenceX reference; otherwise writes a "
+                "'no_target_gpu_configured' marker. Advisory only."
+            ),
+        ),
+    }
+)
+
+
+__all__ = [
+    "ACTION_CATALOGUE",
+    "ActionMetadata",
+    "COORDINATOR_INTERNAL_ACTIONS",
+    "FULL_ENABLED_ACTIONS",
+    "KERNEL_ACTION_REQUEST_KINDS",
+    "COORDINATOR_OWNED_KERNEL_REQUEST_KINDS",
+    "KERNEL_AGENT_OWNED_ACTIONS",
+    "KERNEL_REQUEST_KIND_ALIASES",
+    "NO_KERNEL_AGENT_ENABLED_ACTIONS",
+    "REQUEST_KIND_TO_OWNED_ACTION",
+]

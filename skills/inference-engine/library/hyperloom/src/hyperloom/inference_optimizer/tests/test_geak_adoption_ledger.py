@@ -1,0 +1,349 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit coverage for the two units that turn an acceptance into a named kernel."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+from hyperloom.inference_optimizer.breakdown.recorder.kernel_records import KernelExit
+from hyperloom.common.overlay import overlay_is_loadable
+from hyperloom.orchestrator.kernel.geak_config import (
+    _geak_accepted_kernel_specs,
+    _geak_overlay_digest,
+    geak_spec_name,
+)
+from hyperloom.orchestrator.phases.kernel import KernelPhase
+
+
+def _spec(name: str, delta: float, **extra: Any) -> dict[str, Any]:
+    return {"short_name": name, "e2e_delta_pct": delta, **extra}
+
+
+# Which acceptances count as a kernel
+
+
+def test_non_dict_result_yields_no_specs() -> None:
+    assert _geak_accepted_kernel_specs(None) == []
+    assert _geak_accepted_kernel_specs("no_gain") == []
+
+
+def test_both_lanes_are_read() -> None:
+    # 11 campaign runs carry an acceptance: 8 in accepted_heads only, 3 in accepted_kernels only.
+    result = {
+        "accepted_kernels": [_spec("k_from_kernels", 4.0)],
+        "accepted_heads": [_spec("k_from_heads", 6.0)],
+    }
+    assert [geak_spec_name(s) for s in _geak_accepted_kernel_specs(result)] == [
+        "k_from_kernels",
+        "k_from_heads",
+    ]
+
+
+def test_env_selections_are_excluded() -> None:
+    # ``kind: env`` selects an existing library (ck_gemm_a8w8_blockscale_...); no kernel was authored, so it belongs
+    # in the config half of the gain.
+    result = {
+        "accepted_kernels": [
+            _spec("ck_gemm_a8w8_blockscale_bpreshuffle", 14.9, kind="env"),
+            _spec("_mxfp8_linear_kernel", 13.9, kind="authored"),
+        ]
+    }
+    assert [geak_spec_name(s) for s in _geak_accepted_kernel_specs(result)] == ["_mxfp8_linear_kernel"]
+
+
+def test_geaks_own_delta_never_decides_whether_a_kernel_counts() -> None:
+    result = {
+        "accepted_kernels": [
+            _spec("regression", -1.2),
+            _spec("flat", 0.0),
+            _spec("unparseable", "not-a-number"),
+            {"short_name": "unstated"},
+            _spec("real", 2.5),
+        ]
+    }
+    assert [geak_spec_name(s) for s in _geak_accepted_kernel_specs(result)] == [
+        "regression",
+        "flat",
+        "unparseable",
+        "unstated",
+        "real",
+    ]
+
+
+def test_two_rows_without_a_stated_delta_are_not_twins() -> None:
+    result = {
+        "accepted_kernels": [
+            {"short_name": "cand_c0_triton", "op_kind": "gemm"},
+            {"short_name": "gemm_kernel", "op_kind": "gemm"},
+        ]
+    }
+    assert [geak_spec_name(s) for s in _geak_accepted_kernel_specs(result)] == ["cand_c0_triton", "gemm_kernel"]
+
+
+def test_unnamed_and_non_dict_rows_are_skipped() -> None:
+    result = {
+        "accepted_kernels": [
+            "bare_string",
+            {"e2e_delta_pct": 9.0},
+            {"short_name": "   ", "e2e_delta_pct": 9.0},
+            _spec("named", 9.0),
+        ]
+    }
+    assert [geak_spec_name(s) for s in _geak_accepted_kernel_specs(result)] == ["named"]
+
+
+def test_alias_twin_collapses_to_the_kernel_symbol() -> None:
+    # One acceptance written under both the candidate tag and the symbol.
+    result = {
+        "accepted_kernels": [_spec("cand_c0_triton", 29.994, op_kind="sparse_attn")],
+        "accepted_heads": [_spec("dsa_sparse_attn_prefill_main_kernel", 29.994, op_kind="sparse_attn")],
+    }
+    specs = _geak_accepted_kernel_specs(result)
+    assert [geak_spec_name(s) for s in specs] == ["dsa_sparse_attn_prefill_main_kernel"]
+
+
+def test_alias_twin_collapse_keeps_the_symbol_when_it_arrives_first() -> None:
+    result = {
+        "accepted_kernels": [
+            _spec("dsa_sparse_attn_prefill_main_kernel", 29.994, op_kind="sparse_attn"),
+            _spec("cand_c0_triton", 29.994, op_kind="sparse_attn"),
+        ]
+    }
+    specs = _geak_accepted_kernel_specs(result)
+    assert [geak_spec_name(s) for s in specs] == ["dsa_sparse_attn_prefill_main_kernel"]
+
+
+def test_same_delta_on_a_different_op_kind_is_not_a_twin() -> None:
+    result = {
+        "accepted_kernels": [
+            _spec("a", 12.31, op_kind="decode_attn"),
+            _spec("b", 12.31, op_kind="prefill_attn"),
+        ]
+    }
+    assert len(_geak_accepted_kernel_specs(result)) == 2
+
+
+# Overlay evidence on malformed manifests
+
+
+def test_manifest_that_is_not_an_object_is_not_loadable(tmp_path: Path) -> None:
+    root = tmp_path / "ov"
+    root.mkdir()
+    (root / "sitecustomize.py").write_text("# loads\n")
+    (root / "_overlay_manifest.json").write_text(json.dumps(["rebinds"]))
+    assert overlay_is_loadable(str(root)) is False
+
+
+def test_unparseable_manifest_still_digests_its_bytes(tmp_path: Path) -> None:
+    # A digest is a comparison key, not a verdict: unreadable JSON must still produce a stable value so two runs of
+    # the same overlay compare equal.
+    root = tmp_path / "ov"
+    root.mkdir()
+    (root / "_overlay_manifest.json").write_text("{not json")
+    digest = _geak_overlay_digest(str(root))
+    assert digest and digest == _geak_overlay_digest(str(root))
+
+
+# The per-kernel ledger row
+
+
+def _phase() -> SimpleNamespace:
+    return SimpleNamespace(shared_state=SimpleNamespace(kernel_integrate_attempts={}, macro_cycle=3))
+
+
+def _record(phase: SimpleNamespace, result: Any, **kw: Any) -> None:
+    KernelPhase.record_geak_adopted_kernels(
+        phase,
+        result,
+        measured_tput=kw.get("measured_tput", 120.0),
+        baseline_tput=kw.get("baseline_tput", 100.0),
+        provenance=kw.get("provenance", "geak_revalidate"),
+        overlay_loaded=kw.get("overlay_loaded", True),
+    )
+
+
+def test_no_ledger_row_without_an_accepted_kernel() -> None:
+    phase = _phase()
+    _record(phase, {"status": "no_gain"})
+    _record(phase, None)
+    assert phase.shared_state.kernel_integrate_attempts == {}
+
+
+def test_single_kernel_with_a_loaded_overlay_is_attributable() -> None:
+    phase = _phase()
+    result = {
+        "accepted_kernels": [_spec("_mxfp8_linear_kernel", 13.87, kind="authored", isolated=2.39)],
+        "alignment_metrics": {"final_basis": "cold"},
+        "baseline_alignment": {"status": "aligned"},
+    }
+    _record(phase, result, measured_tput=120.0, baseline_tput=100.0)
+    entry = phase.shared_state.kernel_integrate_attempts["_mxfp8_linear_kernel"]
+    assert entry["validated"] is True
+    assert entry["best_gain_pct"] == 20.0  # orchestrator rebench, not GEAK's 13.87
+    assert entry["source"] == "geak_e2e"
+    assert entry["basis"] == "cold"
+    assert entry["alignment_status"] == "aligned"
+    assert entry["attempt_count"] == 1
+    attempt = entry["attempts"][0]
+    assert attempt["decision"] == "KEEP"
+    assert attempt["gain_pct"] == 20.0
+    assert attempt["artifact_kind"] == "authored"
+    assert attempt["cycle"] == 3
+
+
+def test_an_unproven_overlay_records_the_row_without_a_gain() -> None:
+    # The kernel is still named -- withholding the row loses it entirely -- but a gain measured without proof the
+    # kernel ran is not the kernel's.
+    phase = _phase()
+    _record(
+        phase,
+        {"accepted_kernels": [_spec("k", 5.0)]},
+        overlay_loaded=False,
+    )
+    entry = phase.shared_state.kernel_integrate_attempts["k"]
+    assert entry["validated"] is False
+    assert entry["best_gain_pct"] is None
+    assert entry["overlay_loaded"] is False
+    assert entry["last_decision"] == "UNATTRIBUTED"
+    assert entry["last_status"] == "unvalidated"
+    assert entry["attempts"][0]["gain_pct"] is None
+    assert entry["attempts"][0]["decision"] == "UNATTRIBUTED"
+
+
+def test_two_kernels_on_one_rebench_share_no_invented_split() -> None:
+    phase = _phase()
+    result = {
+        "accepted_kernels": [_spec("k_one", 5.0), _spec("k_two", 7.0)],
+    }
+    _record(phase, result)
+    ledger = phase.shared_state.kernel_integrate_attempts
+    assert set(ledger) == {"k_one", "k_two"}
+    assert all(e["best_gain_pct"] is None and e["validated"] is False for e in ledger.values())
+
+
+def test_a_missing_measurement_leaves_the_gain_null() -> None:
+    phase = _phase()
+    _record(phase, {"accepted_kernels": [_spec("k", 5.0)]}, measured_tput=0.0)
+    assert phase.shared_state.kernel_integrate_attempts["k"]["best_gain_pct"] is None
+
+
+def test_a_second_promotion_appends_rather_than_replaces() -> None:
+    phase = _phase()
+    result = {"accepted_kernels": [_spec("k", 5.0)]}
+    _record(phase, result)
+    _record(phase, result, measured_tput=150.0)
+    entry = phase.shared_state.kernel_integrate_attempts["k"]
+    assert entry["attempt_count"] == 2
+    assert [a["new_tput"] for a in entry["attempts"]] == [120.0, 150.0]
+    assert entry["best_gain_pct"] == 50.0
+
+
+def test_best_gain_is_the_max_over_attempts_not_the_last_one() -> None:
+    # ``kernel_decisions.py`` writes ``best_gain_pct`` as a max; this writer must agree.
+    phase = _phase()
+    result = {"accepted_kernels": [_spec("k", 5.0)]}
+    _record(phase, result, measured_tput=150.0)  # +50%
+    _record(phase, result, measured_tput=110.0)  # +10%
+    entry = phase.shared_state.kernel_integrate_attempts["k"]
+    assert [a["gain_pct"] for a in entry["attempts"]] == [50.0, 10.0]
+    assert entry["best_gain_pct"] == 50.0
+
+
+def test_an_unattributable_second_attempt_does_not_erase_the_first_gain() -> None:
+    phase = _phase()
+    result = {"accepted_kernels": [_spec("k", 5.0)]}
+    _record(phase, result, measured_tput=150.0)
+    _record(phase, result, measured_tput=150.0, overlay_loaded=False)
+    entry = phase.shared_state.kernel_integrate_attempts["k"]
+    assert entry["attempts"][1]["gain_pct"] is None
+    assert entry["best_gain_pct"] == 50.0
+    assert entry["validated"] is False
+
+
+def test_a_non_dict_ledger_is_left_alone() -> None:
+    phase = SimpleNamespace(shared_state=SimpleNamespace(kernel_integrate_attempts=None, macro_cycle=0))
+    _record(phase, {"accepted_kernels": [_spec("k", 5.0)]})
+    assert phase.shared_state.kernel_integrate_attempts is None
+
+
+def test_a_geak_adoption_reaches_the_kernel_events_integrate_ledger(tmp_path: Path) -> None:
+    """GEAK writes the per-kernel ledger directly, bypassing the integrate queue.
+
+    Without a row of its own the timeline would show a GEAK adoption that no
+    gate ever ruled on, and the basis its gain was measured on would exist
+    nowhere but in ``state.json``.
+    """
+    from hyperloom.inference_optimizer.breakdown.recorder.kernel_event import (
+        ROUTE_GEAK,
+        make_kernel_recorder,
+    )
+    from hyperloom.inference_optimizer.session.sbd_v6 import read_timeline_events
+    from hyperloom.inference_optimizer.session.session_binding import session_scope
+
+    with session_scope(tmp_path):
+        recorder = make_kernel_recorder(macro_cycle=3, route=ROUTE_GEAK)
+        assert recorder is not None
+        recorder.begin(tput_before=100.0)
+        recorder.finish(KernelExit(tput_after=120.0))
+
+        _record(
+            _phase(),
+            {
+                "accepted_kernels": [_spec("_mxfp8_linear_kernel", 13.87, kind="authored", isolated=2.39)],
+                "alignment_metrics": {"final_basis": "cold"},
+                "baseline_alignment": {"status": "aligned"},
+            },
+        )
+
+        events = [event for event in read_timeline_events(tmp_path) if event.get("type") == "kernel"]
+        row = events[0]["ext"]["integrate"][0]
+
+    assert row["integration_id"] == "geak-_mxfp8_linear_kernel"
+    assert row["kernel_id"] == "_mxfp8_linear_kernel"
+    assert row["decision"] == "KEEP"
+    assert row["basis"] == "cold"
+    assert row["alignment_status"] == "aligned"
+    assert row["gain_attributed"] is True
+
+
+def test_an_unattributable_geak_adoption_says_so_on_the_timeline(tmp_path: Path) -> None:
+    """Two kernels on one rebench measured a real gain that is nobody's alone."""
+    from hyperloom.inference_optimizer.breakdown.recorder.kernel_event import (
+        ROUTE_GEAK,
+        make_kernel_recorder,
+    )
+    from hyperloom.inference_optimizer.session.sbd_v6 import read_timeline_events
+    from hyperloom.inference_optimizer.session.session_binding import session_scope
+
+    with session_scope(tmp_path):
+        recorder = make_kernel_recorder(macro_cycle=3, route=ROUTE_GEAK)
+        assert recorder is not None
+        recorder.begin(tput_before=100.0)
+        recorder.finish(KernelExit(tput_after=120.0))
+
+        _record(
+            _phase(),
+            {"accepted_kernels": [_spec("k_one", 5.0), _spec("k_two", 6.0)]},
+        )
+
+        events = [event for event in read_timeline_events(tmp_path) if event.get("type") == "kernel"]
+        rows = {row["kernel_id"]: row for row in events[0]["ext"]["integrate"]}
+
+    assert sorted(rows) == ["k_one", "k_two"]
+    assert all(row["gain_attributed"] is False for row in rows.values())
+    assert all(row["gain_pct"] is None for row in rows.values())
+
+
+def test_a_non_dict_result_records_no_candidate() -> None:
+    phase = SimpleNamespace(
+        shared_state=SimpleNamespace(kernel_integrate_attempts={}, macro_cycle=0),
+        session_dir=None,
+    )
+    # Returns without touching state rather than raising on a malformed payload.
+    KernelPhase._record_geak_candidate(phase, None)
+    assert phase.shared_state.kernel_integrate_attempts == {}

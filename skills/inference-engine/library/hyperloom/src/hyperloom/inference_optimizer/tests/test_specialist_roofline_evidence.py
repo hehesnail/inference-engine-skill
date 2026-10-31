@@ -1,0 +1,239 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""SpecialistPromptInputs.roofline_evidence + ROOFLINE EVIDENCE section tests."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hyperloom.orchestrator.state.shared_state import SharedState
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.specialists.domains import (
+    get_domain,
+)
+from hyperloom.orchestrator.specialists.prompt_inputs import SpecialistPromptInputs
+from hyperloom.orchestrator.prompts.specialist_prompt_builder import (
+    _section_roofline_evidence,
+    build_specialist_prompts,
+)
+
+
+def _make_coord(tmp_path: Path, *, state: SharedState) -> Coordinator:
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = state
+    c.knowledge_plane = None
+    return c
+
+
+@pytest.mark.asyncio
+async def test_warm_specialist_params_injects_roofline_evidence(tmp_path):
+    """``warm_specialist_params`` mirrors ``last_trace_analyze`` into ``params['roofline_evidence']``."""
+    analysis_path = tmp_path / "analysis.md"
+    analysis_path.write_text(
+        "## Executive Summary\n"
+        "| Metric | Value |\n"
+        "|--------|-------|\n"
+        "| Compute % | 32.1% |\n"
+        "| Idle % | 17.5% |\n"
+        "| Exposed Communication % | 41.8% |\n"
+        "| Top Bottleneck Category | rccl_AllReduce (41.8%) |\n",
+        encoding="utf-8",
+    )
+
+    state = SharedState(
+        last_trace_analyze={
+            "analysis_md_text": "FULL ANALYSIS TEXT",
+            "analysis_md_path": str(analysis_path),
+            "roofline_snapshot_id": 3,
+            "hot_kernels_top15": [
+                {
+                    "kernel_id": "k1",
+                    "name": "topk_softmax",
+                    "gpu_pct": 8.4,
+                    "bottleneck": "compute",
+                    "source_file": "/sgl-workspace/aiter/aiter/ops/topk.py",
+                },
+                *[
+                    {
+                        "kernel_id": f"k{i}",
+                        "name": f"kernel_{i}",
+                        "gpu_pct": float(i),
+                        "bottleneck": "compute",
+                        "source_file": "",
+                    }
+                    for i in range(2, 11)
+                ],
+            ],
+        },
+    )
+
+    coord = _make_coord(tmp_path, state=state)
+    params: dict[str, Any] = {"domain": "kernel_switch_specialist"}
+    await coord.specialist_dispatch.warm_specialist_params(params)
+
+    assert "roofline_evidence" in params
+    ev = params["roofline_evidence"]
+    assert ev["analysis_md_path"] == str(analysis_path)
+    assert ev["roofline_snapshot_id"] == 3
+    assert len(ev["hot_kernels_top15"]) == 8
+    assert ev["hot_kernels_top15"][0]["kernel_id"] == "k1"
+    assert ev["executive_summary"]["compute_pct"] == pytest.approx(32.1, rel=0.01)
+    assert ev["executive_summary"]["idle_pct"] == pytest.approx(17.5, rel=0.01)
+    assert ev["executive_summary"]["comm_pct"] == pytest.approx(41.8, rel=0.01)
+    assert ev["executive_summary"]["top_bottleneck"] == "rccl_AllReduce"
+
+
+@pytest.mark.asyncio
+async def test_warm_specialist_params_noop_when_no_snapshot(tmp_path):
+    """No ``last_trace_analyze`` → no ``roofline_evidence`` key."""
+    state = SharedState(last_trace_analyze={})
+    coord = _make_coord(tmp_path, state=state)
+    params: dict[str, Any] = {"domain": "serving_specialist"}
+    await coord.specialist_dispatch.warm_specialist_params(params)
+    assert "roofline_evidence" not in params
+
+
+@pytest.mark.asyncio
+async def test_warm_specialist_params_noop_when_analysis_md_text_empty(tmp_path):
+    """Empty ``analysis_md_text`` is treated as no-snapshot."""
+    state = SharedState(
+        last_trace_analyze={
+            "analysis_md_text": "",
+            "analysis_md_path": "/dev/null",
+        },
+    )
+    coord = _make_coord(tmp_path, state=state)
+    params: dict[str, Any] = {"domain": "kernel_switch_specialist"}
+    await coord.specialist_dispatch.warm_specialist_params(params)
+    assert "roofline_evidence" not in params
+
+
+@pytest.mark.asyncio
+async def test_warm_specialist_params_packs_hot_kernels_without_analysis_md(tmp_path):
+    """Hot kernels with no analysis.md still reach the specialist."""
+    state = SharedState(
+        last_trace_analyze={
+            "analysis_md_text": "",
+            "analysis_md_path": "",
+            "roofline_snapshot_id": 4,
+            "hot_kernels_top15": [
+                {
+                    "kernel_id": "k1",
+                    "name": "aten::_flash_attention_forward",
+                    "gpu_pct": 40.0,
+                    "bottleneck": "compute",
+                    "source_file": "attention.py(243)",
+                },
+            ],
+        },
+    )
+    coord = _make_coord(tmp_path, state=state)
+    params: dict[str, Any] = {"domain": "framework_rewrite_specialist"}
+    await coord.specialist_dispatch.warm_specialist_params(params)
+
+    ev = params["roofline_evidence"]
+    assert ev["roofline_snapshot_id"] == 4
+    assert ev["hot_kernels_top15"][0]["name"] == "aten::_flash_attention_forward"
+    assert ev["executive_summary"] == {}
+
+
+@pytest.mark.asyncio
+async def test_warm_specialist_params_respects_existing_evidence(tmp_path):
+    """A caller-supplied ``roofline_evidence`` is not overwritten (setdefault)."""
+    analysis_path = tmp_path / "analysis.md"
+    analysis_path.write_text("# stub\n", encoding="utf-8")
+    state = SharedState(
+        last_trace_analyze={
+            "analysis_md_text": "stub",
+            "analysis_md_path": str(analysis_path),
+            "roofline_snapshot_id": 1,
+            "hot_kernels_top15": [],
+        },
+    )
+    coord = _make_coord(tmp_path, state=state)
+    params: dict[str, Any] = {
+        "domain": "comm_specialist",
+        "roofline_evidence": {"sentinel": True},
+    }
+    await coord.specialist_dispatch.warm_specialist_params(params)
+    assert params["roofline_evidence"] == {"sentinel": True}
+
+
+def _make_inp(roofline_evidence: dict[str, Any]) -> SpecialistPromptInputs:
+    return SpecialistPromptInputs(
+        domain=get_domain("serving_specialist"),
+        gap_canonical_id="gap.x",
+        roofline_evidence=roofline_evidence,
+    )
+
+
+def test_section_renders_executive_summary_and_hot_kernels():
+    inp = _make_inp(
+        {
+            "analysis_md_path": "/sd/.../analysis.md",
+            "roofline_snapshot_id": 7,
+            "executive_summary": {
+                "compute_pct": 30.0,
+                "idle_pct": 15.0,
+                "comm_pct": 40.0,
+                "memcpy_pct": 9.2,
+                "top_bottleneck": "MoE_fused",
+            },
+            "hot_kernels_top15": [
+                {
+                    "kernel_id": "k1",
+                    "name": "topk",
+                    "gpu_pct": 8.4,
+                    "bottleneck": "compute",
+                    "source_file": "/sgl/foo.py",
+                },
+            ],
+        }
+    )
+    section = _section_roofline_evidence(inp)
+    text = "\n".join(section)
+    assert "## 4a. ROOFLINE EVIDENCE" in text
+    assert "snapshot #7" in text
+    assert "Compute %" in text and "30.0%" in text
+    assert "- Exposed memcpy %: 9.2%" in section
+    assert "MoE_fused" in text
+    assert "k1" in text and "8.40%" in text
+    assert "/sd/.../analysis.md" in text
+
+
+def test_section_renders_none_when_evidence_empty():
+    inp = _make_inp({})
+    section = _section_roofline_evidence(inp)
+    text = "\n".join(section)
+    assert "## 4a. ROOFLINE EVIDENCE" in text
+    assert "(none" in text
+
+
+@pytest.mark.parametrize(
+    ("report", "label"),
+    [("/sd/analysis.md", "Full analysis.md path"), ("/sd/analysis.json", "Full TraceLens report path")],
+)
+def test_section_labels_the_report_by_its_format(report, label):
+    section = _section_roofline_evidence(_make_inp({"analysis_md_path": report}))
+    assert f"**{label}:** `{report}`" in section
+
+
+def test_build_specialist_prompts_inserts_section_between_kb_and_recipe():
+    """build_specialist_prompts inserts section 4a between section 4 (KB) and section 5 (recipe)."""
+    inp = _make_inp(
+        {
+            "analysis_md_path": "/sd/analysis.md",
+            "executive_summary": {"compute_pct": 12.0},
+            "hot_kernels_top15": [],
+        }
+    )
+    _system, user = build_specialist_prompts(inp)
+    kb_idx = user.index("## 4. KB CONTEXT (optional, advisory)")
+    roof_idx = user.index("## 4a. ROOFLINE EVIDENCE")
+    recipe_idx = user.index("## 5. WARM-START RECIPE SUMMARY")
+    assert kb_idx < roof_idx < recipe_idx

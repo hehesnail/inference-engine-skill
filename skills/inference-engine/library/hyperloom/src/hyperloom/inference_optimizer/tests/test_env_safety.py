@@ -1,0 +1,449 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for multi-node SSH env key validation."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from hyperloom.inference_optimizer.multi_node._internal import env_safety
+from hyperloom.common import env_safety as common_env_safety
+
+
+def test_valid_mori_and_sglang_keys_allowed():
+    assert env_safety.is_forward_env_key_allowed("MORI_DISPATCH_FOO")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_USE_AITER")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_TORCH_PROFILER_DIR")
+
+
+def test_invalid_key_shape_rejected():
+    assert not env_safety.is_forward_env_key_allowed("X Y")
+    assert not env_safety.is_forward_env_key_allowed("bad-key")
+
+
+def test_denylist_keys_rejected():
+    """Names in BLOCKED_UNTRUSTED_ENV_NAMES are blocked (loader/python/PATH/shell vectors)."""
+    assert not env_safety.is_forward_env_key_allowed("LD_PRELOAD")
+    assert not env_safety.is_forward_env_key_allowed("PYTHONPATH")
+    assert not env_safety.is_forward_env_key_allowed("PATH")
+    assert not env_safety.is_forward_env_key_allowed("IFS")
+
+
+def test_non_denylist_tuning_keys_pass_shape_gate():
+    """Keys outside BLOCKED_UNTRUSTED_ENV_NAMES pass the forward gate when shape is valid."""
+    assert env_safety.is_forward_env_key_allowed("NCCL_IB_HCA")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_USE_AITER")
+
+
+def test_filter_forward_env_drops_bad_keys():
+    out = env_safety.filter_forward_env(
+        {
+            "MORI_FOO": "1",
+            "LD_PRELOAD": "/evil.so",
+            "X Y": "nope",
+        },
+    )
+    assert out == {"MORI_FOO": "1"}
+
+
+def test_assert_forward_env_keys_raises():
+    with pytest.raises(ValueError, match="disallowed SSH forward env keys"):
+        env_safety.assert_forward_env_keys({"LD_PRELOAD": "/tmp/x.so"})
+
+
+def test_common_env_safety_filters_dotenv_and_kernel_agent_keys_only():
+    assert common_env_safety.is_allowed_dotenv_key("OPENAI_API_KEY")
+    assert common_env_safety.is_allowed_dotenv_key("HF_TOKEN")
+    assert common_env_safety.is_allowed_dotenv_key("HTTPS_PROXY")
+    assert common_env_safety.is_allowed_dotenv_key("HYPERLOOM_RUNTIME_DIR")
+    # hyperloom-setup writes the gateway auth headers into .env, so the .env loader must read them back instead of
+    # dropping them as unsupported.
+    assert common_env_safety.is_allowed_dotenv_key("ANTHROPIC_CUSTOM_HEADERS")
+    assert common_env_safety.is_allowed_dotenv_key("OPENAI_CUSTOM_HEADERS")
+    assert not common_env_safety.is_allowed_dotenv_key("PYTHONPATH")
+    assert not common_env_safety.is_allowed_dotenv_key("BAD-NAME")
+
+    assert common_env_safety.is_allowed_kernel_agent_env_key("TRACELENS_ROOT")
+    # install.sh persists the Anthropic header into kernel-agent.env.sh, so the reader must accept it; the OpenAI one
+    # is read on the same terms as the OpenAI URL and key already are.
+    assert common_env_safety.is_allowed_kernel_agent_env_key("ANTHROPIC_CUSTOM_HEADERS")
+    assert common_env_safety.is_allowed_kernel_agent_env_key("OPENAI_CUSTOM_HEADERS")
+    assert common_env_safety.is_allowed_kernel_agent_env_key("HYPERLOOM_SPECIALIST_INHERIT_SECRET_ENV")
+    assert common_env_safety.is_allowed_kernel_agent_env_key("INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS")
+    assert not common_env_safety.is_allowed_kernel_agent_env_key("TRACELENS_TOKEN")
+
+    allowed, dropped = common_env_safety.filter_untrusted_env_mapping(
+        {
+            "bench_foo": 1,
+            "custom_tuning_knob": "enabled",
+            "ANTHROPIC_API_KEY": "anthropic-secret",
+            "LD_PRELOAD": "/tmp/agent-provided.so",
+            "OPENAI_API_KEY": "secret",
+            "PYTHONPATH": "/tmp/agent-provided",
+            "bad key": "nope",
+            "": "empty",
+        },
+        allow_predicate=common_env_safety.valid_env_key,
+    )
+    assert allowed == {
+        "bench_foo": "1",
+        "custom_tuning_knob": "enabled",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "LD_PRELOAD": "/tmp/agent-provided.so",
+        "OPENAI_API_KEY": "secret",
+        "PYTHONPATH": "/tmp/agent-provided",
+    }
+    assert dropped == {
+        "bad key": "invalid_env_key",
+        "<empty>": "invalid_env_key",
+    }
+
+    env = {"LD_PRELOAD": "evil.so", "PATH": "/bin", "SAFE": "1"}
+    assert common_env_safety.scrub_child_process_env(env) is env
+    assert env == {"PATH": "/bin", "SAFE": "1"}
+
+
+def test_scrub_benchmark_process_env_removes_control_plane_credentials():
+    env = {
+        "AMD_API_KEY": "amd-secret",
+        "AMD_LLM_API_KEY": "amd-llm-secret",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "LLM_GATEWAY_KEY": "gateway-secret",
+        "LLM_PROXY_API_KEY": "proxy-secret",
+        "OPENAI_API_KEY": "openai-secret",
+        "SAFE_API_KEY": "safe-secret",
+        "KB_STORE_TOKEN": "kb-secret",
+        "INFERENCE_OPTIMIZER_EXTRA_ENV": '{"KB_STORE_TOKEN": "kb-secret", "VLLM_ROCM_USE_AITER": "1"}',
+        "VLLM_ROCM_USE_AITER": "1",
+        "HF_TOKEN": "model-download-token",
+        "PATH": "/bin",
+        "RUN_EVAL": "true",
+    }
+
+    assert common_env_safety.scrub_benchmark_process_env(env) is env
+    assert env == {
+        "VLLM_ROCM_USE_AITER": "1",
+        "HF_TOKEN": "model-download-token",
+        "PATH": "/bin",
+        "RUN_EVAL": "true",
+    }
+
+
+_HOSTED_CREDENTIALS = (
+    "HYPERLOOM_MCP_TOKEN",
+    "HYPERLOOM_SANDBOX_KEY_DEV",
+    "HYPERLOOM_SANDBOX_KEY_MEASUREMENT",
+    "HYPERLOOM_SANDBOX_KEY_SUBRUN",
+    "HYPERLOOM_SIGNING_KEY_FILE",
+)
+
+
+@pytest.mark.parametrize("name", _HOSTED_CREDENTIALS)
+def test_a_hosted_measurement_credential_never_reaches_a_child_a_variant_or_a_record(name):
+    env = {name: "credential", "PATH": "/bin", "HYPERLOOM_RUN_MODE": "hosted"}
+
+    assert common_env_safety.scrub_benchmark_process_env(env) == {"PATH": "/bin", "HYPERLOOM_RUN_MODE": "hosted"}
+    assert not common_env_safety.is_allowed_variant_env_key(name)
+    assert not common_env_safety.is_allowed_external_env_key(name)
+    assert common_env_safety.redact_secret_env_values({name: "credential"}) == {name: "[REDACTED]"}
+
+
+def test_redact_secret_env_values_masks_credentials_and_keeps_knobs():
+    env = {
+        "OPENAI_API_KEY": "plaintext",
+        "ANTHROPIC_AUTH_TOKEN": "plaintext",
+        # Allowed into a benchmark subprocess, but still a credential once the record leaves the process.
+        "HF_TOKEN": "plaintext",
+        # Listed by name only: neither carries a credential-shaped fragment.
+        "AWS_ACCESS_KEY_ID": "plaintext",
+        "ANTHROPIC_CUSTOM_HEADERS": "plaintext",
+        "TOKENIZERS_PARALLELISM": "false",
+        "DURATION": "3600",
+    }
+
+    assert common_env_safety.redact_secret_env_values(env) == {
+        "OPENAI_API_KEY": "[REDACTED]",
+        "ANTHROPIC_AUTH_TOKEN": "[REDACTED]",
+        "HF_TOKEN": "[REDACTED]",
+        "AWS_ACCESS_KEY_ID": "[REDACTED]",
+        "ANTHROPIC_CUSTOM_HEADERS": "[REDACTED]",
+        "TOKENIZERS_PARALLELISM": "false",
+        "DURATION": "3600",
+    }
+    assert env["OPENAI_API_KEY"] == "plaintext"
+    assert common_env_safety.redact_secret_env_values(None) == {}
+
+
+def test_redact_secret_env_values_keeps_token_count_knobs_visible():
+    # TOKEN is a credential only as a whole name segment, and never as PER_TOKEN.
+    knobs = {
+        "SGLANG_USE_AITER_FP8_PER_TOKEN": "1",
+        "AITER_PER_TOKEN_2": "1",
+        "MAX_NUM_BATCHED_TOKENS": "8192",
+        "VLLM_MAX_NUM_BATCHED_TOKENS": "8192",
+        "SGLANG_MAX_PREFILL_TOKENS": "16384",
+        "SGLANG_USE_AITER_PER_TOKEN_GROUP_QUANT": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "TOKENIZER_MODE": "auto",
+    }
+
+    assert common_env_safety.redact_secret_env_values(knobs) == knobs
+
+
+def test_redact_secret_env_values_masks_every_langfuse_marker_and_scrubs_kept_values():
+    env = {
+        "HF_TOKEN": "plaintext",
+        "GITHUB_TOKEN": "plaintext",
+        "HUGGING_FACE_HUB_TOKEN": "plaintext",
+        "SERVICE_TOKEN_2": "plaintext",
+        "HF_TOKEN_BACKUP": "plaintext",
+        "PER_TOKEN_SCALE_TOKEN": "plaintext",
+        "TOKEN": "plaintext",
+        "TOKENIZER_API_KEY": "plaintext",
+        "MY_SERVICE_API_KEY": "plaintext",
+        "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=plaintext",
+        "SGLANG_CUSTOM_HEADERS": "plaintext",
+        "SSH_PRIVATE_KEY": "plaintext",
+        "MINIO_ACCESS_KEY": "plaintext",
+        "AWS_SECRET_KEY": "plaintext",
+        "BASIC_AUTH": "plaintext",
+        "REQUEST_SIGNATURE": "plaintext",
+        "GPG_PASSPHRASE": "plaintext",
+        "DB_PASSWD": "plaintext",
+        # Kept by name, but a recognizable credential inside the value is still masked.
+        "EXTRA_ARGS": "--header Bearer abcdefghijklmnop",
+        "WORKERS": 4,
+    }
+
+    redacted = common_env_safety.redact_secret_env_values(env)
+
+    for name in env:
+        if name not in {"EXTRA_ARGS", "WORKERS"}:
+            assert redacted[name] == "[REDACTED]", name
+    assert redacted["EXTRA_ARGS"] == "--header Bearer [REDACTED]"
+    assert redacted["WORKERS"] == 4
+
+
+def test_langfuse_redact_env_markers_are_the_shared_list():
+    from hyperloom.inference_optimizer.trace import langfuse_mapping
+
+    # The Langfuse snapshot keeps its wider substring match.
+    assert langfuse_mapping.redact_env({"MAX_NUM_BATCHED_TOKENS": "8192"}) == {
+        "MAX_NUM_BATCHED_TOKENS": "***redacted***"
+    }
+
+
+def test_variant_env_key_allows_workload_pins_and_blocks_hijacks():
+    # Sweep, conc-sweep and shape-capture grids set these from code, so an allowlist that dropped them would silently
+    # flatten every variant.
+    for pinned in ("CONC", "ISL", "OSL", "NUM_PROMPTS", "RUN_EVAL", "PORT", "TP", "MAX_MODEL_LEN"):
+        assert common_env_safety.is_allowed_variant_env_key(pinned)
+    for knob in ("SGLANG_USE_AITER", "VLLM_USE_MTP", "AITER_CONFIG_GEMM_A8W8", "PYTORCH_TUNABLEOP_ENABLED"):
+        assert common_env_safety.is_allowed_variant_env_key(knob)
+    # Name-shape matching would read this as a credential; it is the private model download token and has to survive.
+    assert common_env_safety.is_allowed_variant_env_key("HF_TOKEN")
+
+    for hijack in ("LD_PRELOAD", "PATH", "PYTHONPATH", "BASH_ENV", "LD_AUDIT", "PYTHONSTARTUP"):
+        assert not common_env_safety.is_allowed_variant_env_key(hijack)
+    for secret in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LLM_GATEWAY_KEY"):
+        assert not common_env_safety.is_allowed_variant_env_key(secret)
+    assert not common_env_safety.is_allowed_variant_env_key("bad key")
+    assert not common_env_safety.is_allowed_variant_env_key("")
+
+
+def test_build_benchmark_env_layers_over_parent_and_normalizes(monkeypatch):
+    monkeypatch.setenv("INHERITED_KNOB", "from-parent")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-benchmark")
+    monkeypatch.setenv("SGLANG_USE_AITER", "0")
+
+    env = common_env_safety.build_benchmark_env(
+        {"SGLANG_USE_AITER": "1", "TP": 8, "RANDOM_RANGE_RATIO": 0.8},
+        None,
+        {"TP": 4, "lowercase_knob": "on"},
+    )
+
+    assert env["INHERITED_KNOB"] == "from-parent"
+    assert env["SGLANG_USE_AITER"] == "1"
+    assert env["TP"] == "4"
+    assert env["RANDOM_RANGE_RATIO"] == "0.8"
+    # Env names are conventionally upper case; a lower-case key would be inert.
+    assert env["LOWERCASE_KNOB"] == "on"
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_redact_secret_values_masks_assignments_and_bearer_tokens():
+    text = "OPENAI_API_KEY=ak-sensitive-value Authorization: Bearer sensitive-token"
+
+    redacted = common_env_safety.redact_secret_values(text)
+
+    assert "sensitive-value" not in redacted
+    assert "sensitive-token" not in redacted
+    assert redacted.count("[REDACTED]") == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Authorization: abcdef1234567890",
+        "authorization: Basic YWJjOmRlZg==",
+        "Authorization: Token abc123def456",
+        "Authorization: AWS4-HMAC-SHA256 Credential=EXAMPLEEXAMPLE",
+        "AUTH_KEY=supersecret",
+        "AUTHORIZATION=supersecretvalue",
+        "X_AUTHORIZATION=supersecretvalue",
+        "PROXY_AUTHORIZATION: abc12345678",
+    ),
+)
+def test_redact_secret_values_masks_authorization_forms(text):
+    """Authorization headers and AUTH assignments are masked."""
+    redacted = common_env_safety.redact_secret_values(text)
+
+    assert redacted.endswith("[REDACTED]")
+
+
+def test_redact_secret_values_preserves_json_around_authorization():
+    """Authorization redaction must stop at the enclosing JSON quote."""
+    text = '{"header": "Authorization: Basic YWJjOmRlZg==", "ok": true}'
+
+    out = common_env_safety.redact_secret_values(text)
+
+    assert json.loads(out) == {"header": "Authorization: Basic [REDACTED]", "ok": True}
+
+
+def test_redact_secret_values_masks_custom_header_subscription_key():
+    out = common_env_safety.redact_secret_values("ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: deadbeefsecret")
+    assert "deadbeefsecret" not in out
+    assert "[REDACTED]" in out
+
+
+def test_redact_secret_values_spares_unauthorized_status_text():
+    """AUTH is a suffix, so HTTP Unauthorized text is not an assignment."""
+    text = "401 Unauthorized: invalid API key"
+
+    assert common_env_safety.redact_secret_values(text) == text
+
+
+def test_redact_secret_values_masks_base64_bearer_token():
+    """Bearer token characters include the standard base64 alphabet."""
+    out = common_env_safety.redact_secret_values("Bearer abc+def/ghi=jkl")
+
+    assert out == "Bearer [REDACTED]"
+
+
+def test_redact_secret_values_masks_short_legacy_github_token_shape():
+    """Legacy runner coverage masks gh-prefixed token-shaped values."""
+    assert common_env_safety.redact_secret_values("ghp_abc") == "ghp_[REDACTED]"
+
+
+def test_redact_secret_values_masks_quoted_assignments():
+    """A quoted value is the common shape: shells quote it, json.dumps escapes it."""
+    double = common_env_safety.redact_secret_values('export MYAPP_PASSWORD="hunter2"')
+    single = common_env_safety.redact_secret_values("export MYAPP_PASSWORD='hunter2'")
+    escaped = common_env_safety.redact_secret_values('{"command": "export MYAPP_PASSWORD=\\"hunter2\\""}')
+
+    assert double == 'export MYAPP_PASSWORD="[REDACTED]"'
+    assert single == "export MYAPP_PASSWORD='[REDACTED]'"
+    assert escaped == '{"command": "export MYAPP_PASSWORD=\\"[REDACTED]\\""}'
+    assert common_env_safety.redact_secret_values(r"PASSWORD=C:\foo\bar") == "PASSWORD=[REDACTED]"
+
+
+def test_redact_secret_values_spares_tokenizer_and_max_tokens():
+    """TOKEN as a name fragment must not mask workload knobs in an optimizer."""
+    for text in (
+        '--tokenizer="/models/x"',
+        "--tokenizer=/models/x",
+        "HYPERLOOM_EVAL_BOUNDS max_tokens=4096 stop=[</s>]",
+        '--max-tokens="4096"',
+        "num_speculative_tokens=5",
+        "TOKENIZERS_PARALLELISM=false",
+        "eos_string=</s>,max_retries=5,tokenized_requests=False,max_length=13312",
+        "HYPERLOOM_EVAL_BOUNDS max_tokens=4096 stop_token_ids=[154820, 154827, 154829]",
+        "token_budget=128",
+        "tokens_per_second=12.3",
+    ):
+        assert common_env_safety.redact_secret_values(text) == text
+
+    still_secret = common_env_safety.redact_secret_values(
+        'HF_TOKEN=abc HF_TOKEN_2=def ANTHROPIC_AUTH_TOKEN="tok-abcdef" api_key=real-secret'
+    )
+    assert "abc" not in still_secret
+    assert "def" not in still_secret
+    assert "tok-abcdef" not in still_secret
+    assert "real-secret" not in still_secret
+    assert still_secret.count("[REDACTED]") == 4
+
+
+def test_redact_secret_values_masks_aws_key_and_jwt_shapes():
+    """AWS access-key ids and compact JWTs are masked by shape, not by assignment."""
+    access_id = "AKIA" + "IOSFODNN7EXAMPLE"
+    jwt = "eyJ" + "hbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxIn0." + "aaaaaaaaaa"
+    text = f"aws --secret-key {access_id} Authorization: {jwt}"
+
+    redacted = common_env_safety.redact_secret_values(text)
+
+    assert access_id not in redacted
+    assert jwt not in redacted
+    assert redacted.count("[REDACTED]") == 2
+
+
+def test_redact_secret_values_masks_custom_headers_assignment():
+    text = "ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: deadbeefsecret"
+    out = common_env_safety.redact_secret_values(text)
+    assert "deadbeefsecret" not in out
+    assert "ANTHROPIC_CUSTOM_HEADERS=" in out
+
+
+def test_redact_secret_values_preserves_json_around_custom_headers():
+    """A custom-header assignment must not consume adjacent JSON fields."""
+    text = '{"a": ["OPENAI_CUSTOM_HEADERS=h"], "b": "run with FOO=1"}'
+
+    out = common_env_safety.redact_secret_values(text)
+
+    assert json.loads(out) == {"a": ["OPENAI_CUSTOM_HEADERS=[REDACTED]"], "b": "run with FOO=1"}
+
+
+def test_redact_secret_values_masks_spaced_custom_header_before_newline():
+    """A custom-header value containing a space is masked on non-final lines."""
+    text = "ANTHROPIC_CUSTOM_HEADERS=x-key: deadbeefsecret\nnext line\n"
+
+    out = common_env_safety.redact_secret_values(text)
+
+    assert "deadbeefsecret" not in out
+    assert out.endswith("next line\n")
+
+
+def test_redact_secret_values_masks_every_custom_header():
+    """Comma-separated custom headers are redacted as one bounded value."""
+    text = "ANTHROPIC_CUSTOM_HEADERS=k1: v1,k2: secret2"
+
+    assert common_env_safety.redact_secret_values(text) == "ANTHROPIC_CUSTOM_HEADERS=[REDACTED]"
+
+
+def test_redact_secret_values_preserves_json_around_ocp_header():
+    """OCP header redaction stops at the enclosing JSON delimiters."""
+    text = '{"h":"Ocp-Apim-Subscription-Key: deadbeefsecret", "ok":true}'
+
+    out = common_env_safety.redact_secret_values(text)
+
+    assert json.loads(out) == {"h": "Ocp-Apim-Subscription-Key: [REDACTED]", "ok": True}
+
+
+def test_any_custom_headers_name_is_secret_shaped():
+    """A generic ``*_CUSTOM_HEADERS`` name carries header credentials, like the text-redaction pattern assumes."""
+    assert common_env_safety.is_secret_shaped_env_name("SERVICE_CUSTOM_HEADERS")
+    assert common_env_safety.is_secret_shaped_env_name("service_custom_headers")
+    assert not common_env_safety.is_secret_shaped_env_name("TOKENIZERS_PARALLELISM")
+
+
+def test_launch_provided_names_cover_the_rank_topology_and_the_schedulers():
+    """Names the launch assigns per process, by name and by the prefixes a scheduler exports."""
+    assert common_env_safety.is_launch_provided_env_name("LOCAL_RANK")
+    assert common_env_safety.is_launch_provided_env_name("world_size")
+    assert common_env_safety.is_launch_provided_env_name("SLURM_PROCID")
+    assert common_env_safety.is_launch_provided_env_name("TORCHELASTIC_RUN_ID")
+    assert not common_env_safety.is_launch_provided_env_name("HL_FUSE_RMSNORM")
+    assert not common_env_safety.is_launch_provided_env_name("")

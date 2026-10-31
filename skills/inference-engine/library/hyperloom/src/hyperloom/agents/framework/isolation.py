@@ -1,0 +1,203 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Per-candidate isolation primitives — git worktree + venv lifecycle."""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import site
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from hyperloom_common.env import env_float
+from hyperloom_common.git_safety import safe_directory_args
+
+from .models import Candidate
+
+log = logging.getLogger(__name__)
+
+
+_DISK_MIN_GB_ENV = "FRAMEWORK_EXPLORER_DISK_MIN_GB"
+_DEFAULT_DISK_MIN_GB = 20.0
+# Per-candidate disk budget (worktree + venv + build headroom).
+PER_CANDIDATE_GB = 1.5
+# Sorts after the .pth files pip writes, so a package installed into the venv, editable or not, shadows the
+# interpreter's copy.
+_INHERITED_SITE_PTH = "zz-inherited-site-packages.pth"
+
+
+class DiskPreflightError(RuntimeError):
+    """Raised when the work_dir mount lacks the required free GB."""
+
+
+@dataclass
+class WorkspacePaths:
+    """Resolved per-candidate workspace layout returned by prepare_candidate_workspace."""
+
+    worktree_dir: Path
+    venv_dir: Path
+
+
+# Subprocess helpers
+def _run_subprocess(args: list[str], *, cwd: Path | None = None, timeout_sec: int = 1800) -> None:
+    """Run a subprocess with a timeout; raise CalledProcessError on non-zero."""
+    log.debug("subprocess %s cwd=%s timeout=%ds", " ".join(args[:4]), cwd, timeout_sec)
+    subprocess.run(args, cwd=str(cwd) if cwd else None, check=True, timeout=timeout_sec)
+
+
+def _run_git(args: list[str], *, cwd: Path | None = None, timeout_sec: int = 1800) -> None:
+    """Run a git command with a timeout; thin wrapper over :func:`_run_subprocess`."""
+    executable, *rest = args
+    _run_subprocess([executable, *safe_directory_args(rest, cwd=cwd)], cwd=cwd, timeout_sec=timeout_sec)
+
+
+# Disk preflight
+def disk_preflight(
+    work_dir: Path,
+    n_candidates: int,
+    *,
+    per_candidate_gb: float = PER_CANDIDATE_GB,
+) -> None:
+    """Refuse to start if the work_dir mount lacks enough free space."""
+    floor_gb = env_float(_DISK_MIN_GB_ENV, _DEFAULT_DISK_MIN_GB)
+    required_gb = max(floor_gb, float(n_candidates) * per_candidate_gb)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(str(work_dir))
+    free_gb = usage.free / (1024**3)
+    log.info(
+        "disk_preflight: work_dir=%s free=%.1fGB required=%.1fGB (n=%d, floor=%.1fGB, per_cand=%.1fGB)",
+        work_dir,
+        free_gb,
+        required_gb,
+        n_candidates,
+        floor_gb,
+        per_candidate_gb,
+    )
+    if free_gb < required_gb:
+        raise DiskPreflightError(
+            f"insufficient disk on {work_dir}: free={free_gb:.1f}GB, "
+            f"required={required_gb:.1f}GB "
+            f"(n_candidates={n_candidates}, per_cand={per_candidate_gb}GB, "
+            f"floor={floor_gb}GB). "
+            f"Free space or lower max_search_candidates / set "
+            f"{_DISK_MIN_GB_ENV} to a smaller value."
+        )
+
+
+# Repo cache (mirror clone)
+def _repo_cache_dir(repo_url: str, work_dir: Path) -> Path:
+    """Stable per-repo cache directory under work_dir/_repos."""
+    safe = "".join(ch if ch.isalnum() else "-" for ch in repo_url.lower()).strip("-")
+    return work_dir / "_repos" / (safe or "repo")
+
+
+def prepare_repo_cache(repo_url: str, work_dir: Path) -> Path:
+    """Mirror-clone the repo into the cache dir; fetch when already present."""
+    repo_dir = _repo_cache_dir(repo_url, work_dir)
+    if repo_dir.exists():
+        log.debug("prepare_repo_cache: fetching existing mirror at %s", repo_dir)
+        _run_git(["git", "fetch", "--all", "--tags", "--prune"], cwd=repo_dir)
+        return repo_dir
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    log.info("prepare_repo_cache: cloning --mirror %s -> %s", repo_url, repo_dir)
+    _run_git(["git", "clone", "--mirror", repo_url, str(repo_dir)])
+    return repo_dir
+
+
+def checkout_ref(ref: str) -> str:
+    """Return the git ref a candidate ref checks out: ``PR:N`` is the PR's head, anything else is itself."""
+    if ref.startswith("PR:"):
+        number = ref.split(":", 1)[1]
+        return f"refs/pull/{number}/head"
+    return ref
+
+
+def _fetch_candidate_ref(repo_dir: Path, candidate: Candidate) -> None:
+    """Pre-fetch a PR candidate's head into the cache mirror."""
+    if not candidate.ref.startswith("PR:"):
+        return
+    number = candidate.ref.split(":", 1)[1]
+    _run_git(
+        [
+            "git",
+            "fetch",
+            "origin",
+            f"refs/pull/{number}/head:refs/pull/{number}/head",
+        ],
+        cwd=repo_dir,
+    )
+
+
+def create_venv(venv_dir: Path) -> None:
+    """Create a fresh venv at ``venv_dir`` that also sees this interpreter's packages, replacing any existing one.
+
+    ``--system-site-packages`` reaches only the base installation, so when this
+    interpreter is itself a venv its packages -- the image's ROCm torch among
+    them -- would be missing and pip would fetch replacements. Its site
+    directories are appended through a ``.pth`` instead, as site directories:
+    eggs and editable installs reach ``sys.path`` only through the ``.pth``
+    files inside them.
+    """
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+    log.info("create_venv: %s", venv_dir)
+    _run_subprocess([sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)], timeout_sec=600)
+    purelib = venv_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    adds = "".join(f"; site.addsitedir({d!r})" for d in site.getsitepackages())
+    (purelib / _INHERITED_SITE_PTH).write_text(f"import site{adds}\n", encoding="utf-8")
+
+
+# Per-candidate workspace lifecycle
+def prepare_candidate_workspace(
+    candidate: Candidate,
+    *,
+    repo_url: str,
+    work_dir: Path,
+    index: int,
+) -> WorkspacePaths:
+    """Materialise ``candidate_dir`` + worktree + venv for a candidate."""
+    candidate_dir = work_dir / "candidates" / f"{index:02d}_{candidate.slug}"
+    worktree_dir = candidate_dir / "worktree"
+    venv_dir = candidate_dir / "venv"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_dir = prepare_repo_cache(repo_url, work_dir)
+    _fetch_candidate_ref(repo_dir, candidate)
+    if worktree_dir.exists():
+        shutil.rmtree(worktree_dir)
+    log.info(
+        "prepare_candidate_workspace[%02d] %s: worktree -> %s",
+        index,
+        candidate.ref,
+        worktree_dir,
+    )
+    _run_git(
+        [
+            "git",
+            "--git-dir",
+            str(repo_dir),
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree_dir),
+            checkout_ref(candidate.ref),
+        ]
+    )
+    create_venv(venv_dir)
+    return WorkspacePaths(worktree_dir, venv_dir)
+
+
+__all__ = [
+    "DiskPreflightError",
+    "PER_CANDIDATE_GB",
+    "WorkspacePaths",
+    "checkout_ref",
+    "create_venv",
+    "disk_preflight",
+    "prepare_candidate_workspace",
+    "prepare_repo_cache",
+]

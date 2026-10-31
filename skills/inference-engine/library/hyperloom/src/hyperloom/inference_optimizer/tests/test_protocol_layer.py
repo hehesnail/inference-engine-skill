@@ -1,0 +1,361 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Protocol-layer tests (intent envelope, MessageBus, SqliteLeaseBackend, TaskRegistry, CursorStore)."""
+
+from __future__ import annotations
+
+import pytest
+
+from hyperloom.orchestrator.bus.cursor_store import CursorStore
+from hyperloom.inference_optimizer.protocol.intent import (
+    IntentType,
+    IntentValidationError,
+    validate_envelope,
+)
+from hyperloom.orchestrator.bus.message_bus import (
+    TOPIC_ALLOWLIST,
+    Message,
+    MessageBus,
+)
+from hyperloom.orchestrator.bus.resource_lock import (
+    KNOWN_LANES,
+    LANE_CONFLICTS,
+    SqliteLeaseBackend,
+)
+from hyperloom.orchestrator.state.task_registry import (
+    IllegalTransition,
+    TASK_STATES,
+    TERMINAL_STATES,
+    TaskRegistry,
+    TaskSpec,
+)
+from hyperloom.orchestrator.bus.storage.connection import SqliteConnection
+
+
+@pytest.fixture
+def db(tmp_path) -> SqliteConnection:
+    sc = SqliteConnection(tmp_path / "p0_1.db")
+    yield sc
+    sc.close()
+
+
+# intent_parser
+def test_intent_type_v06_includes_review_verdict():
+    assert IntentType.REVIEW_VERDICT.value == "review_verdict"
+
+
+def test_intent_type_no_objection_or_vote():
+    """Parliament intent types are removed entirely."""
+    values = {t.value for t in IntentType}
+    assert "objection" not in values
+    assert "vote" not in values
+
+
+def test_validate_envelope_minimal_ok():
+    envelope = {"intents": [{"intent_type": "send_message", "payload": {"topic": "observation"}}]}
+    intents = validate_envelope(envelope)
+    assert len(intents) == 1
+    assert intents[0].type == IntentType.SEND_MESSAGE
+
+
+def test_validate_envelope_review_verdict_payload():
+    envelope = {
+        "intents": [
+            {
+                "intent_type": "review_verdict",
+                "payload": {
+                    "target_proposal_msg_id": "abc123",
+                    "verdict": "approve",
+                    "reasoning": "matches KB entry kb-7",
+                },
+            }
+        ]
+    }
+    intents = validate_envelope(envelope)
+    assert intents[0].type == IntentType.REVIEW_VERDICT
+    assert intents[0].payload["verdict"] == "approve"
+
+
+def test_validate_envelope_review_verdict_missing_required_rejected():
+    envelope = {"intents": [{"intent_type": "review_verdict", "payload": {"verdict": "approve"}}]}
+    with pytest.raises(IntentValidationError, match="target_proposal_msg_id"):
+        validate_envelope(envelope)
+
+
+def test_validate_envelope_unknown_intent_rejected():
+    envelope = {"intents": [{"intent_type": "objection", "payload": {}}]}
+    with pytest.raises(IntentValidationError, match="not in allowed set"):
+        validate_envelope(envelope)
+
+
+def test_validate_envelope_propose_action_requires_predicted_gain():
+    envelope = {"intents": [{"intent_type": "propose_action", "payload": {"action_name": "baseline"}}]}
+    with pytest.raises(IntentValidationError, match="predicted_gain_pct"):
+        validate_envelope(envelope)
+
+
+# message_bus
+def test_topic_allowlist_v06_changes():
+    """review_verdict is allowed while objection/vote/parliament topics are removed."""
+    assert "review_verdict" in TOPIC_ALLOWLIST
+    assert "advice" in TOPIC_ALLOWLIST
+    assert "objection" not in TOPIC_ALLOWLIST
+    assert "vote" not in TOPIC_ALLOWLIST
+    assert "parliament_open" not in TOPIC_ALLOWLIST
+
+
+@pytest.mark.asyncio
+async def test_message_bus_append_assigns_seq(db):
+    bus = MessageBus(db)
+    msg = Message.new("Orchestration", "Kernel", "request", {"target_agent": "kernel_agent", "kind": "trace_analyze"})
+    seq = await bus.append_and_seq(msg)
+    assert seq >= 1
+    assert msg.seq == seq
+
+
+@pytest.mark.asyncio
+async def test_message_bus_unknown_topic_rejected(db):
+    bus = MessageBus(db)
+    msg = Message.new("Orchestration", "Kernel", "not_a_real_topic", {})
+    with pytest.raises(ValueError, match="unknown topic"):
+        await bus.append_and_seq(msg)
+
+
+@pytest.mark.asyncio
+async def test_message_bus_tail_filters_by_to_agent_with_broadcast(db):
+    bus = MessageBus(db)
+    await bus.append_and_seq(
+        Message.new("Critic", "Orchestration", "review_verdict", {"target_proposal_msg_id": "p1", "verdict": "approve"})
+    )
+    await bus.append_and_seq(Message.new("Robustness", "*", "alert", {"severity": "high", "summary": "stall"}))
+    await bus.append_and_seq(
+        Message.new("Critic", "Kernel", "review_verdict", {"target_proposal_msg_id": "p2", "verdict": "reject"})
+    )
+    msgs = await bus.tail(to_agent="Orchestration")
+    topics = {(m.from_agent, m.to_agent) for m in msgs}
+    assert ("Critic", "Orchestration") in topics
+    assert ("Robustness", "*") in topics
+    assert ("Critic", "Kernel") not in topics
+
+
+@pytest.mark.asyncio
+async def test_message_bus_replay_for_returns_ascending(db):
+    bus = MessageBus(db)
+    seqs = []
+    for topic in ("observation", "event", "decision"):
+        s = await bus.append_and_seq(Message.new("critic", "orchestration", topic, {}))
+        seqs.append(s)
+    msgs = await bus.replay_for("orchestration", after_seq=0)
+    assert [m.seq for m in msgs] == sorted(seqs)
+
+
+# resource_lock
+def test_known_lanes_v08_includes_research_lane():
+    """The lane set includes ``research_lane`` and ``gpu_research_lane`` while preserving the serving lanes."""
+    assert set(KNOWN_LANES) == {
+        "server_lifecycle",
+        "workspace_mutation",
+        "benchmark_lane",
+        "profile_lane",
+        "research_lane",
+        "gpu_research_lane",
+        "build_lane",
+    }
+
+
+def test_research_lane_has_no_conflicts():
+    """Inv-7.2: research_lane is conflict-free vs. the serving lanes."""
+    assert LANE_CONFLICTS["research_lane"] == frozenset()
+    for lane, conflicts in LANE_CONFLICTS.items():
+        assert "research_lane" not in conflicts, (
+            f"lane={lane!r} unexpectedly lists research_lane as a "
+            f"conflict (Inv-7.2 says research_lane is conflict-free)"
+        )
+
+
+def test_lane_conflicts_symmetric_for_bench_profile_server():
+    assert "profile_lane" in LANE_CONFLICTS["benchmark_lane"]
+    assert "benchmark_lane" in LANE_CONFLICTS["profile_lane"]
+    assert "server_lifecycle" in LANE_CONFLICTS["benchmark_lane"]
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_acquire_release(db):
+    locks = SqliteLeaseBackend(db)
+    lease = await locks.acquire_many(
+        ["workspace_mutation"],
+        holder_id="h1",
+        task_id="t1",
+        action="patch_applier",
+        ttl_sec=60,
+    )
+    assert lease.lanes == ("workspace_mutation",)
+    assert (await locks.lane_holders()).get("workspace_mutation") == 1
+    await locks.release(lease)
+    assert await locks.lane_holders() == {}
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_lane_busy_rolls_back(db):
+    locks = SqliteLeaseBackend(db)
+    a = await locks.acquire_many(
+        ["benchmark_lane"],
+        holder_id="ha",
+        task_id="ta",
+        action="bench_runner",
+        ttl_sec=60,
+    )
+    assert (
+        await locks.acquire_many(
+            ["benchmark_lane"],
+            holder_id="hb",
+            task_id="tb",
+            action="bench_runner",
+            ttl_sec=60,
+        )
+        is None
+    )
+    # Original lease should still be intact (atomic rollback)
+    assert (await locks.lane_holders()).get("benchmark_lane") == 1
+    await locks.release(a)
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_cross_lane_conflict_blocks_profile_during_bench(db):
+    """benchmark_lane held → profile_lane acquire must fail."""
+    locks = SqliteLeaseBackend(db)
+    bench = await locks.acquire_many(
+        ["benchmark_lane"],
+        holder_id="hb",
+        task_id="tb",
+        action="bench_runner",
+        ttl_sec=60,
+    )
+    assert (
+        await locks.acquire_many(
+            ["profile_lane"],
+            holder_id="hp",
+            task_id="tp",
+            action="profile_runner",
+            ttl_sec=60,
+        )
+        is None
+    )
+    await locks.release(bench)
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_unknown_lane_rejected(db):
+    locks = SqliteLeaseBackend(db)
+    with pytest.raises(ValueError, match="unknown lane"):
+        await locks.acquire_many(
+            ["bogus_lane"],
+            holder_id="h",
+            task_id="t",
+            action="x",
+            ttl_sec=60,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_release_ignores_another_holder(db):
+    locks = SqliteLeaseBackend(db)
+    lease = await locks.acquire_many(
+        ["profile_lane"],
+        holder_id="h1",
+        task_id="t1",
+        action="profile_runner",
+        ttl_sec=60,
+    )
+    # Wrong holder release must not delete the row
+    await locks.release(type(lease)(holder_id="other", lanes=lease.lanes))
+    assert (await locks.lane_holders()).get("profile_lane") == 1
+    await locks.release(lease)
+    assert await locks.lane_holders() == {}
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_does_not_expire_a_live_owner(db):
+    locks = SqliteLeaseBackend(db)
+    await locks.acquire_many(
+        ["workspace_mutation"],
+        holder_id="h1",
+        task_id="t1",
+        action="patch_applier",
+        ttl_sec=0,  # expires immediately
+    )
+    assert await locks.reap_dead_holders() == []
+    assert (await locks.lane_holders())["workspace_mutation"] == 1
+
+
+# task_registry
+def test_task_states_and_terminals():
+    assert "queued" in TASK_STATES
+    assert "succeeded" in TERMINAL_STATES
+    assert "running" not in TERMINAL_STATES
+    # A retry takes a fresh idempotency key, never a re-run of the failed row.
+    assert "failed" in TERMINAL_STATES
+
+
+@pytest.mark.asyncio
+async def test_task_registry_create_idempotent(db):
+    tr = TaskRegistry(db)
+    t1, _ = await tr.create_or_return_existing(TaskSpec(kind="bench_runner", params={"x": 1}, idempotency_key="k1"))
+    t2, _ = await tr.create_or_return_existing(TaskSpec(kind="bench_runner", params={"x": 1}, idempotency_key="k1"))
+    assert t1.task_id == t2.task_id
+
+
+@pytest.mark.asyncio
+async def test_task_registry_legal_transitions(db):
+    tr = TaskRegistry(db)
+    t, _ = await tr.create_or_return_existing(TaskSpec(kind="bench_runner", params={}, idempotency_key="kT1"))
+    t2 = await tr.transition(t.task_id, "running")
+    assert t2.state == "running"
+    t3 = await tr.transition(t.task_id, "succeeded", evidence={"tput": 1840})
+    assert t3.state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_task_registry_illegal_transition_rejected(db):
+    tr = TaskRegistry(db)
+    t, _ = await tr.create_or_return_existing(TaskSpec(kind="bench_runner", params={}, idempotency_key="kT2"))
+    with pytest.raises(IllegalTransition):
+        await tr.transition(t.task_id, "succeeded")  # queued -> succeeded illegal
+
+
+@pytest.mark.asyncio
+async def test_task_registry_cancel_family_bulk(db):
+    tr = TaskRegistry(db)
+    a, _ = await tr.create_or_return_existing(TaskSpec(kind="kernel_opt", params={}, idempotency_key="ka"))
+    b, _ = await tr.create_or_return_existing(TaskSpec(kind="kernel_opt", params={}, idempotency_key="kb"))
+    c, _ = await tr.create_or_return_existing(TaskSpec(kind="bench_runner", params={}, idempotency_key="kc"))
+    cancelled = await tr.cancel_family(["kernel_opt"])
+    assert set(cancelled) == {a.task_id, b.task_id}
+    bench_after = await tr.get(c.task_id)
+    assert bench_after.state == "queued"  # untouched
+
+
+# cursor_store
+@pytest.mark.asyncio
+async def test_cursor_store_empty_default(db):
+    cs = CursorStore(db)
+    state = await cs.load("Orchestration")
+    assert state.last_processed_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_cursor_store_advance_forward(db):
+    cs = CursorStore(db)
+    await cs.advance("Critic", seq=5)
+    assert (await cs.load("Critic")).last_processed_seq == 5
+    await cs.advance("Critic", seq=10)
+    assert (await cs.load("Critic")).last_processed_seq == 10
+
+
+@pytest.mark.asyncio
+async def test_cursor_store_never_moves_backwards(db):
+    cs = CursorStore(db)
+    await cs.advance("Critic", seq=10)
+    await cs.advance("Critic", seq=3)
+    assert (await cs.load("Critic")).last_processed_seq == 10

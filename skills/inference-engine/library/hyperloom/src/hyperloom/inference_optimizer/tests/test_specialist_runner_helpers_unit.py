@@ -1,0 +1,565 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Coverage for SpecialistRunner pure helpers + workspace file protocol:
+failure classification, empty-done synthesis, redaction, path resolution, and
+the prompt/transcript/heartbeat/done writers."""
+
+from __future__ import annotations
+
+import json
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from hyperloom.inference_optimizer.trace.agent_trace import AgentTrace
+from hyperloom.orchestrator.loop.sub_agent_runner import RunnerContext
+from hyperloom.orchestrator.specialists import runner as sr
+from hyperloom.orchestrator.specialists.runner import (
+    SpecialistFailureType,
+    SpecialistRunner,
+    build_empty_specialist_done,
+    classify_specialist_failure,
+)
+from hyperloom.orchestrator.state.task_registry import Task
+
+from .conftest import init_git_repo, make_fake_claude
+
+
+def _runner(**over):
+    kwargs = dict(subprocess_config=sr.SpecialistSubprocessConfig())
+    kwargs.update(over)
+    return SpecialistRunner(**kwargs)
+
+
+def _checkout(path, *files):
+    """A git checkout tracking ``files``."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    for rel in files:
+        target = path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"], check=True
+    )
+    return path
+
+
+def test_safe_redact():
+    line = "export ANTHROPIC_API_KEY=redact_me and GITHUB_TOKEN=redact_me_too"
+    out = sr._safe_redact(line)
+    assert "ANTHROPIC_API_KEY=[REDACTED]" in out
+    assert "GITHUB_TOKEN=[REDACTED]" in out
+    assert "redact_me" not in out
+    assert "redact_me_too" not in out
+    assert "[REDACTED]]" not in out
+    assert sr._safe_redact("plain line") == "plain line"
+
+
+def test_safe_redact_headers():
+    line = "Authorization: Bearer redactable-header-value"
+    out = sr._safe_redact(line)
+    assert "Authorization: Bearer [REDACTED]" in out
+    assert "redactable-header-value" not in out
+
+
+def test_safe_redact_bare_gateway_token_shapes():
+    """ak-/pk- shaped tokens are masked even without their env-var name."""
+    line = "curl --header x ak-abc123def456 and pk-lf-98765 and sk-zyx987"
+    out = sr._safe_redact(line)
+    assert "ak-abc123def456" not in out
+    assert "pk-lf-98765" not in out
+    assert "sk-zyx987" not in out
+    assert out.count("[REDACTED]") == 3
+
+
+def test_safe_redact_aws_and_custom_headers():
+    line = (
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY "
+        "AWS_SESSION_TOKEN=FwoGZXIvYXdzEHsaDNEXAMPLETOKEN "
+        "ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: deadbeefsecret"
+    )
+    out = sr._safe_redact(line)
+    assert "wJalrXUtnFEMI" not in out
+    assert "FwoGZXIvYXdzEHsaDNEXAMPLETOKEN" not in out
+    assert "deadbeefsecret" not in out
+    assert "[REDACTED]" in out
+
+
+def test_extra_focus_tags(monkeypatch):
+    monkeypatch.setattr(sr, "normalize_dispatch_tags", lambda params: ["anchor", "extra1", "extra2", ""])
+    domain = SimpleNamespace(kb_anchor="anchor")
+    tags = sr._extra_focus_tags({"dispatch_tags": []}, domain)
+    assert "anchor" not in tags
+    assert set(tags) == {"extra1", "extra2"}
+
+
+def test_classify_succeeded():
+    assert classify_specialist_failure("succeeded", "") == (SpecialistFailureType.NONE, False)
+
+
+def test_classify_stale_variants():
+    assert classify_specialist_failure("stale", "request timeout")[0] == SpecialistFailureType.TIMEOUT
+    assert classify_specialist_failure("stale", "stale_heartbeat 200s")[0] == SpecialistFailureType.STALE_HEARTBEAT
+    ftype, retry = classify_specialist_failure("stale", "subprocess_error")
+    assert ftype == SpecialistFailureType.CRASH and retry is True
+
+
+def test_classify_empty_synthesised():
+    assert classify_specialist_failure("empty_synthesised", "unknown_domain")[0] == SpecialistFailureType.CONFIG
+    assert classify_specialist_failure("empty_synthesised", "no_workspace")[0] == SpecialistFailureType.CONFIG
+    assert classify_specialist_failure("empty_synthesised", "ran out")[0] == SpecialistFailureType.NO_OUTPUT
+
+
+def test_classify_unknown():
+    assert classify_specialist_failure("weird_status", "")[0] == SpecialistFailureType.UNKNOWN
+
+
+def test_build_empty_specialist_done():
+    out = build_empty_specialist_done(gap_canonical_id="g1", domain="kernel_agent", reason="no idea", confidence=2.0)
+    assert out["proposal_set"] == []
+    assert out["proposal_set"] == []
+    assert out["confidence"] == 1.0
+    assert out["summary"] == "no idea"
+
+
+def test_build_empty_specialist_done_default_reason():
+    out = build_empty_specialist_done(gap_canonical_id="g", domain="d", reason="")
+    assert out["summary"] == "specialist exited empty"
+
+
+def test_path_helpers_none_workspace():
+    r = _runner()
+    assert r._transcript_path(None) is None
+    assert r._heartbeat_path(None) is None
+    assert r._done_path(None) is None
+
+
+def test_path_helpers_with_workspace(tmp_path):
+    r = _runner()
+    assert r._transcript_path(tmp_path).name == "transcript.jsonl"
+    assert r._heartbeat_path(tmp_path).name == "heartbeat.json"
+    assert r._done_path(tmp_path).name == "specialist_done.json"
+
+
+def test_resolve_workspace_from_extra(tmp_path):
+    r = _runner()
+    ws = tmp_path / "explicit"
+    ctx = SimpleNamespace(extra={"workspace": str(ws)}, task=SimpleNamespace(task_id="t1"))
+    out = r._resolve_workspace(ctx)
+    assert out == ws and out.exists()
+
+
+def test_resolve_workspace_no_session_dir():
+    r = _runner()
+    ctx = SimpleNamespace(extra={}, task=SimpleNamespace(task_id="t1"))
+    assert r._resolve_workspace(ctx) is None
+
+
+def test_resolve_workspace_session_dir(tmp_path):
+    r = _runner(session_dir=tmp_path)
+    ctx = SimpleNamespace(extra=None, task=SimpleNamespace(task_id="task-9"))
+    out = r._resolve_workspace(ctx)
+    assert out is not None and out.exists()
+    assert "task-9" in str(out)
+
+
+def test_write_helpers_noop_none_workspace():
+    r = _runner()
+    r._append_transcript(None, 0, {"k": "v"})
+    r._write_heartbeat(None, turn=0, max_turns=1, status="x")
+    r._write_specialist_done(None, {"a": 1})
+
+
+def test_append_transcript(tmp_path):
+    r = _runner()
+    r._append_transcript(tmp_path, 1, {"event": "turn"})
+    r._append_transcript(tmp_path, 2, {"event": "turn2"})
+    lines = (tmp_path / "transcript.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["turn"] == 1
+
+
+def test_append_transcript_redacts_nested_metadata(tmp_path):
+    r = _runner()
+    r._append_transcript(
+        tmp_path,
+        1,
+        {
+            "metadata": {
+                "prompt": "OPENAI_API_KEY=redact_me",
+                "headers": ["Authorization: Bearer redactable-header-value"],
+            }
+        },
+    )
+
+    text = (tmp_path / "transcript.jsonl").read_text(encoding="utf-8")
+    assert "redact_me" not in text
+    assert "redactable-header-value" not in text
+    assert "[REDACTED]" in text
+
+
+def test_write_heartbeat(tmp_path):
+    r = _runner()
+    r._write_heartbeat(tmp_path, turn=3, max_turns=10, status="working")
+    payload = json.loads((tmp_path / "heartbeat.json").read_text(encoding="utf-8"))
+    assert payload["turn"] == 3 and payload["status"] == "working"
+
+
+def test_write_specialist_done(tmp_path):
+    r = _runner()
+    r._write_specialist_done(tmp_path, {"proposal_set": []})
+    payload = json.loads((tmp_path / "specialist_done.json").read_text(encoding="utf-8"))
+    assert payload["proposal_set"] == [] and "ts" in payload
+
+
+def test_write_specialist_done_atomic_leaves_no_tmp(tmp_path):
+    # Final write goes through temp + os.replace; no .tmp residue, valid JSON.
+    r = _runner()
+    r._write_specialist_done(tmp_path, {"proposal_set": []})
+    assert not list(tmp_path.glob("*.tmp"))
+    assert json.loads((tmp_path / "specialist_done.json").read_text(encoding="utf-8"))["proposal_set"] == []
+
+
+def _finalize(r, tmp_path, payload, params=None):
+    """Drive ``_finalize`` far enough to inspect the artifact it writes."""
+    prep = sr._PreparedRun(
+        domain=SimpleNamespace(key="serving_specialist"),
+        gap="gap-1",
+        workspace=tmp_path,
+    )
+    ctx = SimpleNamespace(task=SimpleNamespace(task_id="t1", params=dict(params or {})), extra={})
+    result = r._finalize(ctx=ctx, prep=prep, sub_result=sr.SpecialistSubprocessResult(done_payload=payload))
+    return result, json.loads((tmp_path / "specialist_done.json").read_text(encoding="utf-8"))
+
+
+def test_a_harvested_diff_is_the_whole_round_and_the_specialists_copy_of_it_is_not_added(tmp_path, monkeypatch):
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    harvested, copy = patches / "_worktree_diff.patch", patches / "001_x.patch"
+    harvested.write_text("diff\n")
+    copy.write_text("diff\n")
+    vetted: list[list[str]] = []
+
+    def _spy_vet(patches, **_kwargs):
+        vetted.append(list(patches))
+        return list(patches), [], {}, False
+
+    monkeypatch.setattr(sr._patch_safety, "vet_patches", _spy_vet)
+    _runner()._finalize(
+        ctx=SimpleNamespace(task=SimpleNamespace(task_id="t1", params={}), extra={}),
+        prep=sr._PreparedRun(domain=SimpleNamespace(key="serving_specialist"), gap="gap-1", workspace=tmp_path),
+        sub_result=sr.SpecialistSubprocessResult(
+            done_payload={"proposal_set": [], "summary": "s", "patches_written": [str(copy)]},
+            patches=[str(harvested)],
+            patch_roots={str(harvested): str(tmp_path)},
+        ),
+    )
+
+    assert vetted == [[str(harvested)]]
+
+
+def test_a_specialist_keeps_only_citations_of_experiences_its_dispatch_showed(tmp_path):
+    shown_id, unshown_id = "exp-" + "1" * 32, "exp-" + "2" * 32
+    cite = {"id": shown_id, "stance": "avoid", "claim": "It reverted on this stack."}
+    _, written = _finalize(
+        _runner(),
+        tmp_path,
+        {
+            "proposal_set": [
+                {"name": "v1", "reason": "why", "experience_citations": [cite, {**cite, "id": unshown_id}]},
+                {"name": "v2", "reason": "why"},
+            ],
+            "experience_citations": [{**cite, "stance": "adapt"}, {**cite, "id": unshown_id, "stance": "adapt"}],
+            "summary": "s",
+        },
+        params={"kb_rendered_refs": [{"id": shown_id, "purpose": "representative"}]},
+    )
+
+    assert written["proposal_set"][0]["experience_citations"] == [cite]
+    assert "experience_citations" not in written["proposal_set"][1]
+    assert written["experience_citations"] == [{**cite, "stance": "adapt"}]
+
+
+def test_finalize_strips_forbidden_fields_before_the_critic_can_see_them(tmp_path):
+    """The Critic is told to reject a proposal_set carrying self-reported gain
+    fields, which costs the round every idea in it. Dropping them makes that
+    verdict unreachable; the audit note still records what was there."""
+    result, written = _finalize(
+        _runner(),
+        tmp_path,
+        {
+            "proposal_set": [{"name": "v1", "reason": "why", "expected_gain": 8.0, "score": 2}],
+            "summary": "s",
+        },
+    )
+
+    proposal = written["proposal_set"][0]
+    assert "expected_gain" not in proposal
+    assert "score" not in proposal
+    assert proposal["name"] == "v1" and proposal["reason"] == "why"
+    joined = "\n".join(result.notes)
+    assert "patch_safety_forbidden_fields" in joined
+    assert "expected_gain" in joined and "score" in joined
+
+
+def test_finalize_keeps_the_round_level_confidence_the_audit_records(tmp_path):
+    _, written = _finalize(
+        _runner(),
+        tmp_path,
+        {"proposal_set": [{"name": "v1"}], "confidence": 0.6},
+    )
+
+    assert written["confidence"] == 0.6
+
+
+@pytest.mark.asyncio
+async def test_patch_vetting_runs_off_the_event_loop_thread(tmp_path, monkeypatch):
+    """``run`` wraps ``_finalize`` in ``to_thread``; vetting must not freeze the loop."""
+    seen: dict[str, int] = {}
+    loop_ident = threading.get_ident()
+    orig = sr._patch_safety.vet_patches
+
+    def _spy_vet(*args, **kwargs):
+        seen["ident"] = threading.get_ident()
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(sr._patch_safety, "vet_patches", _spy_vet)
+    done = {
+        "gap_canonical_id": "gap-1",
+        "domain": "serving_specialist",
+        "proposal_set": [{"name": "v1"}],
+        "summary": "s",
+        "reason": "test",
+        "confidence": 0.0,
+        "new_findings": [],
+        "residual_questions": [],
+    }
+    repo = tmp_path / "framework"
+    init_git_repo(repo)
+    monkeypatch.setenv("FRAMEWORK_REPO_PATH", str(repo))
+    runner = SpecialistRunner(
+        subprocess_config=sr.SpecialistSubprocessConfig(
+            claude_executable=str(make_fake_claude(tmp_path / "bin", behavior="done_only", payload=done)),
+            framework_source_roots=(str(repo),),
+            poll_interval_seconds=0.2,
+        ),
+        session_dir=tmp_path / "session",
+        default_max_turns=2,
+    )
+    task = Task(
+        task_id="t1",
+        kind="specialist",
+        state="queued",
+        params={"domain": "serving_specialist", "framework": "sglang", "gap_canonical_id": "gap-1", "max_turns": 1},
+        idempotency_key="t1",
+        requires_lanes=tuple(),
+    )
+    await runner.run(RunnerContext(task=task, lease=None, extra={}))
+    assert "ident" in seen
+    assert seen["ident"] != loop_ident
+
+
+def test_maybe_setup_worktree_research_mode_skips_worktree(tmp_path):
+    from hyperloom.orchestrator.specialists.profile import resolve_specialist_profile
+
+    cfg = sr.SpecialistSubprocessConfig()
+    r = _runner(subprocess_config=cfg)
+    ctx = SimpleNamespace(task=SimpleNamespace(task_id="t", params={"mode": "research"}))
+    profile = resolve_specialist_profile(ctx.task.params)
+    assert r._maybe_setup_worktree(ctx, workspace=tmp_path, profile=profile) == (None, None, "")
+
+
+def test_maybe_setup_worktree_bases_on_the_framework_being_optimised(tmp_path, monkeypatch):
+    """A framework specialist must get a worktree of the framework it patches.
+
+    ``framework_source_roots`` lists the framework search roots, and its order
+    is arbitrary with respect to the session: on a pod that ships aiter as a git
+    checkout, aiter sorts first. A WorldPlay session then handed its specialist
+    an aiter worktree, the specialist authored correct patches against
+    ``hyvideo/`` paths that are absent from it, and patch-safety flagged every
+    one as ``missing_target`` — leaving an env-only proposal that toggled a
+    switch with no code behind it and measured 0.0% five rounds running.
+    """
+    aiter = _checkout(tmp_path / "aiter", "aiter/__init__.py")
+    worldplay = _checkout(tmp_path / "HY-WorldPlay", "hyvideo/__init__.py")
+    monkeypatch.setenv("CUSTOM_REPO_PATH", str(worldplay))
+
+    cfg = sr.SpecialistSubprocessConfig(
+        framework_source_roots=(str(aiter), str(worldplay)),
+    )
+    r = _runner(subprocess_config=cfg)
+    seen: dict = {}
+
+    def _fake_setup(base, worktree_path, branch):
+        seen["base"] = base
+        return worktree_path, ""
+
+    monkeypatch.setattr(sr, "_setup_worktree", _fake_setup)
+    ctx = SimpleNamespace(
+        task=SimpleNamespace(
+            task_id="t",
+            params={"framework": "custom", "domain": "framework_rewrite_specialist"},
+        )
+    )
+
+    _wt, source, err = r._maybe_setup_worktree(ctx, workspace=tmp_path)
+
+    assert err == ""
+    assert source.root == worldplay and seen["base"] == worldplay, f"specialist would patch {seen.get('base')}"
+
+
+def test_maybe_setup_worktree_snapshots_a_framework_that_is_not_a_checkout(tmp_path, monkeypatch):
+    """A pip-installed framework keeps its isolation without borrowing whatever checkout sorts first."""
+    aiter = _checkout(tmp_path / "aiter", "aiter/__init__.py")
+    package = tmp_path / "site-packages" / "worldplay"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("CUSTOM_REPO_PATH", str(package))
+
+    cfg = sr.SpecialistSubprocessConfig(framework_source_roots=(str(aiter),))
+    r = _runner(subprocess_config=cfg, session_dir=tmp_path / "session")
+    seen: dict = {}
+
+    def _fake_setup(base, worktree_path, branch):
+        seen["base"] = base
+        return worktree_path, ""
+
+    monkeypatch.setattr(sr, "_setup_worktree", _fake_setup)
+    ctx = SimpleNamespace(task=SimpleNamespace(task_id="t", params={"framework": "custom"}))
+
+    _wt, source, err = r._maybe_setup_worktree(ctx, workspace=tmp_path)
+
+    assert err == ""
+    assert source.root == package and not source.checkout
+    assert seen["base"].parent == tmp_path / "session" / "tree_snapshots"
+    assert not (package / ".git").exists()
+
+
+def test_maybe_setup_worktree_has_nothing_to_isolate_without_a_named_tree(tmp_path, monkeypatch):
+    aiter = _checkout(tmp_path / "aiter", "aiter/__init__.py")
+    monkeypatch.setenv("CUSTOM_REPO_PATH", str(tmp_path / "absent"))
+    monkeypatch.delenv("FRAMEWORK_REPO_PATH", raising=False)
+    monkeypatch.setattr(sr, "resolve_framework_tree", lambda framework: "")
+
+    cfg = sr.SpecialistSubprocessConfig(framework_source_roots=(str(aiter),))
+    r = _runner(subprocess_config=cfg)
+    ctx = SimpleNamespace(
+        task=SimpleNamespace(task_id="t", params={"framework": "custom", "domain": "framework_rewrite_specialist"})
+    )
+
+    wt, source, err = r._maybe_setup_worktree(ctx, workspace=tmp_path)
+
+    assert (wt, source, err) == (None, None, sr.NO_GIT_FRAMEWORK_SOURCE_ROOT)
+
+
+def test_patch_path_within_bases_accepts_sandbox_paths(tmp_path):
+    # Legitimate patch paths stay inside the worktree/workspace.
+    worktree = tmp_path / "worktree"
+    workspace = tmp_path / "workspace"
+    worktree.mkdir()
+    workspace.mkdir()
+    bases = [worktree, workspace]
+
+    inside = worktree / "patches" / "x.patch"
+    inside.parent.mkdir(parents=True)
+    inside.write_text("diff", encoding="utf-8")
+    assert sr._patch_path_within_bases(inside, bases) is True
+    assert sr._patch_path_within_bases(workspace / "y.patch", bases) is True
+
+
+def test_patch_path_within_bases_rejects_outside_paths(tmp_path):
+    # Absolute / traversal paths outside the sandbox are refused.
+    from pathlib import Path
+
+    worktree = tmp_path / "worktree"
+    workspace = tmp_path / "workspace"
+    worktree.mkdir()
+    workspace.mkdir()
+    bases = [worktree, workspace]
+
+    assert sr._patch_path_within_bases(Path("/etc/passwd"), bases) is False
+    assert sr._patch_path_within_bases(worktree / ".." / "escape.patch", bases) is False
+    assert sr._patch_path_within_bases(tmp_path / "sibling.patch", bases) is False
+
+
+def test_subprocess_backend_error_leading_tokens():
+    assert sr._subprocess_backend_error(sr.SpecialistSubprocessResult(timed_out=True)) == "subprocess_timeout"
+    assert (
+        sr._subprocess_backend_error(sr.SpecialistSubprocessResult(timed_out=True, error="  late  "))
+        == "subprocess_timeout: late"
+    )
+    assert (
+        sr._subprocess_backend_error(sr.SpecialistSubprocessResult(stale_heartbeat=True))
+        == "subprocess_stale_heartbeat"
+    )
+    assert (
+        sr._subprocess_backend_error(sr.SpecialistSubprocessResult(exit_code=1, done_payload=None))
+        == "subprocess_exit_code:1"
+    )
+    assert sr._subprocess_backend_error(sr.SpecialistSubprocessResult(error="boom")) == "subprocess_error:boom"
+
+
+def test_finalize_notes_a_recovered_partial_payload(tmp_path):
+    result, written = _finalize(
+        _runner(),
+        tmp_path,
+        {"proposal_set": [{"name": "v1"}], "summary": "s", "_recovered_from_partial": True},
+    )
+    assert result.status == "partial"
+    assert "recovered_from_partial" in result.notes
+    assert written["_specialist_notes"]
+
+
+def test_finalize_skips_non_dict_proposals_and_drops_scanned_patches_outside(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr._patch_safety, "vet_patches", lambda patches, **_: (list(patches), [], {}, False))
+    outside = tmp_path.parent / "outside.patch"
+    outside.write_text("diff\n", encoding="utf-8")
+    prep = sr._PreparedRun(domain=SimpleNamespace(key="serving_specialist"), gap="gap-1", workspace=tmp_path)
+    ctx = SimpleNamespace(task=SimpleNamespace(task_id="t1", params={}), extra={})
+    result = _runner()._finalize(
+        ctx=ctx,
+        prep=prep,
+        sub_result=sr.SpecialistSubprocessResult(
+            done_payload={"proposal_set": ["skip-me", {"name": "keep"}], "summary": "s"},
+            patches=[str(outside)],
+        ),
+    )
+    assert any(n.startswith("patches_scanned_outside_workspace:") for n in result.notes)
+
+
+def test_record_subprocess_run_emits_one_ledger_row_per_turn(tmp_path):
+    r = _runner(session_dir=tmp_path / "session")
+    (tmp_path / "session").mkdir()
+    prep = sr._PreparedRun(
+        domain=SimpleNamespace(key="serving_specialist"),
+        gap="gap-1",
+        workspace=tmp_path,
+        system_prompt="sys",
+        user_prompt="usr",
+        max_turns=2,
+    )
+    ctx = SimpleNamespace(task=SimpleNamespace(task_id="t1", params={}), extra={})
+    traced: list[int] = []
+
+    def _spy(ctx, turn, metadata, latency_ms=None):
+        traced.append(turn)
+
+    r._trace_specialist_llm_call = _spy  # type: ignore[method-assign]
+    r._record_subprocess_run(
+        ctx,
+        prep,
+        sr.SpecialistSubprocessResult(
+            trace=AgentTrace(
+                turn_usages=[{"input_tokens": 1}, {"input_tokens": 2}],
+                usage={"model": "m", "input_tokens": 3},
+            )
+        ),
+        "call-1",
+        12,
+    )
+    assert traced == [1, 2]

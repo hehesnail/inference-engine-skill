@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the Infera multi-node SSH control plane (``ssh_client``)."""
+
+from __future__ import annotations
+
+import base64
+import shlex
+
+import pytest
+
+from hyperloom.inference_optimizer.multi_node._internal import ssh_client
+
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+@pytest.fixture
+def known_hosts(tmp_path):
+    kh = tmp_path / "known_hosts"
+    kh.write_text("", encoding="utf-8")
+    return kh
+
+
+@pytest.fixture
+def key_file(tmp_path):
+    k = tmp_path / "mn_id_ed25519"
+    k.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\nDUMMY\n")
+    return k
+
+
+def test_ssh_identity_is_the_on_disk_path(key_file):
+    """The identity handed to ``ssh -i`` must be the key's own path."""
+    assert ssh_client._ssh_identity(key_file) == str(key_file)
+    assert not ssh_client._ssh_identity(key_file).startswith("/dev/fd/")
+
+
+def test_ssh_identity_does_not_pipe_fds_to_subprocess(monkeypatch, known_hosts, key_file):
+    """No ``pass_fds`` may be handed to ssh: it cannot use an inherited fd."""
+    captured = {}
+
+    def _run(argv, **kwargs):
+        captured["kwargs"] = kwargs
+        return _FakeCompleted(0, "out", "")
+
+    monkeypatch.setattr(ssh_client.subprocess, "run", _run)
+    ssh_client.ssh_run(ssh_client.SshTarget("10.0.0.1", key_file, known_hosts), "echo hi")
+    assert "pass_fds" not in captured["kwargs"]
+
+
+def test_ssh_run_builds_expected_argv(monkeypatch, known_hosts, key_file):
+    captured = {}
+
+    def _run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return _FakeCompleted(0, "out", "")
+
+    monkeypatch.setattr(ssh_client.subprocess, "run", _run)
+    cp = ssh_client.ssh_run(ssh_client.SshTarget("10.0.0.1", key_file, known_hosts, port=2345), "echo hi", timeout=42)
+    assert cp.returncode == 0
+    argv = captured["argv"]
+    assert argv[0] == "ssh"
+    # Identity must be the key path itself; ssh cannot read an inherited fd.
+    assert argv[argv.index("-i") + 1] == str(key_file)
+    assert "IdentitiesOnly=yes" in argv
+    assert "-p" in argv and argv[argv.index("-p") + 1] == "2345"
+    assert "root@10.0.0.1" in argv
+    assert argv[-3:] == ["bash", "-lc", shlex.quote("echo hi")]
+    assert "StrictHostKeyChecking=yes" in argv
+    assert str(known_hosts) in " ".join(argv)
+    assert captured["kwargs"]["timeout"] == 42
+    assert captured["kwargs"]["capture_output"] is True
+
+
+def test_ssh_run_script_base64_wraps_and_prepends_env(monkeypatch, known_hosts, key_file):
+    captured = {}
+
+    def _run(argv, **kwargs):
+        captured["argv"] = argv
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(ssh_client.subprocess, "run", _run)
+    script = "print('multi\nnode')"
+    ssh_client.ssh_run_script(
+        ssh_client.SshTarget("h", key_file, known_hosts),
+        ssh_client.RemoteScript(
+            script, "python3", "--flag v", env={"MORI_DISPATCH": "1", "SGLANG_FOO": "a b"}, remote_path="/tmp/run.py"
+        ),
+    )
+    remote_cmd = captured["argv"][-1]
+    enc = base64.b64encode(script.encode()).decode()
+    assert enc in remote_cmd
+    assert "base64 -d" in remote_cmd
+    assert "/tmp/run.py" in remote_cmd
+    assert "MORI_DISPATCH=1" in remote_cmd
+    assert "'a b'" in remote_cmd
+    assert "python3" in remote_cmd and "--flag v" in remote_cmd
+
+
+def test_ssh_run_script_rejects_invalid_env_key(monkeypatch, known_hosts):
+    monkeypatch.setattr(ssh_client.subprocess, "run", lambda *a, **kw: _FakeCompleted(0))
+    with pytest.raises(ValueError, match="disallowed SSH forward env keys"):
+        ssh_client.ssh_run_script(
+            ssh_client.SshTarget("h", "/k", known_hosts),
+            ssh_client.RemoteScript("x=1", "python3", "", env={"BAD KEY": "1"}),
+        )
+
+
+def test_ssh_run_script_no_env_has_no_prefix(monkeypatch, known_hosts, key_file):
+    captured = {}
+    monkeypatch.setattr(
+        ssh_client.subprocess,
+        "run",
+        lambda argv, **kw: captured.setdefault("argv", argv) or _FakeCompleted(0),
+    )
+    ssh_client.ssh_run_script(
+        ssh_client.SshTarget("h", key_file, known_hosts), ssh_client.RemoteScript("x=1", "python3", "")
+    )
+    remote_cmd = captured["argv"][-1]
+    assert "&& python3 /tmp/mn_infera_launch" in remote_cmd
+
+
+def test_ssh_run_bash_stdin_pipes_the_script_via_stdin(monkeypatch, known_hosts, key_file):
+    captured = {}
+
+    def _run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["input"] = kwargs.get("input")
+        captured["kwargs"] = kwargs
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(ssh_client.subprocess, "run", _run)
+    ssh_client.ssh_run_bash_stdin(ssh_client.SshTarget("h", key_file, known_hosts), "echo body")
+    assert captured["argv"][-2:] == ["bash", "-s"]
+    assert "echo body" in captured["input"]
+    assert "set -uo pipefail" in captured["input"]
+    assert captured["argv"][captured["argv"].index("-i") + 1] == str(key_file)
+    assert "pass_fds" not in captured["kwargs"]

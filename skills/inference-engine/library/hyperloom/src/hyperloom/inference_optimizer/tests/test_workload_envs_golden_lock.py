@@ -1,0 +1,231 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Behavior-lock tests for ``materialize_config_with_envs``: golden snapshots of the real materialized YAML, plus unset/extra_envs restore."""
+
+from __future__ import annotations
+
+import yaml
+
+from hyperloom.orchestrator.actions.executors import _workload_envs as we
+
+# Env names that leak process state into the materialized YAML.
+_LEAKY_ENV = (
+    "TP",
+    "EP",
+    "ISL",
+    "OSL",
+    "CONC",
+    "MAX_MODEL_LEN",
+    "PRECISION",
+    "RANDOM_RANGE_RATIO",
+    "ROCR_VISIBLE_DEVICES",
+    "RUN_EVAL",
+    "PROFILE",
+    "MODEL_PATH",
+    "INFERENCEX_PATH",
+    "PORT",
+    "PROFILE_OSL",
+    "HYPERLOOM_PROFILE_MAX_ITERS",
+    "HYPERLOOM_PROFILE_DELAY_ITERS",
+    "HYPERLOOM_PROFILE_MAX_STEPS_CAP",
+    "INFERENCE_OPTIMIZER_VISIBLE_GPU_COUNT",
+    "INFERENCE_OPTIMIZER_SERVER_ARGS",
+    "XDIT_QUALITY_REF",
+    "XDIT_QUALITY_REF_WRITE",
+)
+
+
+def _isolate(monkeypatch):
+    for k in _LEAKY_ENV:
+        monkeypatch.delenv(k, raising=False)
+    # Pin what would otherwise depend on the host (GPU count, runtime patching, and the reference recipe in the host's
+    # session state), keeping the golden output byte-stable.
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_DISABLE_TP_CLAMP", "1")
+    monkeypatch.setenv("HYPERLOOM_ENABLE_PATCH", "0")
+    monkeypatch.setattr(we, "resolve_reference_launch", lambda: ("", {}, {}))
+
+
+def _write(path, bench):
+    path.write_text(yaml.safe_dump({"benchmark": bench}), encoding="utf-8")
+    return path
+
+
+# ── golden YAML snapshots ───────────────────────────────────────────────────
+
+_GOLDEN_SGLANG_BASELINE = """\
+benchmark:
+  envs:
+    TP: 1
+    ROCR_VISIBLE_DEVICES: '0'
+    NUM_PROMPTS: 320
+    NUM_WARMUPS: 8
+    EXTRA_SGLANG_ARGS: --variant 4 --watchdog-timeout 1800
+    AITER_LOG_TUNED_CONFIG: '1'
+    MAGPIE_TRUST_REMOTE_CODE: '1'
+    BENCH_TRUST_REMOTE_CODE: '1'
+    HF_HUB_TRUST_REMOTE_CODE: '1'
+    RUN_EVAL: 'true'
+  framework: sglang
+  model: /models/foo
+"""
+
+_GOLDEN_VLLM = """\
+benchmark:
+  envs:
+    TP: 1
+    ROCR_VISIBLE_DEVICES: '0'
+    NUM_PROMPTS: 320
+    NUM_WARMUPS: 8
+    EXTRA_VLLM_ARGS: --max-num-seqs 256
+    AITER_LOG_TUNED_CONFIG: '1'
+    MAGPIE_TRUST_REMOTE_CODE: '1'
+    BENCH_TRUST_REMOTE_CODE: '1'
+    HF_HUB_TRUST_REMOTE_CODE: '1'
+    RUN_EVAL: 'true'
+  framework: vllm
+  model: /models/bar
+"""
+
+_GOLDEN_PROFILE = """\
+benchmark:
+  envs:
+    PROFILE: '1'
+    CONC: 64
+    ISL: 1024
+    OSL: 1024
+    TP: 1
+    ROCR_VISIBLE_DEVICES: '0'
+    HYPERLOOM_TRACELENS_PATCH_STATUS: not_attempted
+    PROFILE_EXTRA_BODY: '{"start_step": 6080, "num_steps": 128, "shape_discovery":
+      true, "detailed_annotations": true}'
+    NUM_PROMPTS: 776
+    NUM_WARMUPS: 8
+    AITER_LOG_TUNED_CONFIG: '1'
+    EXTRA_SGLANG_ARGS: --watchdog-timeout 1800
+    MAGPIE_TRUST_REMOTE_CODE: '1'
+    BENCH_TRUST_REMOTE_CODE: '1'
+    HF_HUB_TRUST_REMOTE_CODE: '1'
+    RUN_EVAL: 'true'
+  framework: sglang
+  model: /models/foo
+"""
+
+
+def test_golden_sglang_baseline(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    src = _write(tmp_path / "sglang.yaml", {"framework": "sglang", "model": "/models/foo", "envs": {}})
+    res = we.materialize_config_with_envs(
+        src,
+        tmp_path / "out",
+        launch=we.LaunchLayer(extra_server_args="--variant 4", args_mode="append"),
+    )
+    assert res.read_text(encoding="utf-8") == _GOLDEN_SGLANG_BASELINE
+
+
+def test_golden_vllm(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    src = _write(tmp_path / "vllm.yaml", {"framework": "vllm", "model": "/models/bar", "envs": {}})
+    res = we.materialize_config_with_envs(
+        src,
+        tmp_path / "out",
+        launch=we.LaunchLayer(extra_server_args="--max-num-seqs 256"),
+    )
+    assert res.read_text(encoding="utf-8") == _GOLDEN_VLLM
+
+
+def test_golden_profile_mode(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    monkeypatch.setenv("ISL", "1024")
+    monkeypatch.setenv("OSL", "1024")
+    monkeypatch.setenv("CONC", "64")
+    # PROFILE is read from benchmark.envs (YAML), not the process env: the loop that copies process env into envs does
+    # not include PROFILE.
+    src = _write(tmp_path / "profile.yaml", {"framework": "sglang", "model": "/models/foo", "envs": {"PROFILE": "1"}})
+    res = we.materialize_config_with_envs(src, tmp_path / "out")
+    assert res.read_text(encoding="utf-8") == _GOLDEN_PROFILE
+
+
+# ── unset_envs then restore-from-extra_envs semantics ───────────────────────
+
+
+def test_unset_env_wins_over_extra_envs_for_the_same_key(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    # KEEP exists in the YAML base, is overridden by extra_envs, then named in unset_envs. The final restore loop
+    # re-injects the extra_envs value.
+    src = _write(tmp_path / "cfg.yaml", {"framework": "sglang", "model": "/m", "envs": {"KEEP": "base"}})
+    res = we.materialize_config_with_envs(
+        src,
+        tmp_path / "out",
+        launch=we.LaunchLayer(extra_envs={"KEEP": "from_extra"}, unset_envs="KEEP"),
+    )
+    envs = yaml.safe_load(res.read_text())["benchmark"]["envs"]
+    assert "KEEP" not in envs
+
+
+def test_unset_env_dropped_when_not_in_extra_envs(monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    # KEEP is only in the YAML base and named in unset_envs with no extra_envs entry, so it is popped and never
+    # restored.
+    src = _write(tmp_path / "cfg.yaml", {"framework": "sglang", "model": "/m", "envs": {"KEEP": "base"}})
+    res = we.materialize_config_with_envs(
+        src,
+        tmp_path / "out",
+        launch=we.LaunchLayer(unset_envs="KEEP"),
+    )
+    envs = yaml.safe_load(res.read_text())["benchmark"]["envs"]
+    assert "KEEP" not in envs
+
+
+# ── FLYDSL_EXTRA_SOURCE_DIRS is asked for, and never clobbers a set value ────
+
+
+def _flydsl_env(monkeypatch, tmp_path, **kwargs):
+    """Materialize with a real FlyDSL root on disk; return the rendered envs."""
+    _isolate(monkeypatch)
+    root = tmp_path / "flydsl"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("FLYDSL_ROOT", str(root))
+    monkeypatch.delenv("FLYDSL_EXTRA_SOURCE_DIRS", raising=False)
+    src = _write(
+        tmp_path / "cfg.yaml",
+        {"framework": "vllm", "model": "/m", "envs": dict(kwargs.pop("yaml_envs", {}))},
+    )
+    res = we.materialize_config_with_envs(src, tmp_path / "out", **kwargs)
+    return yaml.safe_load(res.read_text())["benchmark"]["envs"], str(root)
+
+
+def test_an_ordinary_benchmark_is_not_given_the_flydsl_source_dirs(monkeypatch, tmp_path):
+    # Widening FlyDSL's JIT cache key recompiles kernels, so a baseline, explore or sweep run that patched nothing
+    # must not pay for it.
+    envs, _root = _flydsl_env(monkeypatch, tmp_path)
+
+    assert "FLYDSL_EXTRA_SOURCE_DIRS" not in envs
+
+
+def test_the_run_that_applied_a_flydsl_patch_asks_for_the_source_dirs(monkeypatch, tmp_path):
+    envs, root = _flydsl_env(monkeypatch, tmp_path, options=we.MaterializeOptions(flydsl_source_dirs=True))
+
+    # A host with its own FlyDSL install contributes further roots, so the configured one being named is what matters,
+    # not the whole list.
+    assert root in envs["FLYDSL_EXTRA_SOURCE_DIRS"].split(":")
+
+
+def test_an_explicitly_configured_value_is_never_clobbered(monkeypatch, tmp_path):
+    # The injection used to be the last writer of all, so it overwrote both the YAML base and an extra_envs value the
+    # caller had threaded in on purpose.
+    from_yaml, _root = _flydsl_env(
+        monkeypatch,
+        tmp_path,
+        yaml_envs={"FLYDSL_EXTRA_SOURCE_DIRS": "/operator/yaml"},
+        options=we.MaterializeOptions(flydsl_source_dirs=True),
+    )
+    assert from_yaml["FLYDSL_EXTRA_SOURCE_DIRS"] == "/operator/yaml"
+
+    from_extra, _root2 = _flydsl_env(
+        monkeypatch,
+        tmp_path / "second",
+        launch=we.LaunchLayer(extra_envs={"FLYDSL_EXTRA_SOURCE_DIRS": "/operator/extra"}),
+        options=we.MaterializeOptions(flydsl_source_dirs=True),
+    )
+    assert from_extra["FLYDSL_EXTRA_SOURCE_DIRS"] == "/operator/extra"

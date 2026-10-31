@@ -1,0 +1,580 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""plateau pure functions + escalate hints + stop_reason ENUM."""
+
+from __future__ import annotations
+
+
+import pytest
+
+from hyperloom.inference_optimizer.breakdown.stop_reasons import STOP_REASON_VOCAB, is_valid_stop_reason
+from hyperloom.orchestrator.kernel import kernel_decisions
+from hyperloom.orchestrator.lever import LEVER_CONFIG
+from hyperloom.orchestrator.phases.machine_state import (
+    DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK,
+    DEFAULT_PLATEAU_EXPLORE_KEEP_GAIN_PCT,
+    PHASE_KERNEL_AGENT,
+    PHASE_SWEEP,
+    _config_lever_evidence,
+    _framework_plateau,
+    compute_next_phase,
+    kernel_work_pending,
+    PhaseFlags,
+)
+from hyperloom.orchestrator.state import shared_state
+from hyperloom.orchestrator.state.shared_state import (
+    ESCALATE_HINT_SKIP_TO_KERNEL,
+    ESCALATE_HINT_SKIP_TO_SWEEP,
+    ESCALATE_HINT_VOCAB,
+    SharedState,
+    is_valid_escalate_hint,
+)
+
+
+def _config_dry(state, overrides):
+    evidence = _config_lever_evidence(state, overrides)
+    return _framework_plateau(evidence).config_dry, evidence
+
+
+def test_escalate_hint_vocab_closed():
+    assert ESCALATE_HINT_VOCAB == frozenset(
+        {
+            "skip_to_kernel",
+            "skip_to_sweep",
+        }
+    )
+
+
+def test_is_valid_escalate_hint_accepts_vocab():
+    assert is_valid_escalate_hint("skip_to_kernel")
+    assert not is_valid_escalate_hint("garbage")
+    assert not is_valid_escalate_hint("")
+
+
+def test_config_lever_dry_empty_attempts_returns_false():
+    state = SharedState(attempts=[], macro_cycle=0)
+    triggered, ev = _config_dry(state, {})
+    assert triggered is False
+    assert ev["empty_streak"] == 0
+    assert ev["recent_keep_gain_pct"] == 0.0
+
+
+def test_config_lever_dry_low_gain_and_streak_triggers():
+    state = SharedState(
+        macro_cycle=0,
+        attempts=(
+            [{"lever_kind": LEVER_CONFIG, "outcome": "KEEP", "adopted": True, "gain_pct": 0.1, "cycle": 0}]
+            + [
+                {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0}
+                for _ in range(DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK)
+            ]
+        ),
+    )
+    triggered, ev = _config_dry(state, {})
+    assert triggered is True
+    assert ev["empty_streak"] == DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK
+    assert ev["recent_keep_gain_pct"] < DEFAULT_PLATEAU_EXPLORE_KEEP_GAIN_PCT
+
+
+def test_config_lever_dry_high_gain_blocks_trigger():
+    """Even with empty streak, large recent KEEP gain blocks plateau."""
+    state = SharedState(
+        macro_cycle=0,
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "KEEP", "adopted": True, "gain_pct": 3.0, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "KEEP", "adopted": True, "gain_pct": 2.0, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+        ],
+    )
+    triggered, _ev = _config_dry(state, {})
+    assert triggered is False
+
+
+def test_config_lever_dry_short_empty_streak_blocks_trigger():
+    """Low gain alone (without empty streak) does not trigger plateau."""
+    state = SharedState(
+        macro_cycle=0,
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+            # newest attempt adopted → streak resets to 0.
+            {"lever_kind": LEVER_CONFIG, "outcome": "KEEP", "adopted": True, "gain_pct": 0.1, "cycle": 0},
+        ],
+    )
+    triggered, ev = _config_dry(state, {})
+    assert triggered is False
+    assert ev["empty_streak"] == 0
+
+
+def _grid_round(round_id: str, *, variants: int, keep_at: int | None = None, gain: float = 0.1):
+    """One ``run_grid`` round's worth of per-variant rows."""
+    rows = []
+    for i in range(variants):
+        adopted = i == keep_at
+        rows.append(
+            {
+                "lever_kind": LEVER_CONFIG,
+                "outcome": "KEEP" if adopted else "REVERT",
+                "adopted": adopted,
+                "gain_pct": gain if adopted else None,
+                "round_id": round_id,
+                "cycle": 0,
+            }
+        )
+    return rows
+
+
+def test_config_lever_dry_counts_a_grid_round_once():
+    """A single grid is one attempt, however many variants it benched."""
+    state = SharedState(macro_cycle=0, attempts=_grid_round("r1", variants=8))
+    triggered, ev = _config_dry(state, {})
+    assert triggered is False
+    assert ev["empty_streak"] == 1
+
+
+def test_config_lever_dry_triggers_after_streak_floor_rounds():
+    rows: list[dict] = []
+    for i in range(DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK):
+        rows += _grid_round(f"r{i}", variants=4)
+    state = SharedState(macro_cycle=0, attempts=rows)
+    triggered, ev = _config_dry(state, {})
+    assert triggered is True
+    assert ev["empty_streak"] == DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK
+
+
+def test_config_lever_dry_round_that_kept_is_not_dry():
+    """A round that landed a KEEP has made progress, wherever in the grid it fell."""
+    rows: list[dict] = []
+    for i in range(DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK):
+        rows += _grid_round(f"r{i}", variants=4)
+    rows += _grid_round("r-last", variants=8, keep_at=0)
+    state = SharedState(macro_cycle=0, attempts=rows)
+    triggered, ev = _config_dry(state, {})
+    assert triggered is False
+    assert ev["empty_streak"] == 0
+
+
+def test_config_lever_dry_ignores_prior_macro_cycle_rows():
+    state = SharedState(
+        macro_cycle=1,
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0}
+            for _ in range(DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK)
+        ],
+    )
+    triggered, ev = _config_dry(state, {})
+    assert triggered is False
+    assert ev["empty_streak"] == 0
+
+
+def test_config_lever_dry_supports_threshold_overrides():
+    state = SharedState(
+        macro_cycle=0,
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "KEEP", "adopted": True, "gain_pct": 1.5, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+        ],
+    )
+    # Defaults → not triggered (gain too high and streak too short).
+    triggered, _ = _config_dry(state, {})
+    assert triggered is False
+    # Raise threshold above the gain and drop streak to 1 → triggers.
+    triggered, _ = _config_dry(
+        state,
+        {"explore_keep_gain_pct": 3.0, "explore_empty_streak": 1},
+    )
+    assert triggered is True
+
+
+def test_reset_per_cycle_plateau_state_preserves_durable_ledgers():
+    state = SharedState(session_id="t")
+    state.params_no_promote_streak = 4
+    state.framework_agent_phase_done = True
+    state.framework_agent_discover_failures = 2
+    state.framework_agent_empty_discoveries = 2
+    state.rounds_since_last_specialist = {"serving_specialist": 4}
+    state.rounds_since_last_keep = {"serving_specialist": 5}
+    state.last_conc_sweep = {"status": "succeeded"}
+    state.last_conc_sweep = {"status": "succeeded"}
+    state.explore_search = {"tested": {"stable": {"cycle": 0}}}
+    state.kernel_integrate_attempts = {"stable": {"attempts": [{"cycle": 0}]}}
+
+    state.reset_per_cycle_plateau_state()
+
+    assert state.params_no_promote_streak == 0
+    assert state.framework_agent_phase_done is False
+    assert state.framework_agent_discover_failures == 0
+    assert state.framework_agent_empty_discoveries == 0
+    assert state.rounds_since_last_specialist == {}
+    assert state.rounds_since_last_keep == {}
+    assert state.last_conc_sweep == {}
+    assert state.last_conc_sweep == {}
+    assert state.explore_search["tested"]["stable"]["cycle"] == 0
+    assert state.kernel_integrate_attempts["stable"]["attempts"][0]["cycle"] == 0
+
+
+def test_optimize_exits_on_plateau():
+    """Both arms dry advances to the next lever."""
+    state = SharedState(
+        phase="FRAMEWORK_AGENT",
+        phase_started_unix=0.0,
+        max_minutes=0,
+        phase_budget_pct={},
+        macro_cycle=0,
+        # Config arm: low gain + streak at threshold.
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0}
+            for _ in range(DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK)
+        ],
+        pending_escalate_hint="",
+        stop_reason="",
+        plateau_overrides={},
+        # Patch arm: discovery exhausted.
+        framework_agent_phase_done=True,
+    )
+    out = compute_next_phase(state)
+    assert out is not None
+    assert out[1] == "optimize_no_more_leverage"
+
+
+def test_skip_to_kernel_hint_short_circuits_optimize():
+    """A ``skip_to_kernel`` hint exits even when the arms' own signals disagree."""
+    state = SharedState(
+        phase="FRAMEWORK_AGENT",
+        phase_started_unix=0.0,
+        max_minutes=0,
+        phase_budget_pct={},
+        macro_cycle=0,
+        # One attempt recorded so the phase has "done work" this cycle.
+        attempts=[{"lever_kind": LEVER_CONFIG, "outcome": "KEEP", "adopted": True, "gain_pct": 5.0, "cycle": 0}],
+        specialist_rounds=[],
+        pending_escalate_hint=ESCALATE_HINT_SKIP_TO_KERNEL,
+        stop_reason="",
+        plateau_overrides={},
+        framework_agent_phase_done=False,
+    )
+    out = compute_next_phase(state)
+    assert out is not None and out[1] == "optimize_no_more_leverage"
+    assert out[2]["evidence"] == "llm_escalation"
+
+
+def test_kernel_does_not_exit_on_plateau():
+    """Plateau alone (one hot kernel reverted, another still untried) does not exit KERNEL."""
+    state = SharedState(
+        phase="KERNEL_AGENT",
+        phase_started_unix=0.0,
+        max_minutes=0,
+        phase_budget_pct={},
+        last_trace_analyze={"hot_kernels_top15": [_hot("k0", "/repo/op0.py"), _hot("k1", "/repo/op1.py")]},
+        rejected_kernel_ids=[],
+        pending_escalate_hint="",
+        stop_reason="",
+        optimization_stack=[],
+        kernel_optimizer="",
+    )
+    state.record_kernel_integrate_result(
+        {"kernel_id": "k0", "patch_path": "/tmp/k0.patch", "target_file": "/repo/op0.py", "decision": "REVERT"}
+    )
+    assert compute_next_phase(state) is None
+
+
+def _hot(kernel_id: str, source_file: str, gpu_pct: float = 20.0) -> dict:
+    return {
+        "kernel_id": kernel_id,
+        "name": kernel_id,
+        "source_file": source_file,
+        "gpu_pct": gpu_pct,
+        "reusable_native_kernel": True,
+    }
+
+
+def _skip_to_sweep_state(phase: str) -> SharedState:
+    return SharedState(
+        phase=phase,
+        phase_started_unix=0.0,
+        max_minutes=0,
+        phase_budget_pct={},
+        macro_cycle=0,
+        attempts=[],
+        specialist_rounds=[],
+        params_no_promote_streak=0,
+        rejected_kernel_ids=[],
+        optimization_stack=[],
+        pending_escalate_hint=ESCALATE_HINT_SKIP_TO_SWEEP,
+        stop_reason="",
+        plateau_overrides={},
+        framework_agent_phase_done=False,
+        kernel_optimizer="",
+    )
+
+
+def test_skip_to_sweep_from_optimize_is_non_terminal():
+    # skip_to_sweep exhausts the explore lever, non-terminal.
+    out = compute_next_phase(_skip_to_sweep_state("FRAMEWORK_AGENT"), flags=PhaseFlags(kernel_enabled=True))
+    assert out is not None
+    _target, reason, evidence = out
+    assert reason == "optimize_no_more_leverage"
+    assert evidence.get("hint") == ESCALATE_HINT_SKIP_TO_SWEEP
+
+
+def test_compute_next_phase_skip_to_sweep_from_explore_routes_to_kernel():
+    # Exhausted explore leverage switches lever EXPLORE -> KERNEL, non-terminal.
+    out = compute_next_phase(_skip_to_sweep_state("FRAMEWORK_AGENT"), flags=PhaseFlags(kernel_enabled=True))
+    assert out is not None
+    target, reason, evidence = out
+    assert target == PHASE_KERNEL_AGENT
+    assert reason == "optimize_no_more_leverage"
+    assert evidence.get("terminal") is not True
+
+
+def test_kernel_with_no_pending_work_routes_to_sweep():
+    out = compute_next_phase(_skip_to_sweep_state("KERNEL_AGENT"), flags=PhaseFlags(kernel_enabled=True))
+    assert out is not None
+    target, reason, _ = out
+    assert target == PHASE_SWEEP
+    assert reason == "kernel_no_more_leverage"
+
+
+def test_kernel_holds_while_work_pending_keep():
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    state.pending_kernel_integrations = {
+        "i0": {"kernel_id": "k0", "status": "pending", "task_key": "k0", "artifact_path": "/tmp/k0.patch"}
+    }
+
+    assert kernel_work_pending(state) is True
+    assert compute_next_phase(state, flags=PhaseFlags(kernel_enabled=True)) is None
+
+
+def test_kernel_holds_while_work_pending_untried_hot_kernel(monkeypatch):
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    monkeypatch.setattr(kernel_decisions, "untried_hot_reusable_kernels", lambda state: ["k017"])
+
+    assert kernel_work_pending(state) is True
+    assert compute_next_phase(state, flags=PhaseFlags(kernel_enabled=True)) is None
+
+
+def test_a_hot_kernel_a_backend_patched_stops_holding_kernel():
+    # A reusable kernel over the GPU-share floor holds KERNEL until a patch for it exists.
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    state.last_trace_analyze = {
+        "hot_kernels_top15": [
+            {
+                "kernel_id": "k003",
+                "name": "moe_align",
+                "source_file": "/repo/moe.py",
+                "gpu_pct": 25.2,
+                "reusable_native_kernel": True,
+            }
+        ],
+        "task_groups": [],
+    }
+    assert kernel_work_pending(state) is True
+
+    state.record_kernel_integrate_result(
+        {"kernel_id": "k003", "patch_path": "/tmp/k003.patch", "target_file": "/repo/moe.py", "decision": "REVERT"}
+    )
+
+    assert kernel_work_pending(state) is False
+
+
+@pytest.mark.parametrize("status", ["no_gain", "timeout"])
+def test_geak_terminal_exits_kernel_ignoring_per_kernel_pending_work(status, monkeypatch):
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    state.kernel_optimizer = "geak"
+    state.geak_result = {"status": status}
+    monkeypatch.setattr(kernel_decisions, "untried_hot_reusable_kernels", lambda state: ["k017"])
+
+    assert kernel_work_pending(state) is False
+    out = compute_next_phase(state, flags=PhaseFlags(kernel_enabled=True))
+    assert out is not None
+    target, reason, _ = out
+    assert target == PHASE_SWEEP
+    assert reason == "kernel_no_more_leverage"
+
+
+def test_kernel_exits_when_every_hot_kernel_is_rejected_or_integrated():
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    state.last_trace_analyze = {"hot_kernels_top15": [_hot("k001", "/repo/a.py"), _hot("k002", "/repo/b.py")]}
+    state.record_kernel_integrate_result(
+        {"kernel_id": "k001", "patch_path": "/tmp/k001.patch", "target_file": "/repo/a.py", "decision": "REVERT"}
+    )
+    state.optimization_stack = [{"action": "integrate", "kernel_id": "k002", "target_file": "/repo/b.py"}]
+
+    assert kernel_work_pending(state) is False
+    out = compute_next_phase(state, flags=PhaseFlags(kernel_enabled=True))
+    assert out is not None
+    target, reason, _ = out
+    assert target == PHASE_SWEEP
+    assert reason == "kernel_no_more_leverage"
+
+
+def test_a_fusion_row_retires_its_hot_kernel_like_an_integrate_row():
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    state.last_trace_analyze = {"hot_kernels_top15": [_hot("k002", "/repo/op.py")]}
+    state.optimization_stack = [{"action": "fusion", "kernel_id": "k900", "target_file": "/repo/op.py"}]
+
+    assert kernel_work_pending(state) is False
+
+
+def test_a_whitespace_padded_target_file_still_matches():
+    state = _skip_to_sweep_state("KERNEL_AGENT")
+    state.last_trace_analyze = {"hot_kernels_top15": [_hot("k002", "/repo/op.py")]}
+    state.optimization_stack = [{"action": "integrate", "kernel_id": "k900", "target_file": "  /repo/op.py "}]
+
+    assert kernel_work_pending(state) is False
+
+
+def test_set_pending_escalate_hint_accepts_vocab():
+    s = SharedState()
+    assert s.set_pending_escalate_hint(ESCALATE_HINT_SKIP_TO_KERNEL) == "skip_to_kernel"
+    assert s.pending_escalate_hint == "skip_to_kernel"
+
+
+def test_set_pending_escalate_hint_drops_unknown():
+    s = SharedState()
+    assert s.set_pending_escalate_hint("garbage") == ""
+    assert s.pending_escalate_hint == ""
+
+
+def test_consume_pending_escalate_hint_clears_and_returns_hint():
+    s = SharedState()
+    s.set_pending_escalate_hint(ESCALATE_HINT_SKIP_TO_KERNEL)
+    consumed = s.consume_pending_escalate_hint()
+    assert consumed == "skip_to_kernel"
+    assert s.pending_escalate_hint == ""
+
+
+def test_consume_pending_escalate_hint_noop_when_empty():
+    s = SharedState()
+    assert s.consume_pending_escalate_hint() == ""
+
+
+def test_set_stop_reason_accepts_vocab():
+    s = SharedState()
+    assert s.set_stop_reason("target_reached") == "target_reached"
+    assert s.stop_reason == "target_reached"
+    assert s.stop_ts != ""
+
+
+def test_set_stop_reason_lenient_maps_unknown_to_unknown(caplog):
+    s = SharedState()
+    with caplog.at_level("WARNING"):
+        v = s.set_stop_reason("not_a_real_reason")
+    assert v == "unknown"
+    assert s.stop_reason == "unknown"
+
+
+def test_set_stop_reason_strict_raises():
+    s = SharedState()
+    with pytest.raises(ValueError, match="not in STOP_REASON_VOCAB"):
+        s.set_stop_reason("not_a_real_reason", strict=True)
+
+
+def test_set_stop_reason_empty_string_clears():
+    s = SharedState()
+    s.set_stop_reason("target_reached")
+    assert s.stop_reason == "target_reached"
+    s.set_stop_reason("")
+    assert s.stop_reason == ""
+    assert s.stop_ts == ""
+
+
+def test_a_later_stop_reason_does_not_move_the_stop_time(monkeypatch):
+    """CLOSE stops the session on entry and ships the breakdown; a later write must not re-date it."""
+    s = SharedState()
+    monkeypatch.setattr(shared_state, "now_iso", lambda: "2026-08-08T00:00:00.000000+00:00")
+    s.set_stop_reason("time_exhausted")
+    monkeypatch.setattr(shared_state, "now_iso", lambda: "2026-08-08T02:00:00.000000+00:00")
+    s.set_stop_reason("target_reached")
+    assert s.stop_reason == "target_reached"
+    assert s.stop_ts == "2026-08-08T00:00:00.000000+00:00"
+
+
+def test_rewriting_the_same_stop_reason_does_not_move_the_stop_time(monkeypatch):
+    """The Coordinator's ``finally`` re-asserts the reason CLOSE already wrote."""
+    s = SharedState()
+    monkeypatch.setattr(shared_state, "now_iso", lambda: "2026-08-08T00:00:00.000000+00:00")
+    s.set_stop_reason("time_exhausted")
+    monkeypatch.setattr(shared_state, "now_iso", lambda: "2026-08-08T00:04:00.000000+00:00")
+    s.set_stop_reason(s.stop_reason)
+    assert s.stop_ts == "2026-08-08T00:00:00.000000+00:00"
+
+
+def test_saving_a_stopped_session_again_does_not_move_its_stop_time(tmp_path):
+    s = SharedState()
+    s.set_stop_reason("target_reached")
+    pinned = s.stop_ts
+    s.save(tmp_path)
+    s.save(tmp_path)
+    assert s.stop_ts == pinned
+    assert SharedState.load_or_init(tmp_path).stop_ts == pinned
+
+
+def test_stop_reason_vocab_has_v08_additions():
+    for new in (
+        "sweep_done",
+        "prelude_baseline_failed",
+        "time_exhausted_during_prelude",
+    ):
+        assert new in STOP_REASON_VOCAB
+        assert is_valid_stop_reason(new)
+
+
+def test_compute_next_phase_advances_on_plateau():
+    """When both arms report dry, compute_next_phase routes to KERNEL_AGENT."""
+    state = SharedState(
+        phase="FRAMEWORK_AGENT",
+        phase_started_unix=0.0,
+        max_minutes=0,
+        phase_budget_pct={},
+        macro_cycle=0,
+        # Config arm: trailing no-keeps at threshold, gain below floor.
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0}
+            for _ in range(DEFAULT_PLATEAU_EXPLORE_EMPTY_STREAK)
+        ],
+        specialist_rounds=[],
+        params_no_promote_streak=0,
+        optimization_stack=[],
+        pending_escalate_hint="",
+        stop_reason="",
+        plateau_overrides={},
+        framework_agent_phase_done=True,
+    )
+    target, reason, _ = compute_next_phase(state, flags=PhaseFlags(kernel_enabled=True))
+    assert target == "KERNEL_AGENT"
+    assert reason == "optimize_no_more_leverage"
+    triggered, _ = _config_dry(state, {})
+    assert triggered is True
+
+
+def test_compute_next_phase_honors_explore_plateau_overrides():
+    """CLI plateau overrides control the actual phase transition."""
+    state = SharedState(
+        phase="FRAMEWORK_AGENT",
+        phase_started_unix=0.0,
+        max_minutes=0,
+        phase_budget_pct={},
+        macro_cycle=0,
+        # Config arm: 3 trailing no-keeps, which matches the override threshold of 3.
+        attempts=[
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+            {"lever_kind": LEVER_CONFIG, "outcome": "REVERT", "adopted": False, "cycle": 0},
+        ],
+        specialist_rounds=[],
+        params_no_promote_streak=0,
+        optimization_stack=[],
+        pending_escalate_hint="",
+        stop_reason="",
+        plateau_overrides={"explore_empty_streak": 3},
+        framework_agent_phase_done=True,
+    )
+
+    target, reason, evidence = compute_next_phase(state, flags=PhaseFlags(kernel_enabled=True))
+
+    assert target == "KERNEL_AGENT"
+    assert reason == "optimize_no_more_leverage"
+    assert evidence["empty_streak_threshold"] == 3

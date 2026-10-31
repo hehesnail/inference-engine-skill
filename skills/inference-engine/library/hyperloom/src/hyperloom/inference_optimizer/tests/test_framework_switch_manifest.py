@@ -1,0 +1,1158 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the framework-rewrite switch manifest and its lever plumbing."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from hyperloom.common.env_safety import BLOCKED_EXTERNAL_ENV_NAMES
+from hyperloom.common.visible_devices import GPU_MASK_ENV_NAMES
+from hyperloom.orchestrator.actions.executors import _framework_switch_manifest as manifest
+
+
+def _entry(switch: str, **kwargs: Any) -> dict[str, Any]:
+    """Build a manifest entry."""
+    return {"switch": switch, **kwargs}
+
+
+# parsing
+
+
+def test_empty_input_is_not_an_error():
+    """No manifest is the normal case for a non-rewrite patch."""
+    assert manifest.parse_manifest(None) == ([], [])
+    assert manifest.parse_manifest([]) == ([], [])
+    assert manifest.parse_manifest({}) == ([], [])
+
+
+def test_a_scalar_manifest_is_rejected_with_a_reason():
+    """A malformed manifest reports why rather than degrading to silence."""
+    switches, problems = manifest.parse_manifest("HL_X=1")
+    assert switches == []
+    assert problems and "list or dict" in problems[0]
+
+
+def test_entries_are_normalised_and_uppercased():
+    """Switch names are env vars, so they are canonicalised to upper case."""
+    switches, problems = manifest.parse_manifest(
+        [_entry("hl_geom_cache", category="memoize_invariant", target="t.py:f")]
+    )
+    assert problems == []
+    assert switches[0]["switch"] == "HL_GEOM_CACHE"
+    assert switches[0]["value"] == manifest.DEFAULT_SWITCH_VALUE
+    assert switches[0]["category"] == "memoize_invariant"
+    assert switches[0]["target"] == "t.py:f"
+
+
+def test_dict_form_is_accepted():
+    """A manifest keyed by switch name parses the same as the list form."""
+    switches, _ = manifest.parse_manifest({"HL_A": {"category": "fuse_collectives"}})
+    assert [s["switch"] for s in switches] == ["HL_A"]
+    assert switches[0]["category"] == "fuse_collectives"
+
+
+def test_an_explicit_value_is_kept():
+    """A rewrite needing a mode rather than a boolean can say so."""
+    switches, _ = manifest.parse_manifest([_entry("HL_ATTN", value="aiter")])
+    assert switches[0]["value"] == "aiter"
+
+
+def test_an_invalid_env_name_is_dropped():
+    """A name that is not a legal env var could never be set."""
+    switches, problems = manifest.parse_manifest([_entry("not a var")])
+    assert switches == []
+    assert any("valid environment variable" in p for p in problems)
+
+
+@pytest.mark.parametrize("reserved", sorted(BLOCKED_EXTERNAL_ENV_NAMES)[:6])
+def test_a_reserved_benchmark_variable_is_dropped(reserved):
+    """Claiming e.g. PATH or TP would retarget the benchmark, not toggle a path."""
+    switches, problems = manifest.parse_manifest([_entry(reserved)])
+    assert switches == []
+    assert any("reserved benchmark variable" in p for p in problems)
+
+
+@pytest.mark.parametrize("mask", sorted(GPU_MASK_ENV_NAMES))
+def test_a_gpu_mask_switch_is_dropped(mask):
+    """Claiming a visibility mask would select the hardware, not toggle a path."""
+    switches, problems = manifest.parse_manifest([_entry(mask)])
+    assert switches == []
+    assert any("reserved benchmark variable" in p for p in problems)
+
+
+def test_a_credential_shaped_switch_is_dropped():
+    """A manifest is held to the same boundary as a reference recipe."""
+    switches, problems = manifest.parse_manifest([_entry("MY_TOKEN")])
+    assert switches == []
+    assert any("credential-shaped name" in p for p in problems)
+
+
+def test_a_switch_colliding_with_benchmark_config_is_dropped():
+    """A switch already set by the config would be toggled by unrelated config."""
+    switches, problems = manifest.parse_manifest(
+        [_entry("HL_CACHE")],
+        reserved_env={"HL_CACHE"},
+    )
+    assert switches == []
+    assert any("already set by the benchmark configuration" in p for p in problems)
+
+
+def test_a_duplicate_switch_is_dropped_once():
+    """Two entries for one switch would register the lever twice."""
+    switches, problems = manifest.parse_manifest([_entry("HL_A"), _entry("hl_a")])
+    assert [s["switch"] for s in switches] == ["HL_A"]
+    assert any("duplicate" in p for p in problems)
+
+
+def test_an_unrecognised_category_is_kept_with_a_warning():
+    """An unknown category is still information; dropping the lever would lose more."""
+    switches, problems = manifest.parse_manifest([_entry("HL_A", category="something_new")])
+    assert switches[0]["category"] == "something_new"
+    assert any("unrecognised category" in p for p in problems)
+
+
+def test_an_oversized_manifest_is_truncated():
+    """A manifest claiming dozens of switches would consume the whole bench budget."""
+    switches, problems = manifest.parse_manifest([_entry(f"HL_S{i}") for i in range(manifest.MAX_SWITCHES + 5)])
+    assert len(switches) == manifest.MAX_SWITCHES
+    assert any("keeping the first" in p for p in problems)
+
+
+def test_a_dangling_dependency_reference_is_dropped():
+    """An edge to a switch that is not in the manifest cannot be honoured."""
+    switches, problems = manifest.parse_manifest([_entry("HL_A", depends_on=["HL_MISSING"])])
+    assert switches[0]["depends_on"] == []
+    assert any("not in this manifest" in p for p in problems)
+
+
+def test_a_self_reference_is_dropped():
+    """A switch cannot depend on itself; the closure would be meaningless."""
+    switches, problems = manifest.parse_manifest([_entry("HL_A", depends_on=["HL_A"])])
+    assert switches[0]["depends_on"] == []
+    assert any("self-reference" in p for p in problems)
+
+
+def test_one_sided_edges_are_mirrored():
+    """Declaring one direction states a real relationship; honour both halves."""
+    switches, _ = manifest.parse_manifest([_entry("HL_HOIST", enables=["HL_CACHE"]), _entry("HL_CACHE")])
+    by_name = {s["switch"]: s for s in switches}
+    assert by_name["HL_CACHE"]["depends_on"] == ["HL_HOIST"]
+    assert by_name["HL_HOIST"]["enables"] == ["HL_CACHE"]
+
+
+def test_a_dependency_cycle_is_broken_and_reported():
+    """A cycle makes the closure unbounded, so the back edge is dropped."""
+    switches, problems = manifest.parse_manifest(
+        [_entry("HL_A", depends_on=["HL_B"]), _entry("HL_B", depends_on=["HL_A"])]
+    )
+    assert any("cyclic dependency" in p for p in problems)
+    for entry in switches:
+        assert manifest.transitive_closure(entry["switch"], switches, "depends_on") <= {"HL_A", "HL_B"}
+
+
+def test_a_switch_with_dependents_is_flagged_as_an_enabler():
+    """The enabler flag is derived, so a specialist cannot forget to set it."""
+    switches, _ = manifest.parse_manifest([_entry("HL_HOIST", enables=["HL_CACHE"]), _entry("HL_CACHE")])
+    by_name = {s["switch"]: s for s in switches}
+    assert by_name["HL_HOIST"]["enabler"] is True
+    assert by_name["HL_CACHE"]["enabler"] is False
+
+
+# dependency reasoning
+
+
+def _chain() -> list[dict[str, Any]]:
+    """Return a parsed three-switch chain: HOIST -> CACHE -> DERIVED."""
+    switches, problems = manifest.parse_manifest(
+        [
+            _entry("HL_HOIST", category="hoist_loop_invariant", enables=["HL_CACHE"]),
+            _entry("HL_CACHE", category="memoize_invariant", enables=["HL_DERIVED"]),
+            _entry("HL_DERIVED", category="memoize_invariant"),
+            _entry("HL_STANDALONE", category="fuse_collectives"),
+        ]
+    )
+    assert problems == []
+    return switches
+
+
+def test_switch_env_turns_everything_on():
+    """The patch is inert until its switches are set, so benching needs them all."""
+    assert manifest.switch_env(_chain()) == {
+        "HL_HOIST": "1",
+        "HL_CACHE": "1",
+        "HL_DERIVED": "1",
+        "HL_STANDALONE": "1",
+    }
+
+
+def test_switch_env_can_be_restricted():
+    """A bundle turns on only its own closure."""
+    assert manifest.switch_env(_chain(), only={"HL_HOIST", "HL_CACHE"}) == {
+        "HL_HOIST": "1",
+        "HL_CACHE": "1",
+    }
+
+
+def test_dependency_closure_is_transitive():
+    """A rewrite two links down the chain needs both links above it."""
+    assert manifest.transitive_closure("HL_DERIVED", _chain(), "depends_on") == {"HL_DERIVED", "HL_CACHE", "HL_HOIST"}
+    assert manifest.transitive_closure("HL_STANDALONE", _chain(), "depends_on") == {"HL_STANDALONE"}
+
+
+def test_dependents_closure_is_transitive():
+    """Turning an enabler off has to turn off everything below it."""
+    assert manifest.transitive_closure("HL_HOIST", _chain(), "enables") == {"HL_HOIST", "HL_CACHE", "HL_DERIVED"}
+    assert manifest.transitive_closure("HL_DERIVED", _chain(), "enables") == {"HL_DERIVED"}
+
+
+def test_closure_of_an_unknown_switch_is_itself():
+    """Callers never have to special-case a name the manifest does not carry."""
+    assert manifest.transitive_closure("HL_ABSENT", _chain(), "depends_on") == {"HL_ABSENT"}
+
+
+# additive variants
+
+
+def test_additive_variants_bundle_each_lever_with_its_dependencies():
+    """An enabler is never measured without the rewrite it unlocks."""
+    variants = manifest.additive_variants(_chain())
+    by_name = {v["name"]: v for v in variants}
+    assert set(by_name["fwlever_hl_derived"]["extra_envs"]) == {"HL_DERIVED", "HL_CACHE", "HL_HOIST"}
+    assert set(by_name["fwlever_hl_cache"]["extra_envs"]) == {"HL_CACHE", "HL_HOIST"}
+    assert set(by_name["fwlever_hl_hoist"]["extra_envs"]) == {"HL_HOIST"}
+    assert set(by_name["fwlever_hl_standalone"]["extra_envs"]) == {"HL_STANDALONE"}
+
+
+def test_additive_variants_are_ordered_smallest_bundle_first():
+    """Single-lever attribution lands before the combinations consume the budget."""
+    sizes = [len(v["framework_lever_bundle"]) for v in manifest.additive_variants(_chain())]
+    assert sizes == sorted(sizes)
+
+
+def test_additive_variants_name_their_dependencies_in_the_note():
+    """The note has to explain why a bundle carries more than one switch."""
+    variants = {v["name"]: v for v in manifest.additive_variants(_chain())}
+    assert "with its dependencies (HL_HOIST)" in variants["fwlever_hl_cache"]["note"]
+
+
+def test_additive_variants_include_the_authored_full_stack():
+    """The author's own combination is a hypothesis worth one leg."""
+    names = [v["name"] for v in manifest.additive_variants(_chain())]
+    assert "fwlever_all" in names
+    full = next(v for v in manifest.additive_variants(_chain()) if v["name"] == "fwlever_all")
+    assert len(full["extra_envs"]) == 4
+    # A combination test attributes to no single lever.
+    assert full["framework_lever"] == ""
+
+
+def test_additive_variants_deduplicate_identical_bundles():
+    """Two levers with the same closure would bench the same configuration twice."""
+    switches, _ = manifest.parse_manifest([_entry("HL_A"), _entry("HL_B", depends_on=["HL_A"])])
+    variants = manifest.additive_variants(switches)
+    bundles = [frozenset(v["framework_lever_bundle"]) for v in variants]
+    assert len(bundles) == len(set(bundles))
+
+
+def test_a_single_lever_needs_no_full_stack_variant():
+    """With one switch the bundle and the full stack are the same experiment."""
+    switches, _ = manifest.parse_manifest([_entry("HL_ONLY")])
+    assert [v["name"] for v in manifest.additive_variants(switches)] == ["fwlever_hl_only"]
+
+
+# leave-one-out variants
+
+
+def test_leave_one_out_removes_a_lever_with_its_dependents():
+    """Leaving a dependent on without its enabler measures a broken config."""
+    variants = {v["name"]: v for v in manifest.leave_one_out_variants(_chain())}
+    assert set(variants["fwlever_drop_hl_cache"]["unset_envs"]) == {"HL_CACHE", "HL_DERIVED"}
+    assert set(variants["fwlever_drop_hl_derived"]["unset_envs"]) == {"HL_DERIVED"}
+    assert set(variants["fwlever_drop_hl_standalone"]["unset_envs"]) == {"HL_STANDALONE"}
+
+
+def test_leave_one_out_skips_a_removal_that_empties_the_stack():
+    """Removing everything reproduces the pre-patch baseline, already measured."""
+    names = [v["name"] for v in manifest.leave_one_out_variants(_chain())]
+    # Dropping the root enabler would take HL_CACHE and HL_DERIVED with it, but HL_STANDALONE survives, so it is a
+    # real experiment and is kept.
+    assert "fwlever_drop_hl_hoist" in names
+    chain_only, _ = manifest.parse_manifest([_entry("HL_HOIST", enables=["HL_CACHE"]), _entry("HL_CACHE")])
+    assert "fwlever_drop_hl_hoist" not in [v["name"] for v in manifest.leave_one_out_variants(chain_only)]
+
+
+def test_leave_one_out_needs_at_least_two_levers():
+    """With one lever, removing it is just the baseline."""
+    switches, _ = manifest.parse_manifest([_entry("HL_ONLY")])
+    assert manifest.leave_one_out_variants(switches) == []
+
+
+def test_leave_one_out_variants_carry_no_extra_envs():
+    """A removal variant must not also add anything, or the delta is unreadable."""
+    for variant in manifest.leave_one_out_variants(_chain()):
+        assert "extra_envs" not in variant
+        assert variant["unset_envs"]
+
+
+# summary
+
+
+def test_summary_is_empty_for_nothing():
+    """A non-rewrite patch logs no manifest block."""
+    assert manifest.summarize([], []) == ""
+
+
+def test_summary_lists_switches_and_problems():
+    """The log line carries both what was accepted and what was dropped."""
+    switches, _ = manifest.parse_manifest([_entry("HL_A", category="memoize_invariant", target="a.py:f")])
+    text = manifest.summarize(switches, ["dropped HL_B: bad name"])
+    assert "HL_A" in text
+    assert "category=memoize_invariant" in text
+    assert "! dropped HL_B" in text
+
+
+# unarmed switch gates
+
+
+def _diff(*added: str, context: tuple[str, ...] = (), removed: tuple[str, ...] = ()) -> str:
+    """Build a one-file diff with the given added, context and removed lines."""
+    body = [f" {line}" for line in context] + [f"-{line}" for line in removed] + [f"+{line}" for line in added]
+    header = "diff --git a/src.py b/src.py\n--- a/src.py\n+++ b/src.py\n@@ -1,1 +1,2 @@\n"
+    return header + "\n".join(body) + "\n"
+
+
+def test_a_name_the_patch_adds_a_read_of_and_nothing_sets_is_listed():
+    """The lead the next mandate carries: the patch reads it, the bench had no value for it."""
+    patch = _diff('    if os.environ.get("HL_FUSE_RMSNORM") == "1":')
+    assert manifest.unarmed_env_reads([patch], armed=set()) == ["HL_FUSE_RMSNORM"]
+
+
+def test_every_read_form_is_seen():
+    """A kernel-side rewrite reads its env from C just as the Python side does."""
+    patch = _diff(
+        '    a = os.getenv("HL_A")',
+        '    b = os.environ["HL_B"]',
+        '    const char* c = std::getenv("HL_C");',
+    )
+    assert manifest.unarmed_env_reads([patch]) == ["HL_A", "HL_B", "HL_C"]
+
+
+def test_a_name_something_sets_is_not_listed():
+    """The manifest switches and the proposal's extra_envs both set names for the bench."""
+    patch = _diff('    if os.environ.get("HL_FUSE") == "1":')
+    assert manifest.unarmed_env_reads([patch], armed={"HL_FUSE"}) == []
+
+
+def test_a_read_the_file_already_had_is_not_this_rounds_lead():
+    """The patch moved an existing read, so it says nothing about what this round changed."""
+    patch = _diff(
+        '    flag = os.environ.get("HL_OLD")',
+        context=('    if os.environ.get("HL_OLD") == "1":',),
+    )
+    assert manifest.unarmed_env_reads([patch]) == []
+
+
+def test_a_read_the_patch_rewrites_in_place_is_not_new():
+    """Replacing the line that reads a name does not make it this round's doing."""
+    patch = _diff(
+        '    flag = os.environ.get("HL_OLD", "0")',
+        removed=('    flag = os.environ.get("HL_OLD")',),
+    )
+    assert manifest.unarmed_env_reads([patch]) == []
+
+
+def test_a_secret_shaped_name_is_not_listed():
+    """A credential the patch reads is never a switch of the round's own."""
+    patch = _diff('    key = os.environ.get("HF_TOKEN")')
+    assert manifest.unarmed_env_reads([patch]) == []
+
+
+def test_the_patch_set_is_read_as_one_change():
+    """One patch adding a read of what another patch's file already reads is not new either."""
+    adds = _diff('    flag = os.environ.get("HL_SHARED")')
+    reads_already = _diff("    pass", context=('    if os.environ.get("HL_SHARED") == "1":',))
+    assert manifest.unarmed_env_reads([adds, reads_already]) == []
+
+
+def test_a_falsy_default_is_listed():
+    """Unset and "0" reach the same branch, so setting the name is still worth checking."""
+    patch = _diff('    if os.environ.get("HL_FUSE", "0") == "1":')
+    assert manifest.unarmed_env_reads([patch]) == ["HL_FUSE"]
+
+
+def test_a_read_with_a_non_falsy_default_is_not_listed():
+    """Set or unset, the line runs the same way, so it explains no inert bench."""
+    patch = _diff('    if os.environ.get("SGLANG_USE_NEW_PATH", "1") == "1":')
+    assert manifest.unarmed_env_reads([patch], armed={"PATH", "HOME"}) == []
+
+
+def test_a_tuning_default_is_not_listed():
+    """A read that falls back to a usable value leaves nothing to check."""
+    patch = _diff(
+        '    root = os.getenv("ROCM_PATH", "/opt/rocm")',
+        '    streams = int(os.environ.get("HL_STREAMS", "4"))',
+    )
+    assert manifest.unarmed_env_reads([patch], armed={"PATH", "HOME"}) == []
+
+
+def test_a_launcher_provided_name_is_not_listed():
+    """Rank and world topology come from the launch per process; no round sets them."""
+    patch = _diff(
+        '    rank = int(os.environ.get("LOCAL_RANK", "0"))',
+        '    size = os.environ["WORLD_SIZE"]',
+        '    node = os.getenv("SLURM_PROCID")',
+    )
+    assert manifest.unarmed_env_reads([patch], armed={"PATH", "HOME"}) == []
+
+
+def test_a_benchmark_owned_name_is_not_listed():
+    """A manifest may not claim it either, so a round could not have set it."""
+    patch = _diff('    out = os.environ["RESULT_DIR"]')
+    assert manifest.unarmed_env_reads([patch]) == []
+
+
+def test_a_default_that_is_not_a_literal_is_not_listed():
+    """Nothing readable here says an unset name changes what the line does."""
+    patch = _diff('    mode = os.environ.get("HL_MODE", _DEFAULT_MODE)')
+    assert manifest.unarmed_env_reads([patch]) == []
+
+
+def test_the_unset_name_is_listed_next_to_reads_that_are_set_elsewhere():
+    """A patch that reads its rank and a name of its own leaves one name to check."""
+    patch = _diff(
+        '    rank = int(os.environ.get("LOCAL_RANK", "0"))',
+        '    if os.environ.get("HL_FUSE_RMSNORM") == "1":',
+    )
+    assert manifest.unarmed_env_reads([patch]) == ["HL_FUSE_RMSNORM"]
+
+
+def test_a_read_the_scan_cannot_read_as_a_switch_is_listed_all_the_same():
+    """What the list is and is not.
+
+    An opt-out switch runs the change precisely while the name is unset, a
+    write sets the name rather than reading it, and a value read gates
+    nothing at all — on the line, all three look like the switch above. The
+    scan reports them, which is why nothing refuses a round over this list:
+    it is read next to a bench that already came out inert, where it is a
+    place to look.
+    """
+    opt_out = _diff(
+        '    if not os.environ.get("HL_DISABLE_NEW"):',
+        '    if (!std::getenv("HL_DISABLE_FAST_PATH")) {',
+        '    use_new = os.environ.get("HL_LEGACY_PATH") is None',
+        '    off = bool(int(os.getenv("VLLM_ROCM_DISABLE_NEW_PATH", "0")))',
+    )
+    writes = _diff('    os.environ["SGLANG_ENABLE_X"] = "1"', '    del os.environ["SGLANG_OLD"]')
+    values = _diff('    cache = os.environ.get("TRITON_CACHE_DIR") or default_dir', '    hip = os.getenv("HIP_PATH")')
+    assert manifest.unarmed_env_reads([opt_out]) == [
+        "HL_DISABLE_FAST_PATH",
+        "HL_DISABLE_NEW",
+        "HL_LEGACY_PATH",
+        "VLLM_ROCM_DISABLE_NEW_PATH",
+    ]
+    assert manifest.unarmed_env_reads([writes]) == ["SGLANG_ENABLE_X", "SGLANG_OLD"]
+    assert manifest.unarmed_env_reads([values]) == ["HIP_PATH", "TRITON_CACHE_DIR"]
+
+
+# SharedState lever ledger
+
+
+def _state():
+    """Return a fresh SharedState."""
+    from hyperloom.orchestrator.state.shared_state import SharedState
+
+    return SharedState()
+
+
+def test_levers_are_registered_with_their_state():
+    """A registered lever records whether it is currently on."""
+    state = _state()
+    switches = _chain()
+    assert state.record_authored_framework_levers(switches, default_on=False)
+    rows = state.authored_framework_levers
+    assert [r["switch"] for r in rows] == ["HL_HOIST", "HL_CACHE", "HL_DERIVED", "HL_STANDALONE"]
+    assert all(r["default_on"] is False for r in rows)
+    assert rows[0]["attributed_gain_pct"] is None
+
+
+def test_re_registering_a_lever_does_not_duplicate_it():
+    """A rewrite re-authored in a later round keeps one lever row."""
+    state = _state()
+    state.record_authored_framework_levers(_chain(), default_on=False)
+    state.record_authored_framework_levers(_chain(), default_on=True)
+    assert len(state.authored_framework_levers) == 4
+    assert all(r["default_on"] is True for r in state.authored_framework_levers)
+
+
+def test_re_registering_preserves_a_measured_attribution():
+    """A measurement outranks a re-registration; losing it would re-bench the lever."""
+    state = _state()
+    state.record_authored_framework_levers(_chain(), default_on=False)
+    state.record_framework_lever_attribution("HL_CACHE", gain_pct=7.5)
+    state.record_authored_framework_levers(_chain(), default_on=True)
+    row = next(r for r in state.authored_framework_levers if r["switch"] == "HL_CACHE")
+    assert row["attributed_gain_pct"] == pytest.approx(7.5)
+
+
+def test_registering_nothing_is_a_noop():
+    """A non-rewrite patch leaves the ledger untouched."""
+    state = _state()
+    assert state.record_authored_framework_levers([], default_on=True) is False
+    assert state.authored_framework_levers == []
+
+
+def test_attribution_of_an_unknown_switch_is_ignored():
+    """A stale attribution cannot invent a lever row."""
+    state = _state()
+    assert state.record_framework_lever_attribution("HL_GHOST", gain_pct=1.0) is False
+
+
+def _entry_parsed(switch: str) -> dict[str, Any]:
+    """Return a single parsed manifest entry for ``switch``."""
+    switches, _ = manifest.parse_manifest([_entry(switch)])
+    return switches[0]
+
+
+# explore seeding
+
+
+def test_dormant_levers_seed_additive_variants():
+    """Code kept inert is turned on one dependency-closed bundle at a time."""
+    from hyperloom.orchestrator.actions.executors.explore import framework_lever_grid
+
+    state = _state()
+    state.record_authored_framework_levers(_chain(), default_on=False)
+    payload = framework_lever_grid(state)
+    assert payload
+    assert all(v["framework_lever_source"] == "additive" for v in payload)
+    assert all("extra_envs" in v for v in payload)
+
+
+def test_active_levers_seed_leave_one_out_variants():
+    """A stack that already won is attributed by removing one lever at a time."""
+    from hyperloom.orchestrator.actions.executors.explore import framework_lever_grid
+
+    state = _state()
+    state.record_authored_framework_levers(_chain(), default_on=True)
+    payload = framework_lever_grid(state)
+    assert payload
+    assert all(v["framework_lever_source"] == "leave_one_out" for v in payload)
+    assert all("unset_envs" in v for v in payload)
+
+
+def test_already_attributed_levers_are_not_re_benched():
+    """A lever with a number spends no further legs."""
+    from hyperloom.orchestrator.actions.executors.explore import framework_lever_grid
+
+    state = _state()
+    state.record_authored_framework_levers(_chain(), default_on=False)
+    for row in state.authored_framework_levers:
+        state.record_framework_lever_attribution(row["switch"], gain_pct=1.0)
+    assert framework_lever_grid(state) == []
+
+
+def test_no_levers_means_no_seeding():
+    """The seeder is inert for every framework that has no authored rewrites."""
+    from hyperloom.orchestrator.actions.executors.explore import framework_lever_grid
+
+    assert framework_lever_grid(None) == []
+    assert framework_lever_grid(_state()) == []
+
+
+def test_lever_variants_survive_the_payload_parser():
+    """The parsed variant keeps the name attribution joins on and the unset the leg needs, or attribution is lost."""
+    from hyperloom.orchestrator.actions.executors.explore import (
+        _framework_lever_attributions,
+        _grid_variants_from_payload,
+        framework_lever_grid,
+    )
+
+    state = _state()
+    state.record_authored_framework_levers(_chain(), default_on=True)
+    payload = framework_lever_grid(state)
+    variants = _grid_variants_from_payload(payload)
+    assert len(variants) == len(payload)
+    assert all(v.unset_envs for v in variants)
+
+    outcomes = [{"variant_name": v.name, "outcome": "REVERT", "metrics": {"gain_pct": -2.0}} for v in variants]
+    attributed = _framework_lever_attributions(outcomes, payload)
+    assert {row["switch"] for row in attributed} == {str(v.get("framework_lever")) for v in payload}
+    # leave_one_out: dropping a lever that cost 2% credits it with +2%.
+    assert all(row["gain_pct"] == pytest.approx(2.0) for row in attributed)
+
+
+# attribution sign convention
+
+
+def test_additive_attribution_takes_the_measured_gain_directly():
+    """Switching a lever on measures its contribution as-is."""
+    from hyperloom.orchestrator.actions.executors.explore import _framework_lever_attributions
+
+    seeds = [{"name": "fwlever_hl_a", "framework_lever": "HL_A", "framework_lever_source": "additive"}]
+    outcomes = [{"variant_name": "fwlever_hl_a", "outcome": "KEEP", "metrics": {"gain_pct": 6.2}}]
+    assert _framework_lever_attributions(outcomes, seeds) == [
+        {
+            "switch": "HL_A",
+            "gain_pct": 6.2,
+            "source": "additive",
+            "variant_name": "fwlever_hl_a",
+            "outcome": "KEEP",
+        }
+    ]
+
+
+def test_leave_one_out_attribution_negates_the_measured_gain():
+    """Removing a lever measures the negative of its contribution."""
+    from hyperloom.orchestrator.actions.executors.explore import _framework_lever_attributions
+
+    seeds = [
+        {
+            "name": "fwlever_drop_hl_a",
+            "framework_lever": "HL_A",
+            "framework_lever_source": "leave_one_out",
+        }
+    ]
+    outcomes = [{"variant_name": "fwlever_drop_hl_a", "outcome": "REVERT", "metrics": {"gain_pct": -8.0}}]
+    assert _framework_lever_attributions(outcomes, seeds)[0]["gain_pct"] == pytest.approx(8.0)
+
+
+def test_a_combination_variant_attributes_to_nothing():
+    """The full-stack leg is a combination test, not one rewrite's number."""
+    from hyperloom.orchestrator.actions.executors.explore import _framework_lever_attributions
+
+    seeds = [{"name": "fwlever_all", "framework_lever": "", "framework_lever_source": "additive"}]
+    outcomes = [{"variant_name": "fwlever_all", "outcome": "KEEP", "metrics": {"gain_pct": 12.0}}]
+    assert _framework_lever_attributions(outcomes, seeds) == []
+
+
+def test_an_unmeasured_variant_attributes_to_nothing():
+    """A failed or killed leg produces no number, so it records none."""
+    from hyperloom.orchestrator.actions.executors.explore import _framework_lever_attributions
+
+    seeds = [{"name": "fwlever_hl_a", "framework_lever": "HL_A", "framework_lever_source": "additive"}]
+    outcomes = [{"variant_name": "fwlever_hl_a", "outcome": "FAILED", "metrics": {}}]
+    assert _framework_lever_attributions(outcomes, seeds) == []
+
+
+def test_non_lever_variants_are_ignored():
+    """An ordinary config variant in the same round is not a lever attribution."""
+    from hyperloom.orchestrator.actions.executors.explore import _framework_lever_attributions
+
+    seeds = [{"name": "fwlever_hl_a", "framework_lever": "HL_A", "framework_lever_source": "additive"}]
+    outcomes = [{"variant_name": "myfw_hw_queues_2", "outcome": "KEEP", "metrics": {"gain_pct": 3.0}}]
+    assert _framework_lever_attributions(outcomes, seeds) == []
+
+
+# two-tier verdict in integrate_patch
+
+
+_REWRITE_PATCH = """\
+diff --git a/src.py b/src.py
+index 0000000..1111111 100644
+--- a/src.py
++++ b/src.py
+@@ -1,2 +1,2 @@
+ def f():
+-    return 1
++    return 2
+"""
+
+# Default manifest for the integrate_patch runs below: a hoist enabler plus the
+# cache it unlocks. Named so a test can pass ``switches=[]`` to mean "no manifest
+# at all", which is a materially different case from "the default one".
+_DEFAULT_MANIFEST: list[dict[str, Any]] = [
+    {"switch": "HL_HOIST", "category": "hoist_loop_invariant", "enables": ["HL_CACHE"]},
+    {"switch": "HL_CACHE", "category": "memoize_invariant"},
+]
+
+
+@pytest.fixture(autouse=True)
+def _allowlist_tmp_framework_roots(monkeypatch, tmp_path):
+    """Let integrate_patch treat the test's temp checkout as framework source."""
+    from .conftest import patch_integrate_patch_roots
+
+    patch_integrate_patch_roots(monkeypatch, tmp_path)
+
+
+async def _run_rewrite_integrate(
+    tmp_path,
+    monkeypatch,
+    *,
+    delta_pct: float,
+    accuracy_pass: bool | None = True,
+    switches: "list[dict[str, Any]] | None" = _DEFAULT_MANIFEST,
+    parity_delta_pct: float = 0.0,
+    parity_accuracy_pass: bool | None = True,
+    parity_tput_missing: bool = False,
+    patch_body: str | None = None,
+    extra_params: "dict[str, Any] | None" = None,
+):
+    """Run integrate_patch on a switch-gated rewrite patch with a faked bench."""
+    import json as _json
+
+    from .conftest import init_git_repo
+    from hyperloom.orchestrator.actions.executors.integrate_patch import IntegratePatchExecutor
+    from hyperloom.orchestrator.loop.sub_agent_runner import RunnerContext
+    from hyperloom.orchestrator.state.task_registry import Task
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    repo = tmp_path / "framework"
+    init_git_repo(repo)
+    workspace = session_dir / "runs" / "specialist" / "t-spec-rw"
+    (workspace / "worktree" / "patches").mkdir(parents=True)
+    (workspace / "worktree" / "patches" / "001_rewrite.patch").write_text(
+        patch_body or _REWRITE_PATCH, encoding="utf-8"
+    )
+    (workspace / "specialist_done.json").write_text(
+        _json.dumps(
+            {
+                "gap_canonical_id": "gap.rewrite",
+                "domain": "framework_rewrite_specialist",
+                "proposal_set": [],
+                "patches_written": ["patches/001_rewrite.patch"],
+                "summary": "switch-gated rewrites",
+                manifest.MANIFEST_KEY: list(switches or []),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    base_tput = 100.0
+    executor = IntegratePatchExecutor(session_dir=session_dir)
+    benched_envs: dict[str, str] = {}
+    legs: list[dict[str, Any]] = []
+
+    async def _fake_bench(bench, **kwargs):
+        legs.append(dict(kwargs))
+        is_parity = bool(kwargs.get("unset_envs"))
+        if is_parity:
+            if parity_tput_missing:
+                # The leg ran but no throughput came back: a measurement failure, which says nothing either way about
+                # whether the patch is inert.
+                return ({}, {"accuracy_pass": None, "timed_out": False})
+            # A well-behaved default-off patch reproduces the base exactly.
+            return (
+                {"output_throughput": base_tput * (1.0 + parity_delta_pct / 100.0)},
+                {"accuracy_pass": parity_accuracy_pass, "timed_out": False},
+            )
+        benched_envs.update(kwargs.get("extra_envs_applied") or {})
+        return (
+            {"output_throughput": base_tput * (1.0 + delta_pct / 100.0)},
+            {"accuracy_pass": accuracy_pass, "timed_out": False},
+        )
+
+    async def _noop_kb(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(executor, "_bench_patch", _fake_bench)
+    monkeypatch.setattr(executor, "_maybe_write_framework_kb_record", _noop_kb)
+
+    task_params: dict[str, Any] = {
+        "specialist_task_id": "t-spec-rw",
+        "framework_source_root": str(repo),
+        "base_tput": base_tput,
+        "accuracy_baseline": 1.0,
+    }
+    if extra_params:
+        task_params.update(extra_params)
+    task = Task(
+        task_id="t-int-rw",
+        kind="integrate_patch",
+        state="queued",
+        params=task_params,
+        idempotency_key="t-int-rw",
+        requires_lanes=tuple(),
+    )
+    result = await executor(RunnerContext(task=task, lease=None, extra={}))
+    return result, repo, benched_envs, legs
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_patch_is_benched_with_its_switches_on(tmp_path, monkeypatch):
+    """An applied rewrite patch is inert, so benching it as-is would measure nothing."""
+    _, _, benched_envs, _ = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=8.0)
+    assert benched_envs == {"HL_HOIST": "1", "HL_CACHE": "1"}
+
+
+@pytest.mark.asyncio
+async def test_a_winning_bundle_keeps_and_registers_levers_as_on(tmp_path, monkeypatch):
+    """Clearing the gate puts the switches in the running config, ready for removal tests."""
+    result, repo, _, _ = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=8.0)
+    assert result["status"] == "kept"
+    assert result["framework_lever_outcome"] == "default_on"
+    assert {row["switch"] for row in result["framework_levers"]} == {"HL_HOIST", "HL_CACHE"}
+    assert result["extra_envs_applied"] == {"HL_HOIST": "1", "HL_CACHE": "1"}
+    assert (repo / "src.py").read_text().endswith("return 2\n")
+
+
+@pytest.mark.asyncio
+async def test_an_unprofitable_bundle_is_kept_inert_with_levers_registered(tmp_path, monkeypatch):
+    """A bundle that misses the threshold keeps its code dormant instead of reverting."""
+    result, repo, _, _ = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=0.2)
+    assert result["status"] == "kept_inert"
+    assert result["framework_lever_outcome"] == "registered_off"
+    assert len(result["patches_applied"]) == 1
+    # Nothing may enter the running configuration.
+    assert result["extra_envs_applied"] == {}
+    assert result["extra_envs_applied"] == {}
+    # The code is still on disk, just dormant.
+    assert (repo / "src.py").read_text().endswith("return 2\n")
+    assert "enabler" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_an_inert_keep_is_committed_so_the_next_revert_keeps_it(tmp_path, monkeypatch):
+    """Revert is a reset to HEAD; uncommitted inert code would be stashed as user changes."""
+    import subprocess
+
+    result, repo, _, _ = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=0.2)
+    assert result["status"] == "kept_inert"
+    status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+    assert status.stdout.strip() == ""
+    head_src = subprocess.run(["git", "-C", str(repo), "show", "HEAD:src.py"], capture_output=True, text=True)
+    assert head_src.stdout.endswith("return 2\n")
+
+
+@pytest.mark.asyncio
+async def test_without_a_base_an_unprofitable_bundle_reverts_instead_of_keeping_inert(tmp_path, monkeypatch):
+    """Before anything boots there is no base, so inertness cannot be shown and the code must not stay."""
+    result, repo, _, legs = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=0.2,
+        extra_params={"base_tput": 0.0},
+    )
+    assert result["status"] == "reverted"
+    assert result["error_class"] == "switch_off_parity_inconclusive"
+    assert not [leg for leg in legs if leg.get("unset_envs")]
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_an_incorrect_switched_rewrite_is_kept_inert_and_flagged(tmp_path, monkeypatch):
+    """A correctness failure on a bundle names the bundle, not a switch."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=0.2,
+        accuracy_pass=False,
+    )
+    assert result["status"] == "kept_inert"
+    assert result.get("quality_unverified") is True
+    # Applied but dormant: nothing may enter current_best off this verdict.
+    assert result["extra_envs_applied"] == {}
+    assert result["extra_envs_applied"] == {}
+    assert (repo / "src.py").read_text().endswith("return 2\n")
+
+
+@pytest.mark.asyncio
+async def test_a_patch_without_a_manifest_still_reverts_on_a_miss(tmp_path, monkeypatch):
+    """The inert-keep path is opt-in via the manifest; ordinary patches are unchanged."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=0.2,
+        switches=[],
+    )
+    assert result["status"] == "reverted"
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_inert_keep_flows_into_the_lever_ledger(tmp_path, monkeypatch):
+    """The writeback registers inert levers without lifting current_best."""
+    from hyperloom.inference_optimizer.session.optimization_journal import Verdict
+    from hyperloom.orchestrator.loop._promote_outcome import _PromoteOutcome
+
+    from .conftest import make_coordinator
+
+    result, _, _, _ = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=0.2)
+    state = _state()
+    state.baseline_tput = 100.0
+    state.save(tmp_path)
+    coord = make_coordinator(tmp_path)
+    state = coord.shared_state
+
+    outcome = _PromoteOutcome(verdict=Verdict.RECORDED)
+    await coord.writeback._promote_integrate_patch(result, None, outcome)
+    assert outcome.verdict is Verdict.RECORDED
+    assert [row["switch"] for row in state.authored_framework_levers] == ["HL_HOIST", "HL_CACHE"]
+    assert all(row["default_on"] is False for row in state.authored_framework_levers)
+    assert not state.current_best
+
+
+# switch-off parity
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_without_a_patch_registers_no_levers(tmp_path, monkeypatch):
+    """Switches gating code that was never delivered must not become levers."""
+    import json as _json
+
+    from .conftest import init_git_repo
+    from hyperloom.orchestrator.actions.executors.integrate_patch import IntegratePatchExecutor
+    from hyperloom.orchestrator.loop.sub_agent_runner import RunnerContext
+    from hyperloom.orchestrator.state.task_registry import Task
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    repo = tmp_path / "framework"
+    init_git_repo(repo)
+    workspace = session_dir / "runs" / "specialist" / "t-spec-nopatch"
+    workspace.mkdir(parents=True)
+    (workspace / "specialist_done.json").write_text(
+        _json.dumps(
+            {
+                "proposal_set": [],
+                "patches_written": [],
+                manifest.MANIFEST_KEY: _DEFAULT_MANIFEST,
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = await IntegratePatchExecutor(session_dir=session_dir)(
+        RunnerContext(
+            task=Task(
+                task_id="t-int-nopatch",
+                kind="integrate_patch",
+                state="queued",
+                params={"specialist_task_id": "t-spec-nopatch", "framework_source_root": str(repo)},
+                idempotency_key="t-int-nopatch",
+                requires_lanes=tuple(),
+            ),
+            lease=None,
+            extra={},
+        )
+    )
+    assert result["status"] == "no_patches"
+    assert not result.get("framework_levers")
+
+
+@pytest.mark.asyncio
+async def test_parity_leg_runs_with_every_switch_removed(tmp_path, monkeypatch):
+    """The parity leg must guarantee the switches are absent, not merely unset."""
+    _, _, _, legs = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=8.0)
+    parity_legs = [leg for leg in legs if leg.get("unset_envs")]
+    assert len(parity_legs) == 1
+    assert set(parity_legs[0]["unset_envs"]) == {"HL_HOIST", "HL_CACHE"}
+    assert parity_legs[0]["extra_envs_applied"] == {}
+    # A distinct variant name, or the second leg would collide with the first.
+    assert parity_legs[0]["variant_suffix"] == "-parity"
+
+
+@pytest.mark.asyncio
+async def test_a_clean_parity_leg_is_recorded_on_the_keep(tmp_path, monkeypatch):
+    """A KEEP carries its own evidence that the patch is inert when disabled."""
+    result, _, _, _ = await _run_rewrite_integrate(tmp_path, monkeypatch, delta_pct=8.0)
+    assert result["status"] == "kept"
+    parity = result["switch_off_parity"]
+    assert parity["ran"] is True
+    assert parity["ok"] is True
+    assert parity["delta_pct"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_a_patch_that_is_not_inert_when_disabled_is_reverted(tmp_path, monkeypatch):
+    """A rewrite that changes throughput with its switches off breaks the contract."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        parity_delta_pct=9.0,
+    )
+    assert result["status"] == "reverted"
+    assert result["error_class"] == "switch_off_parity_failed"
+    assert "not a default-off rewrite" in result["reason"]
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_a_plain_patch_without_a_manifest_is_still_benched(tmp_path, monkeypatch):
+    """Most framework work is a straight edit with no switch, and must still run.
+
+    Without a manifest there are no levers and no parity leg, but the patch is a
+    patch: it earns a benchmark like any other.
+    """
+    _result, _, _, legs = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        switches=[],
+    )
+    assert legs, "a plain patch must still be benched"
+
+
+@pytest.mark.asyncio
+async def test_a_parity_leg_that_produced_no_measurement_is_not_called_a_parity_violation(tmp_path, monkeypatch):
+    """\"We could not measure it\" and \"the patch is not inert\" are different findings."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        parity_tput_missing=True,
+    )
+    assert result["status"] == "reverted"
+    assert result["error_class"] == "switch_off_parity_inconclusive"
+    assert "not actually inert" not in result["reason"]
+    assert "could not be measured" in result["reason"]
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+def test_both_parity_outcomes_are_writable_to_the_framework_kb():
+    """A verdict the KB rejects is a verdict that never reaches the next session."""
+    from hyperloom.orchestrator.knowledge import kb_writeback
+
+    assert kb_writeback.OUTCOME_REVERTED_SWITCH_OFF_PARITY in kb_writeback.ALLOWED_OUTCOMES
+    assert kb_writeback.OUTCOME_REVERTED_PARITY_INCONCLUSIVE in kb_writeback.ALLOWED_OUTCOMES
+    # The two must stay distinct: one is a property of the patch, the other of the run.
+    assert kb_writeback.OUTCOME_REVERTED_SWITCH_OFF_PARITY != kb_writeback.OUTCOME_REVERTED_PARITY_INCONCLUSIVE
+
+
+@pytest.mark.asyncio
+async def test_parity_noise_inside_the_band_is_tolerated(tmp_path, monkeypatch):
+    """Run-to-run variance must not be mistaken for a behavioural change."""
+    result, _, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        parity_delta_pct=1.0,
+    )
+    assert result["status"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_a_parity_leg_that_fails_correctness_reverts(tmp_path, monkeypatch):
+    """Different output with the switches off is a behavioural change too."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        parity_accuracy_pass=False,
+    )
+    assert result["status"] == "reverted"
+    assert result["error_class"] == "switch_off_parity_failed"
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_parity_guards_the_inert_keep_too(tmp_path, monkeypatch):
+    """An inert KEEP leaves code on disk, so it needs the same guarantee."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=0.2,
+        parity_delta_pct=-5.0,
+    )
+    assert result["status"] == "reverted"
+    assert result["error_class"] == "switch_off_parity_failed"
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_a_correctness_failure_still_spends_a_parity_leg_on_a_switched_bundle(tmp_path, monkeypatch):
+    """A quality regression condemns one switch, not the whole bundle."""
+    result, repo, _, legs = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        accuracy_pass=False,
+    )
+    assert [leg for leg in legs if leg.get("unset_envs")], "parity must run to decide if the code can stay"
+    assert result["status"] == "kept_inert"
+    assert result.get("quality_unverified") is True
+    # The code stays on disk with the switches off, for explore to bisect.
+    assert (repo / "src.py").read_text().endswith("return 2\n")
+
+
+@pytest.mark.asyncio
+async def test_a_correctness_failure_without_switches_still_reverts(tmp_path, monkeypatch):
+    """An unswitched patch has nothing to bisect, so a quality regression reverts it."""
+    result, repo, _, legs = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        accuracy_pass=False,
+        switches=[],
+    )
+    assert result["status"] == "reverted"
+    assert not [leg for leg in legs if leg.get("unset_envs")]
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_that_is_not_inert_still_reverts_despite_the_bisect_path(tmp_path, monkeypatch):
+    """Keeping code is only safe when 'off' is genuinely off."""
+    result, repo, _, _ = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        accuracy_pass=False,
+        parity_delta_pct=9.0,
+    )
+    assert result["status"] == "reverted"
+    assert result["error_class"] == "switch_off_parity_failed"
+    assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_a_patch_without_switches_spends_no_parity_leg(tmp_path, monkeypatch):
+    """Parity only means something for a default-off patch."""
+    _, _, _, legs = await _run_rewrite_integrate(
+        tmp_path,
+        monkeypatch,
+        delta_pct=8.0,
+        switches=[],
+    )
+    assert not [leg for leg in legs if leg.get("unset_envs")]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_parity_leg_does_not_read_as_a_pass(tmp_path, monkeypatch):
+    """A probe that cannot run has proved nothing, so it must not wave the patch through."""
+    from hyperloom.orchestrator.actions.executors._integrate_results import _PatchBench
+    from hyperloom.orchestrator.actions.executors.integrate_patch import IntegratePatchExecutor
+
+    executor = IntegratePatchExecutor(session_dir=tmp_path)
+
+    async def _raising_bench(*_args, **_kwargs):
+        raise OSError("bench harness exploded")
+
+    monkeypatch.setattr(executor, "_bench_patch", _raising_bench)
+    verdict = await executor._switch_off_parity(
+        _PatchBench(params={}, output_root=tmp_path, specialist_task_id="t"), switch_manifest=_chain(), base_tput=100.0
+    )
+    assert verdict["ran"] is True
+    assert verdict["ok"] is False
+    assert "raised" in verdict["reason"]
+
+
+@pytest.mark.asyncio
+async def test_parity_without_a_base_is_reported_as_not_run(tmp_path):
+    """No base to compare against means the check was skipped, not that it passed."""
+    from hyperloom.orchestrator.actions.executors._integrate_results import _PatchBench
+    from hyperloom.orchestrator.actions.executors.integrate_patch import IntegratePatchExecutor
+
+    verdict = await IntegratePatchExecutor(session_dir=tmp_path)._switch_off_parity(
+        _PatchBench(params={}, output_root=tmp_path, specialist_task_id="t"), switch_manifest=_chain(), base_tput=0.0
+    )
+    assert verdict["ran"] is False
+    assert "no positive base throughput" in verdict["reason"]
+
+
+@pytest.mark.asyncio
+async def test_parity_can_be_switched_off_explicitly(tmp_path):
+    """An operator debugging the harness can take the extra leg out."""
+    from hyperloom.orchestrator.actions.executors._integrate_results import _PatchBench
+    from hyperloom.orchestrator.actions.executors.integrate_patch import IntegratePatchExecutor
+
+    verdict = await IntegratePatchExecutor(session_dir=tmp_path)._switch_off_parity(
+        _PatchBench(params={"enable_switch_off_parity": False}, output_root=tmp_path, specialist_task_id="t"),
+        switch_manifest=_chain(),
+        base_tput=100.0,
+    )
+    assert verdict["ran"] is False
+    assert verdict["ok"] is True

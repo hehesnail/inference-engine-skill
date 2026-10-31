@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""GitHub Search backend for perf PR candidate discovery."""
+
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import urllib.parse
+import urllib.request
+
+from hyperloom.common.github_urls import repo_slug as parse_repo_slug
+
+from ._shared import GitHubPr
+
+
+def _auth_headers(accept: str) -> dict[str, str]:
+    """Build request headers, adding a bearer token when one is configured."""
+    headers = {"Accept": accept, "User-Agent": "framework-agent/0.1"}
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+PERF_TERMS = (
+    "perf",
+    "performance",
+    "throughput",
+    "rocm",
+    "aiter",
+    "flash",
+    "decode",
+)
+
+#: GitHub Search answers HTTP 422 past five boolean operators.
+_MAX_OR_TERMS = 6
+
+
+def _build_query(repo: str, *, terms: tuple[str, ...]) -> str:
+    """Compose a GitHub Search query scoped to ``repo`` that ORs the first ``_MAX_OR_TERMS`` of ``terms``."""
+    return f"repo:{repo} is:pr (" + " OR ".join(terms[:_MAX_OR_TERMS]) + ")"
+
+
+def search_perf_prs(
+    repo_url: str,
+    *,
+    limit: int = 5,
+    terms: tuple[str, ...],
+    timeout_sec: float = 10.0,
+) -> list[GitHubPr]:
+    """Return PRs in every state matching ``terms`` via the GitHub Search API."""
+    try:
+        repo = parse_repo_slug(repo_url)
+    except ValueError:
+        return []
+    query = _build_query(repo, terms=terms)
+    url = "https://api.github.com/search/issues?" + urllib.parse.urlencode({"q": query, "per_page": str(limit)})
+    req = urllib.request.Request(url, headers=_auth_headers("application/vnd.github+json"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # nosec B310 - fixed GitHub HTTPS API URL.
+            data = json.loads(resp.read().decode("utf-8"))
+    except (OSError, http.client.HTTPException, ValueError):  # best-effort policy
+        return []
+    out: list[GitHubPr] = []
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        if not isinstance(number, int):
+            continue
+        out.append(
+            GitHubPr(
+                number=number,
+                title=str(item.get("title") or ""),
+                html_url=str(item.get("html_url") or ""),
+            )
+        )
+    return out[:limit]
+
+
+def pr_patches(repo_slug: str, number: int, *, timeout_sec: float = 30.0) -> str:
+    """Return a merged PR's unified diff (``git apply``-ready), or ``\"\"``."""
+    slug = str(repo_slug or "").strip().strip("/")
+    if not slug or number <= 0:
+        return ""
+    api_url = f"https://api.github.com/repos/{slug}/pulls/{int(number)}"
+    for url, accept in (
+        (api_url, "application/vnd.github.diff"),
+        (f"https://github.com/{slug}/pull/{int(number)}.diff", "text/plain"),
+    ):
+        req = urllib.request.Request(url, headers=_auth_headers(accept))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # nosec B310 - fixed GitHub HTTPS URL.
+                text = resp.read().decode("utf-8", "replace")
+            if text.strip():
+                return text
+        except (OSError, http.client.HTTPException, ValueError):  # best-effort; try the fallback URL
+            continue
+    return ""
+
+
+__all__ = ["search_perf_prs", "PERF_TERMS", "pr_patches"]

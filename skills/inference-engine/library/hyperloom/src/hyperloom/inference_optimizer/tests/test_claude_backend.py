@@ -1,0 +1,862 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""ClaudeBackend + emit_intent MCP server tests."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hyperloom.orchestrator.roles import ClaudeBackend
+from hyperloom.orchestrator.roles.agent_role import default_role_registry
+from hyperloom.orchestrator.roles.base import BackendError, LLMCallFailed, RetryPolicy
+from hyperloom.orchestrator.roles.mcp_emit_intent import (
+    EMIT_INTENT_TOOL_NAME,
+    EMIT_INTENT_TOOL_QUALIFIED,
+    build_emit_intent_server,
+    build_emit_intent_tool_input_schema,
+    validate_emit_intent_input,
+)
+from hyperloom.orchestrator.roles import claude as claude_module
+from hyperloom.inference_optimizer.protocol.intent import (
+    IntentType,
+    IntentValidationError,
+)
+
+
+@dataclass
+class FakeToolUseBlock:
+    name: str
+    input: dict[str, Any]
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+
+# Subclass so type(block).__name__ == "ToolUseBlock" (matching ClaudeBackend).
+class ToolUseBlock(FakeToolUseBlock):  # type: ignore[misc, valid-type]
+    pass
+
+
+class TextBlock:
+    def __init__(self, text: str):
+        self.text = text
+
+
+@dataclass
+class FakeAssistantMessage:
+    content: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class FakeResultMessage:
+    """Stand-in for the SDK's terminal ResultMessage (carries .result)."""
+
+    result: str = ""
+    content: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class FakeSystemMessage:
+    """Stand-in for the SDK's SystemMessage; the CLI's init frame carries its tool list in ``data``."""
+
+    subtype: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FakeOptions:
+    """Stand-in for ClaudeAgentOptions — captures kwargs for assertions."""
+
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _make_query_factory(messages: list[Any]):
+    async def _q(*, prompt, options):
+        for m in messages:
+            yield m
+
+    return _q
+
+
+def _make_raising_query_factory(exc: BaseException):
+    async def _q(*, prompt, options):
+        raise exc
+        yield  # pragma: no cover — keeps this an async generator
+
+    return _q
+
+
+@pytest.mark.asyncio
+async def test_stream_api_error_is_marked_as_llm_call_failed():
+    """A non-timeout gateway error must be countable, not just a timeout."""
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_raising_query_factory(RuntimeError("litellm.BadRequestError: AnthropicException")),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    with pytest.raises(LLMCallFailed, match="Claude backend call failed"):
+        await backend.run("hello")
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_not_marked_as_an_llm_failure():
+    """Cancellation is a BaseException and must pass through untouched."""
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_raising_query_factory(asyncio.CancelledError()),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await backend.run("hello")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {"intent_type": "send_message", "payload": {"topic": "heartbeat"}},
+            id="minimal_send_message",
+        ),
+        pytest.param(
+            {
+                "intent_type": "review_verdict",
+                "payload": {"target_proposal_msg_id": "abc", "verdict": "approve"},
+            },
+            id="review_verdict_full",
+        ),
+        pytest.param(
+            {
+                "__unparsedToolInput": {
+                    "raw": '{"intent_type": "send_message", "payload": {"topic": "heartbeat"}}',
+                    "len": 62,
+                }
+            },
+            id="unparsed_wrapper_fallback",
+        ),
+    ],
+)
+def test_validate_emit_intent_input_accepts_well_formed(payload):
+    validate_emit_intent_input(payload)
+
+
+@pytest.mark.parametrize(
+    "payload, error_match",
+    [
+        pytest.param(
+            {"intent_type": "objection", "payload": {}},
+            "unknown intent_type",
+            id="unknown_intent_type",
+        ),
+        pytest.param(
+            {"payload": {"topic": "x"}},
+            "requires both",
+            id="missing_intent_type",
+        ),
+        pytest.param(
+            {"intent_type": "send_message", "payload": "not_object"},
+            "must be an object",
+            id="payload_must_be_object",
+        ),
+        pytest.param(
+            {
+                "intent_type": "send_message",
+                "payload": {"topic": "heartbeat"},
+                "extra": "nope",
+            },
+            "unexpected keys",
+            id="unexpected_top_keys",
+        ),
+        pytest.param(
+            {"intent_type": "review_verdict", "payload": {"verdict": "approve"}},
+            "target_proposal_msg_id",
+            id="review_verdict_missing_target",
+        ),
+    ],
+)
+def test_validate_emit_intent_input_rejects_malformed(payload, error_match):
+    with pytest.raises(IntentValidationError, match=error_match):
+        validate_emit_intent_input(payload)
+
+
+def test_build_emit_intent_server_returns_none_without_factories():
+    """Empty SDK shim with no `tool` or `create_sdk_mcp_server` → None."""
+
+    class EmptySdk:
+        __name__ = "empty"
+
+    cfg = build_emit_intent_server(
+        sdk_module=EmptySdk(),
+        tool_factory=None,
+        server_factory=None,
+    )
+    assert cfg is None
+
+
+def test_build_emit_intent_server_uses_factories():
+    captured: dict[str, Any] = {}
+
+    def fake_tool(name, desc, schema):
+        captured["tool_name"] = name
+
+        def deco(handler):
+            captured["handler"] = handler
+            return ("decorated", handler)
+
+        return deco
+
+    def fake_server(name, version, tools):
+        captured["server_name"] = name
+        captured["version"] = version
+        captured["tools"] = tools
+        return {"server": name}
+
+    cfg = build_emit_intent_server(
+        tool_factory=fake_tool,
+        server_factory=fake_server,
+    )
+    assert cfg == {"server": "inference_optimizer"}
+    assert captured["tool_name"] == EMIT_INTENT_TOOL_NAME
+    assert captured["server_name"] == "inference_optimizer"
+    assert captured["version"] == "1.0.0"
+    assert len(captured["tools"]) == 1
+
+
+_ORCHESTRATION_INTENTS = default_role_registry()["orchestration"].allowed_intents
+_CRITIC_INTENTS = default_role_registry()["critic"].allowed_intents
+_REVIEW_VERDICT_EMIT = {
+    "intent_type": "review_verdict",
+    "payload": {"target_proposal_msg_id": "p1", "verdict": "approve"},
+}
+
+
+def _capturing_tool_factory(captured: dict[str, Any]):
+    def fake_tool(name, desc, schema):
+        captured["schema"] = schema
+
+        def deco(handler):
+            captured["handler"] = handler
+            return handler
+
+        return deco
+
+    return fake_tool
+
+
+def _registered_emit_intent(**kwargs: Any) -> dict[str, Any]:
+    """The schema and handler ``build_emit_intent_server`` registers."""
+    captured: dict[str, Any] = {}
+    build_emit_intent_server(
+        tool_factory=_capturing_tool_factory(captured),
+        server_factory=lambda name, version, tools: {"server": name},
+        **kwargs,
+    )
+    return captured
+
+
+def _offered_intent_types(schema: dict[str, Any]) -> set[str]:
+    return set(schema["properties"]["intent_type"]["enum"])
+
+
+def test_emit_intent_schema_offers_only_the_roles_intents():
+    """A role is offered only the intent types the PolicyGate lets it emit."""
+    orchestration = _registered_emit_intent(allowed_intents=_ORCHESTRATION_INTENTS)["schema"]
+    critic = _registered_emit_intent(allowed_intents=_CRITIC_INTENTS)["schema"]
+
+    assert _offered_intent_types(orchestration) == {t.value for t in _ORCHESTRATION_INTENTS}
+    assert "review_verdict" not in _offered_intent_types(orchestration)
+    assert "review_verdict" not in orchestration["properties"]["payload"]["description"]
+    assert _offered_intent_types(critic) == {t.value for t in _CRITIC_INTENTS}
+    assert not _offered_intent_types(critic) & {t.value for t in _ORCHESTRATION_INTENTS - _CRITIC_INTENTS}
+    assert "delegate" not in critic["properties"]["payload"]["description"]
+    assert "__unparsedToolInput" in orchestration["properties"]
+
+
+def test_emit_intent_schema_without_a_role_offers_every_intent():
+    schema = _registered_emit_intent()["schema"]
+
+    assert schema == build_emit_intent_tool_input_schema(IntentType)
+    assert _offered_intent_types(schema) == {t.value for t in IntentType}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True], ids=["native-if-schema-bypassed", "unparsed-wrapper"])
+async def test_the_emit_intent_handler_refuses_an_intent_outside_the_role(wrapped):
+    """The handler refuses by the decoded type and names the types the role may emit.
+
+    Under the real SDK only the wrapped form reaches the handler: the schema's enum refuses a native out-of-role
+    call first (pinned in test_claude_unparsed_tool_input_unit). The native case pins the handler's own check.
+    """
+    handler = _registered_emit_intent(allowed_intents=_ORCHESTRATION_INTENTS)["handler"]
+    arguments: dict[str, Any] = _REVIEW_VERDICT_EMIT
+    if wrapped:
+        raw = json.dumps(_REVIEW_VERDICT_EMIT)
+        arguments = {"__unparsedToolInput": {"raw": raw, "len": len(raw)}}
+
+    result = await handler(arguments)
+
+    assert result["is_error"] is True
+    text = result["content"][0]["text"]
+    assert "'review_verdict'" in text
+    for intent_type in _ORCHESTRATION_INTENTS:
+        assert intent_type.value in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True], ids=["native", "unparsed-wrapper"])
+async def test_the_emit_intent_tool_acks_an_intent_the_role_may_emit(wrapped):
+    handler = _registered_emit_intent(allowed_intents=_CRITIC_INTENTS)["handler"]
+    arguments: dict[str, Any] = _REVIEW_VERDICT_EMIT
+    if wrapped:
+        raw = json.dumps(_REVIEW_VERDICT_EMIT)
+        arguments = {"__unparsedToolInput": {"raw": raw, "len": len(raw)}}
+
+    result = await handler(arguments)
+
+    assert "is_error" not in result
+    assert result["content"][0]["text"] == "ok"
+
+
+def test_claude_backend_registers_emit_intent_for_its_role():
+    captured: dict[str, Any] = {}
+    ClaudeBackend(
+        sdk_query_factory=_make_query_factory([]),
+        sdk_options_cls=FakeOptions,
+        mcp_tool_factory=_capturing_tool_factory(captured),
+        mcp_server_factory=lambda name, version, tools: {"server": name},
+        allowed_intents=_ORCHESTRATION_INTENTS,
+    )
+
+    assert _offered_intent_types(captured["schema"]) == {t.value for t in _ORCHESTRATION_INTENTS}
+
+
+def test_claude_backend_raises_without_sdk_or_seams(monkeypatch):
+    """If neither real SDK nor test seams provided, BackendError fires."""
+    import importlib
+
+    real_import = importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == "claude_agent_sdk":
+            raise ImportError("simulated: not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    with pytest.raises(BackendError, match="claude-agent-sdk"):
+        ClaudeBackend(
+            sdk_query_factory=None,
+            sdk_options_cls=None,
+            sdk_module=None,
+        )
+
+
+def test_claude_backend_with_seams_constructs(monkeypatch):
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    assert backend.sdk_query_factory is not None
+
+
+def _clear_effort_env(monkeypatch):
+    for k in (
+        "INFERENCE_OPTIMIZER_CLAUDE_EFFORT",
+        "INFERENCE_OPTIMIZER_CLAUDE_ORCHESTRATION_EFFORT",
+        "INFERENCE_OPTIMIZER_CLAUDE_THINKING",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_build_options_effort_defaults_to_medium(monkeypatch):
+    _clear_effort_env(monkeypatch)
+    backend = ClaudeBackend(model="m", sdk_query_factory=_make_query_factory([]), sdk_options_cls=FakeOptions)
+    o = backend._build_options(tools=[], max_turns=4, system_prompt="sp")
+    assert o.kwargs["effort"] == "medium"
+    assert o.kwargs["thinking"] == {"type": "adaptive"}
+
+
+def test_build_options_runs_the_cli_the_subprocess_specialists_spawn(monkeypatch, tmp_path):
+    """The in-process backend hands the SDK the same CLI ``resolve_claude_executable`` gives subprocesses."""
+    recorded = tmp_path / "claude"
+    recorded.write_text("#!/bin/sh\n", encoding="utf-8")
+    recorded.chmod(0o755)
+    monkeypatch.delenv("HYPERLOOM_CLAUDE_CLI_PATH", raising=False)
+    monkeypatch.setenv("GEAK_CLAUDE_BIN", str(recorded))
+    backend = ClaudeBackend(model="m", sdk_query_factory=_make_query_factory([]), sdk_options_cls=FakeOptions)
+    assert backend._build_options(tools=[], max_turns=1, system_prompt=None).kwargs["cli_path"] == str(recorded)
+
+
+def test_build_options_effort_env_override_and_thinking_off(monkeypatch):
+    _clear_effort_env(monkeypatch)
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_CLAUDE_ORCHESTRATION_EFFORT", "high")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_CLAUDE_THINKING", "off")
+    b = ClaudeBackend(model="m", sdk_query_factory=_make_query_factory([]), sdk_options_cls=FakeOptions)
+    o = b._build_options(tools=[], max_turns=4, system_prompt="sp")
+    assert o.kwargs["effort"] == "high"
+    assert "thinking" not in o.kwargs
+
+
+def test_real_sdk_options_accept_hyperloom_kwargs(monkeypatch):
+    """SDK compat: the pinned SDK must accept the kwargs _build_options sends."""
+    _clear_effort_env(monkeypatch)
+    sdk = pytest.importorskip("claude_agent_sdk")
+    b = ClaudeBackend(
+        model="m",
+        sdk_query_factory=_make_query_factory([]),
+        sdk_options_cls=sdk.ClaudeAgentOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    # Must not raise: effort + thinking both accepted by ClaudeAgentOptions.
+    b._build_options(tools=[], max_turns=4, system_prompt="sp")
+
+
+@pytest.mark.asyncio
+async def test_run_extracts_single_emit_intent_tool_use():
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "send_message",
+                    "payload": {"topic": "heartbeat", "body_md": "ok"},
+                },
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("hello", system_prompt="sys", tools=["Read"])
+    assert len(res.intents) == 1
+    assert res.intents[0].type == IntentType.SEND_MESSAGE
+    assert res.intents[0].payload["topic"] == "heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_run_extracts_multiple_emit_intent_tool_uses():
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "propose_action",
+                    "payload": {"action_name": "baseline", "predicted_gain_pct": 0.0},
+                },
+            ),
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "request",
+                    "payload": {"target_agent": "kernel_agent", "kind": "trace_analyze"},
+                },
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 2
+    assert res.intents[0].type == IntentType.PROPOSE_ACTION
+    assert res.intents[1].type == IntentType.REQUEST
+
+
+@pytest.mark.asyncio
+async def test_run_accepts_short_tool_name_too():
+    """SDK in-process tools sometimes show as plain `emit_intent` (no mcp__ prefix)."""
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_NAME,
+                input={
+                    "intent_type": "alert",
+                    "payload": {"severity": "low", "summary": "x"},
+                },
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert res.intents and res.intents[0].type == IntentType.ALERT
+
+
+@pytest.mark.asyncio
+async def test_run_ignores_other_tool_uses():
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(name="Read", input={"path": "/tmp/x"}),
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "send_message",
+                    "payload": {"topic": "heartbeat"},
+                },
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_text_blocks_collected_into_raw_text():
+    msg = FakeAssistantMessage(
+        content=[
+            TextBlock(text="thinking..."),
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "send_message",
+                    "payload": {"topic": "heartbeat"},
+                },
+            ),
+            TextBlock(text=" done."),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert "thinking..." in res.raw_text
+    assert " done." in res.raw_text
+
+
+@pytest.mark.asyncio
+async def test_run_without_an_emit_intent_call_returns_no_intents():
+    msg = FakeAssistantMessage(
+        content=[
+            TextBlock(text="just thinking, no tool call."),
+            ToolUseBlock(name="Read", input={"path": "/tmp/x"}),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    result = await backend.run("p")
+    assert result.intents == []
+    assert "just thinking" in result.raw_text
+
+
+@pytest.mark.parametrize(
+    ("offered_tools", "offered"),
+    [
+        pytest.param([EMIT_INTENT_TOOL_QUALIFIED, "mcp__other__tool"], True, id="offered"),
+        pytest.param(["mcp__other__tool"], False, id="dropped"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mcp_setup_diagnostic_reports_what_the_cli_offered(offered_tools, offered):
+    """Registering emit_intent does not mean the CLI offered it, so the setup snapshot carries the CLI's own account."""
+    init = FakeSystemMessage(
+        subtype="init",
+        data={
+            "claude_code_version": "2.1.294",
+            "tools": ["Read", *offered_tools],
+            "mcp_servers": [{"name": "inference_optimizer", "status": "connected"}],
+        },
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([init, FakeAssistantMessage(content=[TextBlock(text="hi")])]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    assert backend.get_mcp_setup_diagnostic()["emit_intent"]["offered"] is None
+    await backend.run("p")
+    setup = backend.get_mcp_setup_diagnostic()
+    assert setup["cli_version"] == "2.1.294"
+    assert setup["mcp_tools"] == sorted(offered_tools)
+    assert setup["mcp_server_status"] == {"inference_optimizer": "connected"}
+    assert setup["emit_intent"]["offered"] is offered
+
+
+def test_mcp_setup_diagnostic_hashes_the_role_scoped_schema():
+    """The recorded schema hash identifies the schema this role registers, not the full intent contract."""
+    import hashlib
+
+    backend = ClaudeBackend(mcp_server_factory=lambda *a, **k: None, allowed_intents=_ORCHESTRATION_INTENTS)
+    expected = json.dumps(
+        build_emit_intent_tool_input_schema(_ORCHESTRATION_INTENTS), sort_keys=True, separators=(",", ":")
+    )
+
+    recorded = backend.get_mcp_setup_diagnostic()["emit_intent"]["schema_sha256"]
+
+    assert recorded == hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    full = json.dumps(build_emit_intent_tool_input_schema(IntentType), sort_keys=True, separators=(",", ":"))
+    assert recorded != hashlib.sha256(full.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_run_invalid_tool_use_input_drops_block_silently():
+    """Bad tool_use input shouldn't crash the run — just drop the bad block."""
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "send_message",
+                    "payload": {},  # missing required `topic`
+                },
+            ),
+            ToolUseBlock(
+                name=EMIT_INTENT_TOOL_QUALIFIED,
+                input={
+                    "intent_type": "send_message",
+                    "payload": {"topic": "heartbeat"},
+                },
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 1
+
+
+@pytest.mark.parametrize("tool_name", [EMIT_INTENT_TOOL_QUALIFIED, EMIT_INTENT_TOOL_NAME])
+@pytest.mark.asyncio
+async def test_unparsed_tool_wrapper_retries_dedupe_to_one_intent(tool_name):
+    """Claude Code retries the same wrapped JSON; keep one validated intent."""
+    raw = '{"intent_type": "send_message", "payload": {"topic": "heartbeat", "body_md": "ok"}}'
+    wrapped = {"__unparsedToolInput": {"raw": raw, "len": len(raw)}}
+    other = '{"intent_type": "send_message", "payload": {"topic": "status", "body_md": "next"}}'
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(name=tool_name, input=dict(wrapped)),
+            ToolUseBlock(name=tool_name, input=dict(wrapped)),
+            ToolUseBlock(
+                name=tool_name,
+                input={"__unparsedToolInput": {"raw": other, "len": len(other)}},
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 2
+    assert [intent.payload["topic"] for intent in res.intents] == ["heartbeat", "status"]
+
+
+@pytest.mark.parametrize("tool_name", [EMIT_INTENT_TOOL_QUALIFIED, EMIT_INTENT_TOOL_NAME])
+@pytest.mark.asyncio
+async def test_string_wrapped_fallback_retries_dedupe_to_one_intent(tool_name):
+    """A string-wrapped fallback dedupes exactly like the dict-wrapped one.
+
+    Behind an OpenAI-compatible / litellm proxy the wrapper arrives inside a
+    JSON *string*. Without wrapper detection accepting that shape, two
+    identical retries would each yield an intent and the duplicate action
+    would be dispatched twice.
+    """
+    raw = '{"intent_type": "send_message", "payload": {"topic": "heartbeat", "body_md": "ok"}}'
+    wrapped = json.dumps({"__unparsedToolInput": {"raw": raw, "len": len(raw)}})
+    other_raw = '{"intent_type": "send_message", "payload": {"topic": "status", "body_md": "next"}}'
+    other = json.dumps({"__unparsedToolInput": {"raw": other_raw, "len": len(other_raw)}})
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(name=tool_name, input=wrapped),
+            ToolUseBlock(name=tool_name, input=wrapped),
+            ToolUseBlock(name=tool_name, input=other),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 2
+    assert [intent.payload["topic"] for intent in res.intents] == ["heartbeat", "status"]
+
+
+@pytest.mark.parametrize("tool_name", [EMIT_INTENT_TOOL_QUALIFIED, EMIT_INTENT_TOOL_NAME])
+@pytest.mark.asyncio
+async def test_empty_string_tool_input_reports_decode_error(tool_name, caplog):
+    """An empty-string input reports a decode error, not a missing intent_type.
+
+    ``input or {}`` used to swallow ``""`` into ``{}``, which decoded cleanly
+    and surfaced later as ``intent_type None not in allowed set`` — pointing a
+    reader at the model rather than at the undecodable envelope.
+    """
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(name=tool_name, input=""),
+            ToolUseBlock(
+                name=tool_name,
+                input={"intent_type": "send_message", "payload": {"topic": "heartbeat"}},
+            ),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    with caplog.at_level(logging.INFO, logger=claude_module.log.name):
+        res = await backend.run("p")
+    # The empty-string block is dropped; the rest of the turn is unaffected.
+    assert len(res.intents) == 1
+    assert "claude tool_use decode failed: emit_intent tool input string is not valid JSON" in caplog.messages
+
+
+@pytest.mark.parametrize("tool_name", [EMIT_INTENT_TOOL_QUALIFIED, EMIT_INTENT_TOOL_NAME])
+@pytest.mark.asyncio
+async def test_identical_native_tool_inputs_are_not_deduped(tool_name):
+    """Native Claude objects keep every emit_intent call, even duplicates."""
+    native = {"intent_type": "send_message", "payload": {"topic": "heartbeat"}}
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(name=tool_name, input=dict(native)),
+            ToolUseBlock(name=tool_name, input=dict(native)),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 2
+
+
+@pytest.mark.parametrize("tool_name", [EMIT_INTENT_TOOL_QUALIFIED, EMIT_INTENT_TOOL_NAME])
+@pytest.mark.asyncio
+async def test_wrapper_then_native_same_intent_keeps_both(tool_name):
+    """A wrapper block and a native block are two tool_use events."""
+    raw = '{"intent_type": "send_message", "payload": {"topic": "heartbeat"}}'
+    wrapped = {"__unparsedToolInput": {"raw": raw, "len": len(raw)}}
+    native = {"intent_type": "send_message", "payload": {"topic": "heartbeat"}}
+    msg = FakeAssistantMessage(
+        content=[
+            ToolUseBlock(name=tool_name, input=dict(wrapped)),
+            ToolUseBlock(name=tool_name, input=dict(native)),
+        ]
+    )
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory([msg]),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert len(res.intents) == 2
+
+
+@pytest.mark.asyncio
+async def test_raw_text_prefers_result_no_duplication():
+    """The streamed TextBlock and ResultMessage.result share content; raw_text must not concatenate both."""
+    text = '{"tool": "emit_proposal", "args": {}}'
+    msgs = [
+        FakeAssistantMessage(content=[TextBlock(text=text)]),
+        FakeResultMessage(result=text),
+    ]
+    backend = ClaudeBackend(
+        sdk_query_factory=_make_query_factory(msgs),
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+    )
+    res = await backend.run("p")
+    assert res.raw_text == text
+    assert res.raw_text.count('"tool"') == 1
+
+
+@pytest.mark.asyncio
+async def test_options_includes_system_prompt_and_max_turns():
+    captured: dict[str, Any] = {}
+
+    async def q(*, prompt, options):
+        captured["options_kwargs"] = options.kwargs
+        captured["prompt"] = prompt
+        captured["system_prompt_text"] = Path(options.kwargs["system_prompt"]["path"]).read_text(encoding="utf-8")
+        return
+        yield  # make it a generator
+
+    backend = ClaudeBackend(
+        sdk_query_factory=q,
+        sdk_options_cls=FakeOptions,
+        mcp_server_factory=lambda *a, **k: None,
+        max_turns_default=7,
+    )
+    await backend.run("the prompt", system_prompt="sys", tools=["Read"], max_turns=3)
+    # max_turns is floored to _MIN_MAX_TURNS (8): Claude Code counts its own messages as
+    # turns, so a literal max_turns=3 would trip before the model can emit an intent.
+    assert captured["options_kwargs"]["max_turns"] == 8
+    assert captured["options_kwargs"]["system_prompt"]["type"] == "file"
+    assert captured["system_prompt_text"] == "sys"
+    assert "Read" in captured["options_kwargs"]["allowed_tools"]
+    assert captured["options_kwargs"]["tools"] == ["Read"]
+    # Output instructions appended to prompt
+    assert "OUTPUT FORMAT" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_options_includes_mcp_server_when_emit_intent_enabled():
+    captured: dict[str, Any] = {}
+
+    async def q(*, prompt, options):
+        captured["options_kwargs"] = options.kwargs
+        return
+        yield
+
+    def fake_tool(name, desc, schema):
+        def deco(handler):
+            return ("decorated", handler)
+
+        return deco
+
+    def fake_server(name, version, tools):
+        return {"name": name}
+
+    backend = ClaudeBackend(
+        sdk_query_factory=q,
+        sdk_options_cls=FakeOptions,
+        mcp_tool_factory=fake_tool,
+        mcp_server_factory=fake_server,
+    )
+    assert backend.mcp_server_config is not None
+    assert backend.get_mcp_setup_diagnostic()["allowed_tools"] == []
+    assert backend.get_mcp_setup_diagnostic()["mcp_servers"] == []
+    await backend.run("p", tools=["Read", "emit_intent", "get_failure"])
+    kw = captured["options_kwargs"]
+    setup = backend.get_mcp_setup_diagnostic()
+    assert setup["allowed_tools"] == kw["allowed_tools"]
+    assert setup["mcp_servers"] == sorted(kw["mcp_servers"])
+    assert "mcp_servers" in kw
+    assert "inference_optimizer" in kw["mcp_servers"]
+    # emit_intent qualified tool name auto-added to allowed_tools
+    assert EMIT_INTENT_TOOL_QUALIFIED in kw["allowed_tools"]
+    assert kw["tools"] == ["Read"]

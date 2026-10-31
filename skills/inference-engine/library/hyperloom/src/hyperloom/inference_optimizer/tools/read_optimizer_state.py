@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+"""Print concise optimizer state and lifecycle status.
+
+Usage:
+    hyperloom session state SESSION_DIR
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Any
+
+from hyperloom_common.jsonio import read_json_strict
+from hyperloom.inference_optimizer.session.session_paths import manifest_path, state_path
+
+
+SUMMARY_KEYS = (
+    "stop_reason",
+    "baseline_tput",
+    "cumulative_gain_validated",
+    "current_best",
+    "last_trace_analyze",
+)
+
+
+def _format_lifecycle_event(event: dict[str, Any]) -> str:
+    """Render a single lifecycle event as a one-line human-readable summary."""
+    duration = f" {event['duration_s']}s" if event.get("duration_s") is not None else ""
+    detail = f" [{event['detail']}]" if event.get("detail") else ""
+    artifacts = " ".join(f"{key}={value}" for key, value in (event.get("artifacts") or {}).items())
+    line = f"#{event.get('seq')} {event.get('label')} [{event.get('phase')}] {event.get('status')}{duration}{detail}"
+    if artifacts:
+        line += f" -> {artifacts}"
+    return line
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print a concise optimizer state and recent lifecycle summary."""
+    parser = argparse.ArgumentParser(prog="hyperloom session state", description=__doc__)
+    parser.add_argument("session_dir", help="Optimizer session directory.")
+    parser.add_argument(
+        "--lifecycle-limit",
+        type=int,
+        default=12,
+        help="Number of recent lifecycle events to print (default: 12).",
+    )
+    args = parser.parse_args(argv)
+
+    session_dir = Path(args.session_dir)
+    state_file = state_path(session_dir)
+    manifest_file = manifest_path(session_dir)
+    if not state_file.is_file():
+        print(f"state.json not found at {state_file}", file=sys.stderr)
+        return 2
+
+    if manifest_file.is_file():
+        manifest = read_json_strict(manifest_file, require_dict=True)
+        print("session_id:", manifest.get("session_id"))
+    print("session_dir:", session_dir)
+
+    state = read_json_strict(state_file, require_dict=True)
+    for key in SUMMARY_KEYS:
+        print(f"{key}: {state.get(key)}")
+    print("explore_last_round:", state.get("explore_search", {}).get("last_round"))
+    print("phase:", state.get("phase"))
+    injections = state.get("experience_kb_injections") or []
+    for consumer in ("orchestration", "specialist"):
+        rows = [row for row in injections if row.get("consumer") == consumer]
+        if not rows:
+            continue
+        latest = rows[-1]
+        target = (
+            f" domain={latest.get('domain')} gap={latest.get('gap_canonical_id')}" if consumer == "specialist" else ""
+        )
+        print(
+            f"experience_kb_injection[{consumer}]: {len(rows)} recorded; latest tick={latest.get('tick')} "
+            f"read_id={latest.get('read_id')}{target}"
+        )
+        summaries = {item.get("experience_id"): item for item in latest.get("experiences") or []}
+        for experience_id in latest.get("experience_ids") or []:
+            item = summaries.get(experience_id, {})
+            print(
+                f"  {experience_id}: decision={item.get('decision')} change={item.get('change_summary')!r} "
+                f"baseline={item.get('baseline_value')} outcome={item.get('outcome_value')} "
+                f"source_run={item.get('source_run_id')}"
+            )
+
+    events = state.get("lifecycle") or []
+    limit = max(0, int(args.lifecycle_limit))
+    print(f"\n--- lifecycle (last {limit} of {len(events)}) ---")
+    for event in events[-limit:] if limit else []:
+        print(_format_lifecycle_event(event))
+    return 0

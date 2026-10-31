@@ -1,0 +1,291 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
+import math
+import time
+
+import pytest
+
+from hyperloom_common.coerce import (
+    dict_rows,
+    first_float,
+    first_int,
+    first_str,
+    optional_positive_float,
+    optional_positive_int,
+    recorded_float,
+    text_or_none,
+    to_float,
+    to_int,
+    to_list,
+    to_mapping,
+    to_str_list,
+    to_unix,
+)
+
+
+class TestToStrList:
+    def test_none_is_empty(self):
+        assert to_str_list(None) == []
+
+    def test_string_stripped(self):
+        assert to_str_list("  a  ") == ["a"]
+
+    def test_blank_string_dropped(self):
+        assert to_str_list("   ") == []
+
+    def test_iterable_stripped_and_filtered(self):
+        assert to_str_list(["a ", " ", "b"]) == ["a", "b"]
+
+    def test_scalar_coerced(self):
+        assert to_str_list(42) == ["42"]
+
+    def test_scalar_blank_dropped(self):
+        assert to_str_list(False) == ["False"]
+
+
+class TestToFloat:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (1, 1.0),
+            (1.5, 1.5),
+            ("2.5", 2.5),
+            ("  3.0  ", 3.0),
+            (-4, -4.0),
+        ],
+    )
+    def test_parses(self, value, expected):
+        assert to_float(value) == expected
+
+    @pytest.mark.parametrize("value", [None, True, False, "abc", "", object(), [1]])
+    def test_rejects_to_default_none(self, value):
+        assert to_float(value) is None
+
+    def test_bool_rejected_even_though_int_subclass(self):
+        assert to_float(True) is None
+        assert to_float(False) is None
+
+    def test_custom_default(self):
+        assert to_float("nope", default=0.0) == 0.0
+        assert to_float(None, default=-1.0) == -1.0
+
+
+class TestRecordedFloat:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (1, 1.0),
+            (1.5, 1.5),
+            ("2.5", 2.5),
+            (-4, -4.0),
+        ],
+    )
+    def test_parses(self, value, expected):
+        assert recorded_float(value) == expected
+
+    @pytest.mark.parametrize("value", [None, "", "abc", object(), [1]])
+    def test_absent_or_unparseable_reads_as_the_default(self, value):
+        assert recorded_float(value) == 0.0
+        assert recorded_float(value, -1.0) == -1.0
+
+    def test_infinity_survives_so_a_degenerate_measurement_stays_visible(self):
+        assert recorded_float(float("inf")) == math.inf
+        assert recorded_float("Infinity") == math.inf
+        assert math.isnan(recorded_float(float("nan")))
+
+    @pytest.mark.parametrize("value", [float("inf"), float("nan"), True])
+    def test_keeps_what_to_float_rejects(self, value):
+        """The three inputs on which the two coercions disagree, so a swap is never silent."""
+        assert to_float(value, 0.0) == 0.0
+        assert recorded_float(value) != 0.0 or math.isnan(recorded_float(value))
+
+
+class TestToInt:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (1, 1),
+            ("2", 2),
+            ("  3  ", 3),
+            (-4, -4),
+        ],
+    )
+    def test_parses(self, value, expected):
+        assert to_int(value) == expected
+
+    @pytest.mark.parametrize("value", [None, True, False, "abc", "", "1.5"])
+    def test_non_int_string_and_float_string_reject(self, value):
+        # A float string like "1.5" is not a valid int(); a real float truncates.
+        assert to_int(value) is None
+
+    def test_real_float_truncates(self):
+        assert to_int(2.9) == 2
+
+    def test_custom_default(self):
+        assert to_int("nope", default=0) == 0
+
+
+class TestFirst:
+    def test_first_float_returns_first_parseable(self):
+        assert first_float(None, "x", "3.5", 4) == 3.5
+
+    def test_first_float_default_when_none(self):
+        assert first_float(None, "x", default=9.0) == 9.0
+
+    def test_first_int_returns_first_parseable(self):
+        assert first_int(None, "x", "7", 8) == 7
+
+    def test_first_int_default_when_none(self):
+        assert first_int("x", None, default=-1) == -1
+
+    def test_bool_skipped(self):
+        assert first_float(True, "2.0") == 2.0
+
+
+class TestOptionalPositiveInt:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (5, 5),
+            ("10", 10),
+            (" 3 ", 3),
+        ],
+    )
+    def test_positive(self, value, expected):
+        assert optional_positive_int(value) == expected
+
+    @pytest.mark.parametrize("value", [0, -1, "0", "-5", None, True, "x", ""])
+    def test_non_positive_or_invalid_to_default(self, value):
+        assert optional_positive_int(value) is None
+
+    def test_custom_default(self):
+        assert optional_positive_int(0, default=1) == 1
+
+
+class TestOptionalPositiveFloat:
+    @pytest.mark.parametrize("value,expected", [(5, 5.0), (2.5, 2.5), ("5", 5.0), (" 0.25 ", 0.25)])
+    def test_positive(self, value, expected):
+        assert optional_positive_float(value) == expected
+
+    @pytest.mark.parametrize(
+        "value", [0, 0.0, -1.5, "0", "-2", None, True, False, "x", "", math.inf, -math.inf, math.nan, "inf"]
+    )
+    def test_non_positive_non_finite_or_invalid_to_default(self, value):
+        assert optional_positive_float(value) is None
+
+    def test_custom_default(self):
+        assert optional_positive_float(0, default=1.0) == 1.0
+
+
+class TestToUnix:
+    def test_numeric_epoch(self):
+        assert to_unix(1_700_000_000) == 1_700_000_000.0
+        assert to_unix(1_700_000_000.5) == 1_700_000_000.5
+
+    def test_iso_z_suffix(self):
+        ts = to_unix("2021-01-01T00:00:00Z")
+        assert ts is not None
+        assert math.isclose(ts, 1_609_459_200.0)
+
+    def test_iso_offset(self):
+        ts = to_unix("2021-01-01T00:00:00+00:00")
+        assert ts is not None
+        assert math.isclose(ts, 1_609_459_200.0)
+
+    def test_numeric_string_fallback(self):
+        assert to_unix("1700000000") == 1_700_000_000.0
+
+    def test_a_timestamp_without_an_offset_is_utc(self, monkeypatch):
+        """iso_z reads a naive timestamp as UTC; both feed the same comparisons."""
+        monkeypatch.setenv("TZ", "Asia/Shanghai")
+        time.tzset()
+        try:
+            ts = to_unix("2021-01-01T00:00:00")
+        finally:
+            monkeypatch.delenv("TZ")
+            time.tzset()
+        assert ts is not None
+        assert math.isclose(ts, 1_609_459_200.0)
+
+    @pytest.mark.parametrize("value", [None, True, False, "not-a-ts", object()])
+    def test_reject_to_default(self, value):
+        assert to_unix(value) is None
+
+    def test_custom_default(self):
+        assert to_unix("bad", default=0.0) == 0.0
+
+
+class TestFirstStr:
+    def test_returns_first_truthy_as_text(self):
+        assert first_str(None, "", "a", "b") == "a"
+
+    def test_coerces_a_non_string(self):
+        assert first_str(None, 42) == "42"
+
+    def test_all_falsy_is_empty(self):
+        assert first_str(None, "", 0, False, []) == ""
+
+    def test_no_values_is_empty(self):
+        assert first_str() == ""
+
+    def test_zero_is_skipped_not_returned(self):
+        """0 is falsy, so a numeric id of 0 never wins; callers pass ids as strings."""
+        assert first_str(0, "fallback") == "fallback"
+
+
+class TestToMapping:
+    def test_mapping_is_copied(self):
+        source = {"a": 1}
+        result = to_mapping(source)
+        assert result == {"a": 1}
+        assert result is not source
+
+    def test_non_mapping_is_empty(self):
+        for value in (None, [], "a", 42, object()):
+            assert to_mapping(value) == {}
+
+
+class TestToList:
+    def test_list_is_copied(self):
+        source = [1, 2]
+        result = to_list(source)
+        assert result == [1, 2]
+        assert result is not source
+
+    def test_tuple_becomes_list(self):
+        assert to_list((1, 2)) == [1, 2]
+
+    def test_a_string_is_not_a_sequence_here(self):
+        """A string is never exploded into characters; a bare scalar yields nothing."""
+        assert to_list("ab") == []
+
+    def test_non_sequence_is_empty(self):
+        for value in (None, {}, 42, object()):
+            assert to_list(value) == []
+
+
+class TestTextOrNone:
+    def test_none_stays_none(self):
+        assert text_or_none(None) is None
+
+    def test_blank_reads_as_none(self):
+        assert text_or_none("   ") is None
+
+    def test_stripped(self):
+        assert text_or_none("  hi  ") == "hi"
+
+    def test_scalar_coerced(self):
+        assert text_or_none(42) == "42"
+
+
+class TestDictRows:
+    def test_keeps_only_dict_entries_in_order(self):
+        first, second = {"a": 1}, {"b": 2}
+        assert dict_rows([first, "x", None, second]) == [first, second]
+
+    def test_non_list_is_empty(self):
+        for value in (None, {"a": 1}, ({"a": 1},), "ab"):
+            assert dict_rows(value) == []

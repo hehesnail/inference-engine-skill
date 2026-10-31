@@ -1,0 +1,536 @@
+{
+  "date": "2026-10-31",
+  "files": [
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/examples.md",
+      "local_path": "library/trtllm/host/analysis/references/examples.md",
+      "source_sha256": "80ed0358a394e8f7c5e94cb1734aa1bc51769615538b84bb188e7c1447d86922",
+      "local_sha256": "80ed0358a394e8f7c5e94cb1734aa1bc51769615538b84bb188e7c1447d86922",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/iteration-isolation-techniques.md",
+      "local_path": "library/trtllm/host/analysis/references/iteration-isolation-techniques.md",
+      "source_sha256": "cdb2b2e50cb3b105f1111bb7b540041c3c8e3251bd9d7abd25615affb23c103c",
+      "local_sha256": "cdb2b2e50cb3b105f1111bb7b540041c3c8e3251bd9d7abd25615affb23c103c",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/kernel-level-analysis.md",
+      "local_path": "library/trtllm/host/analysis/references/kernel-level-analysis.md",
+      "source_sha256": "0831f4ee67863c36ab18ec50622238bfc0e76d180f6e6e1ed90327657071b291",
+      "local_sha256": "eb283a1e4ed56b79ace880c8b7e9e4216a334d1f8c811e6754d947de63f07ee6",
+      "modification": "markdown link adaptation"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/metrics.md",
+      "local_path": "library/trtllm/host/analysis/references/metrics.md",
+      "source_sha256": "e74d84287b337f20c1821e9cb16bd0ff5a949985adadca89c96c34ae9b796d01",
+      "local_sha256": "e74d84287b337f20c1821e9cb16bd0ff5a949985adadca89c96c34ae9b796d01",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/nsys-schema.md",
+      "local_path": "library/trtllm/host/analysis/references/nsys-schema.md",
+      "source_sha256": "f1bd0f92d6bb7ef02e66edb53b0e4e6703374c3afa0e74fbe924dad52ba59899",
+      "local_sha256": "f1bd0f92d6bb7ef02e66edb53b0e4e6703374c3afa0e74fbe924dad52ba59899",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/output-format.md",
+      "local_path": "library/trtllm/host/analysis/references/output-format.md",
+      "source_sha256": "555ad68fe085902c210492c3abdfc2b8937bd926cdd26674e5d77c001798c068",
+      "local_sha256": "555ad68fe085902c210492c3abdfc2b8937bd926cdd26674e5d77c001798c068",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/phase-classification.md",
+      "local_path": "library/trtllm/host/analysis/references/phase-classification.md",
+      "source_sha256": "beda3ec65f736fd928c627cefebf01c503ceeaba3f4832d0ce08afc2fb3d2a51",
+      "local_sha256": "beda3ec65f736fd928c627cefebf01c503ceeaba3f4832d0ce08afc2fb3d2a51",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/thresholds.md",
+      "local_path": "library/trtllm/host/analysis/references/thresholds.md",
+      "source_sha256": "c2e70a4e6b18cff5395e69b2cff2b47e68a8e68108fc2c11fc11af0b10541fc9",
+      "local_sha256": "c2e70a4e6b18cff5395e69b2cff2b47e68a8e68108fc2c11fc11af0b10541fc9",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/references/trtllm-nvtx-ranges.md",
+      "local_path": "library/trtllm/host/analysis/references/trtllm-nvtx-ranges.md",
+      "source_sha256": "0e10733df20194fa327f44604094584f8c9316d41275fc3db5a62874a968b1ab",
+      "local_sha256": "0e10733df20194fa327f44604094584f8c9316d41275fc3db5a62874a968b1ab",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/scripts/analyze_host_overhead.py",
+      "local_path": "library/trtllm/host/analysis/scripts/analyze_host_overhead.py",
+      "source_sha256": "b500b89a929ea02fd386f1048e6ec05559ef1399bb61b7fa9aaedffd4509a9e5",
+      "local_sha256": "b500b89a929ea02fd386f1048e6ec05559ef1399bb61b7fa9aaedffd4509a9e5",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-analysis/scripts/detect_host_overhead.py",
+      "local_path": "library/trtllm/host/analysis/scripts/detect_host_overhead.py",
+      "source_sha256": "34911da92c61a5fec65c3c18ebeecc2d1b9bd6af6539abd7ae5a806cf5f6282e",
+      "local_sha256": "34911da92c61a5fec65c3c18ebeecc2d1b9bd6af6539abd7ae5a806cf5f6282e",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/communication-patterns.md",
+      "local_path": "library/trtllm/host/optimization/references/communication-patterns.md",
+      "source_sha256": "73663e1cb07e3ba5e492b9f5602cf2a96343bcbba188027dd7fd168be450e9fd",
+      "local_sha256": "73663e1cb07e3ba5e492b9f5602cf2a96343bcbba188027dd7fd168be450e9fd",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/examples.md",
+      "local_path": "library/trtllm/host/optimization/references/examples.md",
+      "source_sha256": "682eeac68f51065b9170939510f0da4004393ea9525bf77ddd7545aac87a6812",
+      "local_sha256": "682eeac68f51065b9170939510f0da4004393ea9525bf77ddd7545aac87a6812",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/hot-path-files.md",
+      "local_path": "library/trtllm/host/optimization/references/hot-path-files.md",
+      "source_sha256": "38cb31d1b376d2d77c97313354b9f33f85027cca6c557b542f9dc6814f51658a",
+      "local_sha256": "38cb31d1b376d2d77c97313354b9f33f85027cca6c557b542f9dc6814f51658a",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/hotspot-classification.md",
+      "local_path": "library/trtllm/host/optimization/references/hotspot-classification.md",
+      "source_sha256": "51a71d8ee1c38675e5a88b0e049d60796bc3597d6b7fb6314b41f46be3e46022",
+      "local_sha256": "51a71d8ee1c38675e5a88b0e049d60796bc3597d6b7fb6314b41f46be3e46022",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/optimization-patterns.md",
+      "local_path": "library/trtllm/host/optimization/references/optimization-patterns.md",
+      "source_sha256": "6ed79c88259bcf63985aa19f6a5bdf34deb21f12c716ca00a03bc23f772a778f",
+      "local_sha256": "6ed79c88259bcf63985aa19f6a5bdf34deb21f12c716ca00a03bc23f772a778f",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/optimization-strategy.md",
+      "local_path": "library/trtllm/host/optimization/references/optimization-strategy.md",
+      "source_sha256": "ae80f4a28a48aebe0ac468cdd631ec7cc0d3c6b4d9376dda00dd770fdc0c65a7",
+      "local_sha256": "ae80f4a28a48aebe0ac468cdd631ec7cc0d3c6b4d9376dda00dd770fdc0c65a7",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/patterns/compound-pitfalls.md",
+      "local_path": "library/trtllm/host/optimization/references/patterns/compound-pitfalls.md",
+      "source_sha256": "b2d4af1cf11aabbff253cecbe5b146aabfeb820726eaeb2ae8f8beb5256938fe",
+      "local_sha256": "b2d4af1cf11aabbff253cecbe5b146aabfeb820726eaeb2ae8f8beb5256938fe",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/patterns/gpu-graph.md",
+      "local_path": "library/trtllm/host/optimization/references/patterns/gpu-graph.md",
+      "source_sha256": "d19b551e30269aee91fddedbe2e7c6fe73cba78d2208720961d4900ba320d459",
+      "local_sha256": "638cc802ae9f50c26ef44f89ebcfd6828aeaeca87789ec83ef66400c8fb872cd",
+      "modification": "markdown link adaptation"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/patterns/loop-iteration.md",
+      "local_path": "library/trtllm/host/optimization/references/patterns/loop-iteration.md",
+      "source_sha256": "3f6e94faae726636e72d485075f211a41e90539c5af2f851c55d8d3da2932a10",
+      "local_sha256": "3f6e94faae726636e72d485075f211a41e90539c5af2f851c55d8d3da2932a10",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/patterns/python-overhead.md",
+      "local_path": "library/trtllm/host/optimization/references/patterns/python-overhead.md",
+      "source_sha256": "ee04344f0a82faff1279c8ae75ef84cdb2411364d2b92feb5a44742dfa754fc2",
+      "local_sha256": "ee04344f0a82faff1279c8ae75ef84cdb2411364d2b92feb5a44742dfa754fc2",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/patterns/sync-alloc.md",
+      "local_path": "library/trtllm/host/optimization/references/patterns/sync-alloc.md",
+      "source_sha256": "ac13594e49ec5fc673cc5ed6afd3dd3c1a124b7814e36c9f7d1fade2fcf7bebc",
+      "local_sha256": "ac13594e49ec5fc673cc5ed6afd3dd3c1a124b7814e36c9f7d1fade2fcf7bebc",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-host-optimization/references/patterns/system.md",
+      "local_path": "library/trtllm/host/optimization/references/patterns/system.md",
+      "source_sha256": "4ee9c0713d1e57d4a09f6fa815d11b3d80379acd0b5d58dd5518cbbdaebe476f",
+      "local_sha256": "4ee9c0713d1e57d4a09f6fa815d11b3d80379acd0b5d58dd5518cbbdaebe476f",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-torch-cuda-graphs/references/patterns-dynamic.md",
+      "local_path": "library/trtllm/host/graphs/patterns-dynamic.md",
+      "source_sha256": "b83cb623db04ce8c9e21becb1f77131bde58ad81de2d7ae0bae6ac7868550a56",
+      "local_sha256": "b83cb623db04ce8c9e21becb1f77131bde58ad81de2d7ae0bae6ac7868550a56",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-torch-cuda-graphs/references/patterns-compatibility.md",
+      "local_path": "library/trtllm/host/graphs/patterns-compatibility.md",
+      "source_sha256": "b76b33c62ebff06d70e90d3061598c7ee137ab32c8029da82cc34b901148a8e9",
+      "local_sha256": "b76b33c62ebff06d70e90d3061598c7ee137ab32c8029da82cc34b901148a8e9",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-torch-cuda-graphs/references/api-pytorch.md",
+      "local_path": "library/trtllm/host/graphs/api-pytorch.md",
+      "source_sha256": "6b18ace21928a28c02bde098f0b6b3a28b9674e99527d295bfc54ad60220b194",
+      "local_sha256": "6b18ace21928a28c02bde098f0b6b3a28b9674e99527d295bfc54ad60220b194",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-torch-cuda-graphs/references/troubleshooting.md",
+      "local_path": "library/trtllm/host/graphs/troubleshooting.md",
+      "source_sha256": "accbc5560c9f607cdca49cc40567986fae983c94ac91b82fa65bfa4c67cdbd46",
+      "local_sha256": "accbc5560c9f607cdca49cc40567986fae983c94ac91b82fa65bfa4c67cdbd46",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": ".claude/skills/perf-torch-sync-free/references/sync-patterns.md",
+      "local_path": "library/trtllm/host/sync-patterns.md",
+      "source_sha256": "edfc8133108e15b6f1fd2b88ab1ea20477d24271d39074fdcba88e9e2927e2f4",
+      "local_sha256": "edfc8133108e15b6f1fd2b88ab1ea20477d24271d39074fdcba88e9e2927e2f4",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/TensorRT-LLM",
+      "revision": "f405e10b730ea953961ecf5719242c581527587a",
+      "source_path": "LICENSE",
+      "local_path": "library/trtllm/LICENSE",
+      "source_sha256": "a56e691155bb532ea212f701d3ecacb2db549fa64757f9bad3e06bc9177f46ea",
+      "local_sha256": "a56e691155bb532ea212f701d3ecacb2db549fa64757f9bad3e06bc9177f46ea",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "LICENSE",
+      "local_path": "library/ncu-report/LICENSE",
+      "source_sha256": "84aab57158a914f448b38d8be29dd842b634a08c192d844f416a256beed4ae94",
+      "local_sha256": "84aab57158a914f448b38d8be29dd842b634a08c192d844f416a256beed4ae94",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "README.md",
+      "local_path": "library/ncu-report/README.md",
+      "source_sha256": "0ad97dd6983604b403ad59fb28b06cda3620e355a8dc5c4c573460bd610b1472",
+      "local_sha256": "0ad97dd6983604b403ad59fb28b06cda3620e355a8dc5c4c573460bd610b1472",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "SKILL.md",
+      "local_path": "library/ncu-report/UPSTREAM.reference.md",
+      "source_sha256": "0c75fd53c2fa6bdb8e057b42403445fd5ab40c9af1dc5d3c04977adaa369dd78",
+      "local_sha256": "0c75fd53c2fa6bdb8e057b42403445fd5ab40c9af1dc5d3c04977adaa369dd78",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "blackwell-cuda-programming.md",
+      "local_path": "library/ncu-report/blackwell-cuda-programming.md",
+      "source_sha256": "9d77cd6f96f6e31f4c2cc6ab58b982913e8179131dc205dfc73b8bd94b735530",
+      "local_sha256": "9d77cd6f96f6e31f4c2cc6ab58b982913e8179131dc205dfc73b8bd94b735530",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/README.md",
+      "local_path": "library/ncu-report/helpers/README.md",
+      "source_sha256": "0b960634e6b583bf7fe90bdfce73a22d32bf251cdc5a77349a6d8f47f7de78bd",
+      "local_sha256": "0b960634e6b583bf7fe90bdfce73a22d32bf251cdc5a77349a6d8f47f7de78bd",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/analyze_reports.py",
+      "local_path": "library/ncu-report/helpers/analyze_reports.py",
+      "source_sha256": "9367965a1e57a20c923feec8a54d94f68c978116dab74180de96154b2f74c100",
+      "local_sha256": "9367965a1e57a20c923feec8a54d94f68c978116dab74180de96154b2f74c100",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/extract_stall_hotspots.py",
+      "local_path": "library/ncu-report/helpers/extract_stall_hotspots.py",
+      "source_sha256": "68028aa44d6052ee22201a0bd544f7b3152e2ffe99fa62b3faa1e431d3e791fa",
+      "local_sha256": "68028aa44d6052ee22201a0bd544f7b3152e2ffe99fa62b3faa1e431d3e791fa",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/harness_template.cu",
+      "local_path": "library/ncu-report/helpers/harness_template.cu",
+      "source_sha256": "7acae743fa20d2bc120e8cfa7fda6b1ee72178fa0a08110127ba83dbf300f3f9",
+      "local_sha256": "7acae743fa20d2bc120e8cfa7fda6b1ee72178fa0a08110127ba83dbf300f3f9",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/list_flashinfer_workloads.py",
+      "local_path": "library/ncu-report/helpers/list_flashinfer_workloads.py",
+      "source_sha256": "5d38de992c0f1d42a49cfbc36ebace630fa1b92dba9d2e3b7d754576d1d386d8",
+      "local_sha256": "5d38de992c0f1d42a49cfbc36ebace630fa1b92dba9d2e3b7d754576d1d386d8",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/ncu_utils.py",
+      "local_path": "library/ncu-report/helpers/ncu_utils.py",
+      "source_sha256": "e808d37e4b8f0a6260ab1706cb63ddf3e8d77321a79ae5ca4ae602a454db71c8",
+      "local_sha256": "e808d37e4b8f0a6260ab1706cb63ddf3e8d77321a79ae5ca4ae602a454db71c8",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/plot_timeline.py",
+      "local_path": "library/ncu-report/helpers/plot_timeline.py",
+      "source_sha256": "db07bd248823a4457775feb4a271b14e17de5d9b225d3c2d8f43ece96ae83db1",
+      "local_sha256": "db07bd248823a4457775feb4a271b14e17de5d9b225d3c2d8f43ece96ae83db1",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "helpers/safetensors_loader.h",
+      "local_path": "library/ncu-report/helpers/safetensors_loader.h",
+      "source_sha256": "1935d681420449cee47029e656011bcf09d6caf55ad1fd8303a1decd85d27dc5",
+      "local_sha256": "1935d681420449cee47029e656011bcf09d6caf55ad1fd8303a1decd85d27dc5",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/00-directory-layout.md",
+      "local_path": "library/ncu-report/reference/00-directory-layout.md",
+      "source_sha256": "b88c22e6b9936c971124f89eb8a34bb20e901cc26c08fb864f4df4375d758bde",
+      "local_sha256": "b88c22e6b9936c971124f89eb8a34bb20e901cc26c08fb864f4df4375d758bde",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/01-workflow.md",
+      "local_path": "library/ncu-report/reference/01-workflow.md",
+      "source_sha256": "21805df9c5948c88e40f1117ad8d0121af2d7da05dc62628fbd0c0af02774012",
+      "local_sha256": "1854732a2f46e3d2e254db7e2a1b33fc7aae7fdc9b93045e957f62737cdd8e3a",
+      "modification": "markdown link adaptation"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/02-harness-guide.md",
+      "local_path": "library/ncu-report/reference/02-harness-guide.md",
+      "source_sha256": "91f151e2fdc8c6f0aa1474d71307d3597ed81be8ad63c17d7a811246d1f03ee3",
+      "local_sha256": "91f151e2fdc8c6f0aa1474d71307d3597ed81be8ad63c17d7a811246d1f03ee3",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/03-collection.md",
+      "local_path": "library/ncu-report/reference/03-collection.md",
+      "source_sha256": "e0bfdffb6efa69aae8efe9e9cab5d6428a3fd681f6822cb6a76e90a2ca118161",
+      "local_sha256": "e0bfdffb6efa69aae8efe9e9cab5d6428a3fd681f6822cb6a76e90a2ca118161",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/04-python-api.md",
+      "local_path": "library/ncu-report/reference/04-python-api.md",
+      "source_sha256": "3b69ffe8b670761aabb3e9f0b759947db64092c4b5b95448dd443f82b041258d",
+      "local_sha256": "3b69ffe8b670761aabb3e9f0b759947db64092c4b5b95448dd443f82b041258d",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/05-analysis-dimensions.md",
+      "local_path": "library/ncu-report/reference/05-analysis-dimensions.md",
+      "source_sha256": "c0b8c2f0b3e2e5e3ef003dea93b3b5989a550807d847714f37dca8e05e408d56",
+      "local_sha256": "c0b8c2f0b3e2e5e3ef003dea93b3b5989a550807d847714f37dca8e05e408d56",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/06-diagnosis-playbook.md",
+      "local_path": "library/ncu-report/reference/06-diagnosis-playbook.md",
+      "source_sha256": "341209f586f7ca5e31c23c3eb49b56345d3f08b3f85a82cf48369e6534aea4e1",
+      "local_sha256": "341209f586f7ca5e31c23c3eb49b56345d3f08b3f85a82cf48369e6534aea4e1",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/07-report-template.md",
+      "local_path": "library/ncu-report/reference/07-report-template.md",
+      "source_sha256": "0d19709046d9769fef8a556803d1931c8ac971d8559fbbc82e8f8c45b1323f4a",
+      "local_sha256": "0d19709046d9769fef8a556803d1931c8ac971d8559fbbc82e8f8c45b1323f4a",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/08-metric-names.md",
+      "local_path": "library/ncu-report/reference/08-metric-names.md",
+      "source_sha256": "802a8bc68d98f5d818b9dc99bf5d65551d102949cc6a3e1f834b0fb73fe68655",
+      "local_sha256": "802a8bc68d98f5d818b9dc99bf5d65551d102949cc6a3e1f834b0fb73fe68655",
+      "modification": "none"
+    },
+    {
+      "repository": "mit-han-lab/ncu-report-skill",
+      "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
+      "source_path": "reference/09-common-issues.md",
+      "local_path": "library/ncu-report/reference/09-common-issues.md",
+      "source_sha256": "fd30e913d6072587fa52ad4c41a20d29b8ca68eb1a786c6a79d48b171b2d3a87",
+      "local_sha256": "fd30e913d6072587fa52ad4c41a20d29b8ca68eb1a786c6a79d48b171b2d3a87",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "skills/compute-sanitizer-diagnose-cuda-bugs/SKILL.md",
+      "local_path": "library/nvidia/compute-sanitizer/GUIDE.md",
+      "source_sha256": "0253adc748efd1154a2337f87f44a4b236426dfed5b777ac5cea3f1a4bcba491",
+      "local_sha256": "c9b2799313e7819ac248f8219ce244b640638843aeee888cb786885f9da6d350",
+      "modification": "markdown link adaptation"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "skills/compute-sanitizer-diagnose-cuda-bugs/references/changelog.md",
+      "local_path": "library/nvidia/compute-sanitizer/references/changelog.md",
+      "source_sha256": "a0de1bb56005dff2544dbd6249401a07a3812f9911be7af7ea1f8de18dd7ec15",
+      "local_sha256": "a0de1bb56005dff2544dbd6249401a07a3812f9911be7af7ea1f8de18dd7ec15",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "skills/compute-sanitizer-diagnose-cuda-bugs/references/initcheck.md",
+      "local_path": "library/nvidia/compute-sanitizer/references/initcheck.md",
+      "source_sha256": "d92adee497486aed13bbddce07299ec69d49abcd0606b6373d3f3c327f51e969",
+      "local_sha256": "d92adee497486aed13bbddce07299ec69d49abcd0606b6373d3f3c327f51e969",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "skills/compute-sanitizer-diagnose-cuda-bugs/references/memcheck.md",
+      "local_path": "library/nvidia/compute-sanitizer/references/memcheck.md",
+      "source_sha256": "1ba9d25fd2cbc8a339548d207e20ab29b43ab12dca0e94c5d8818db3029256a9",
+      "local_sha256": "1ba9d25fd2cbc8a339548d207e20ab29b43ab12dca0e94c5d8818db3029256a9",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "skills/compute-sanitizer-diagnose-cuda-bugs/references/racecheck.md",
+      "local_path": "library/nvidia/compute-sanitizer/references/racecheck.md",
+      "source_sha256": "69f03839a882d65c0b7926f705a6b90c48ef111ed0cbc6720c2da45b514e200c",
+      "local_sha256": "69f03839a882d65c0b7926f705a6b90c48ef111ed0cbc6720c2da45b514e200c",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "skills/compute-sanitizer-diagnose-cuda-bugs/references/synccheck.md",
+      "local_path": "library/nvidia/compute-sanitizer/references/synccheck.md",
+      "source_sha256": "5aaa26610de21b571e794a4ce9b863d53e5ff3a252278a6fb035e874ab030caf",
+      "local_sha256": "5aaa26610de21b571e794a4ce9b863d53e5ff3a252278a6fb035e874ab030caf",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "LICENSE-APACHE",
+      "local_path": "library/nvidia/LICENSE-APACHE",
+      "source_sha256": "4f321b887d0350e672e06c8a8bc85cff17ee2d1f3c360617079041ceee324c81",
+      "local_sha256": "4f321b887d0350e672e06c8a8bc85cff17ee2d1f3c360617079041ceee324c81",
+      "modification": "none"
+    },
+    {
+      "repository": "NVIDIA/skills",
+      "revision": "25340619336e89bcc40365c28bfe9e790430468e",
+      "source_path": "LICENSE-CC-BY-4.0",
+      "local_path": "library/nvidia/LICENSE-CC-BY-4.0",
+      "source_sha256": "8aca1bec720ca7a68f5e6a13e61eed6ca21c3925db15620bc39878be250af846",
+      "local_sha256": "8aca1bec720ca7a68f5e6a13e61eed6ca21c3925db15620bc39878be250af846",
+      "modification": "none"
+    }
+  ]
+}

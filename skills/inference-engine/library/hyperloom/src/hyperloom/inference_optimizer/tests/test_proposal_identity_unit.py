@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Shared proposal/variant identity."""
+
+from __future__ import annotations
+
+import pytest
+
+from hyperloom.orchestrator.actions.executors._proposal_identity import (
+    BaseControls,
+    controls_of,
+    effective_fingerprint,
+    is_executable,
+    normalize_proposal,
+)
+
+
+# (label, extra_args, extra_envs, variant controls, base controls, expected fingerprint)
+_GOLDEN = [
+    ("plain", "--max-num-seqs 128", {"A": "1"}, ([], [], "append"), ([], [], ""), "0ab03ba33fdfbe41"),
+    ("variant-only", "--max-num-seqs 128", {"A": "1"}, (["--x"], ["E"], "append"), ([], [], ""), "057f597995c4b19c"),
+    ("base-only", "--max-num-seqs 128", {"A": "1"}, ([], [], "append"), (["--b"], ["BE"], ""), "4930b4d6a6fe14c9"),
+    ("both", "--max-num-seqs 128", {"A": "1"}, (["--x"], ["E"], "append"), (["--b"], ["BE"], ""), "cf0be9ec6cf0fe3c"),
+    ("overlap", "--max-num-seqs 128", {}, (["--b"], [], "append"), (["--b"], [], ""), "ed71997299911ca9"),
+    ("variant-replace", "", {"A": "1"}, ([], [], "replace"), ([], [], ""), "7f4d4d32a84df525"),
+    ("base-replace", "", {"A": "1"}, ([], [], "append"), ([], [], "replace"), "7f4d4d32a84df525"),
+    ("removal-only", "", {}, (["--enable-prefix-caching"], [], "append"), ([], [], ""), "ca4d2e9e9760543a"),
+    ("empty", "", {}, ([], [], "append"), ([], [], ""), "164374825086dc65"),
+]
+
+
+def _controls(remove_args, unset_envs, args_mode) -> dict:
+    return controls_of(
+        normalize_proposal({"remove_args": remove_args, "unset_envs": unset_envs, "args_mode": args_mode})
+    )
+
+
+@pytest.mark.parametrize(
+    "args,envs,variant,base,expected",
+    [row[1:] for row in _GOLDEN],
+    ids=[row[0] for row in _GOLDEN],
+)
+def test_effective_fingerprint_matches_the_pinned_executor_values(args, envs, variant, base, expected):
+    b_remove, b_unset, b_mode = base
+    assert (
+        effective_fingerprint(
+            args,
+            envs,
+            controls=_controls(*variant),
+            base=BaseControls(remove_args=b_remove, unset_envs=b_unset, args_mode=b_mode),
+        )
+        == expected
+    )
+
+
+def test_base_controls_change_the_fingerprint():
+    controls = _controls(["--x"], [], "append")
+    assert effective_fingerprint("--a 1", {}, controls=controls) != effective_fingerprint(
+        "--a 1", {}, controls=controls, base=BaseControls(remove_args=["--b"])
+    )
+
+
+def test_removal_union_is_base_first_and_deduped():
+    both = effective_fingerprint(
+        "", {}, controls=_controls(["--b", "--v"], [], "append"), base=BaseControls(remove_args=["--b"])
+    )
+    assert both == effective_fingerprint("", {}, controls=_controls(["--b", "--v"], [], "append"))
+
+
+@pytest.mark.parametrize(
+    "proposal,expected",
+    [
+        ({"extra_args": "--a 1"}, True),
+        ({"extra_server_args": "--a 1"}, True),
+        ({"extra_envs": {"A": "1"}}, True),
+        ({"remove_args": ["--a"]}, True),
+        ({"unset_envs": ["A"]}, True),
+        ({"args_mode": "replace"}, True),
+        ({"name": "research-only", "reason": "read the scheduler"}, False),
+        ({"extra_args": "  ", "extra_envs": {}}, False),
+    ],
+)
+def test_is_executable(proposal, expected):
+    assert is_executable(normalize_proposal(proposal)) is expected
+
+
+def test_normalize_resolves_the_args_alias_and_keeps_atomic():
+    fields = normalize_proposal(
+        {
+            "name": " coupled ",
+            "extra_server_args": " --a 1 ",
+            "extra_envs": {"A": 1},
+            "remove_args": "--drop",
+            "args_mode": "REPLACE",
+            "atomic": True,
+            "reason": "needs the paired headroom",
+        }
+    )
+    assert fields == {
+        "name": "coupled",
+        "extra_args": "--a 1",
+        "extra_envs": {"A": "1"},
+        "remove_args": ["--drop"],
+        "unset_envs": [],
+        "args_mode": "replace",
+        "atomic": True,
+        "reason": "needs the paired headroom",
+    }
+
+
+def test_controls_of_drops_defaults():
+    assert controls_of(normalize_proposal({"extra_args": "--a 1"})) == {}
+    assert controls_of(normalize_proposal({"remove_args": ["--x"], "args_mode": "replace"})) == {
+        "remove_args": ["--x"],
+        "args_mode": "replace",
+    }
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (["--max-num-seqs", "128"], "--max-num-seqs 128"),
+        (("--a", "1"), "--a 1"),
+        (["--a", "", "  ", "1"], "--a 1"),
+        ("--a 1", "--a 1"),
+        (None, ""),
+    ],
+)
+def test_list_form_args_are_space_joined_not_repr(value, expected):
+    assert normalize_proposal({"extra_args": value})["extra_args"] == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ({"--kv-cache-dtype": "fp8_e4m3"}, "--kv-cache-dtype fp8_e4m3"),
+        (
+            {"--mem-fraction-static": 0.9, "--max-running-requests": 128},
+            "--mem-fraction-static 0.9 --max-running-requests 128",
+        ),
+        ({"--enable-mixed-chunk": True, "--disable-radix-cache": False}, "--enable-mixed-chunk"),
+        ({"--served-model-name": "a b"}, "--served-model-name 'a b'"),
+    ],
+)
+def test_mapping_form_args_render_as_flags_not_repr(value, expected):
+    assert normalize_proposal({"extra_args": value})["extra_args"] == expected
+
+
+def test_mapping_form_args_pass_the_grid_argv_gate():
+    from hyperloom.inference_optimizer.grid_server_args import validate_server_args_shell_safe
+
+    args = normalize_proposal({"extra_args": {"--kv-cache-dtype": "fp8_e4m3"}})["extra_args"]
+    assert validate_server_args_shell_safe(args) == args
+
+
+def test_a_variants_experience_citations_survive_its_rebuild_into_a_derived_variant():
+    from hyperloom.orchestrator.actions.executors.explore import (
+        _decision_fields,
+        _grid_variants_from_payload,
+        _variant_with_eval_off,
+    )
+
+    citation = {"id": "exp-" + "1" * 32, "stance": "adopt", "claim": "Kept on the same model."}
+    [variant] = _grid_variants_from_payload(
+        [{"name": "v", "extra_args": "--x 1", "reasoning": "why", "experience_citations": [citation]}]
+    )
+
+    assert _decision_fields(_variant_with_eval_off(variant)) == {
+        "note": "why",
+        "reasoning_origin": "action_payload.reasoning",
+        "experience_citations": [citation],
+    }
+
+
+def test_the_queue_and_the_grid_parser_agree_on_a_list_form_variant():
+    from hyperloom.orchestrator.actions.executors.explore import _grid_variants_from_payload
+
+    payload = {"name": "v", "extra_args": ["--max-num-seqs", "128"], "extra_envs": {"E": "1"}}
+    parsed = _grid_variants_from_payload([payload])[0]
+    fields = normalize_proposal(payload)
+    assert fields["extra_args"] == parsed.extra_server_args
+    assert effective_fingerprint(
+        fields["extra_args"], fields["extra_envs"], controls=controls_of(fields)
+    ) == effective_fingerprint(parsed.extra_server_args, parsed.extra_envs, controls={})

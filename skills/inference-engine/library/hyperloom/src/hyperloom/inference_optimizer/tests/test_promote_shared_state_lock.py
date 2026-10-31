@@ -1,0 +1,2868 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Behavior-lock tests for ``WritebackCollaborator.promote_to_shared_state``: per-task_kind state writes, audit rows,
+and sweep/conc_sweep early-return.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from hyperloom.orchestrator.roles import (
+    MockBackend,
+    MockCriticBackend,
+    ScriptedPlan,
+)
+from hyperloom.orchestrator.lever import LEVER_CONFIG
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.inference_optimizer.session.optimization_journal import OUTCOME_NO_PROMOTE, OUTCOME_RECORDED, Verdict
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.loop.sub_agent_runner import SubAgentResult
+from hyperloom.orchestrator.loop import _keep_patch_column as keep_patch_column
+from hyperloom.orchestrator.loop import _promote_outcome as promote_outcome
+from hyperloom.orchestrator.loop._keep_patch_column import _is_patch_column_keep
+from hyperloom.orchestrator.loop.writeback import WritebackCollaborator
+from hyperloom.orchestrator.knowledge.remote_recipe._vendor.kb_store_client import (
+    KnowledgeSections,
+)
+from hyperloom.orchestrator.knowledge.remote_recipe.values import has_new_keep
+from hyperloom.orchestrator.state._shared_state.attempt_audit import _AUDIT_ACTIONS
+from hyperloom.inference_optimizer.session.paths import make_session_dir
+from hyperloom.orchestrator.state.task_registry import Task, TaskSpec
+
+
+@pytest.fixture
+def session_dir(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
+    return make_session_dir()
+
+
+def _silent_backends() -> dict[str, object]:
+    silent = ScriptedPlan(
+        turns=[],
+        default_intent=Intent(
+            type=IntentType.SEND_MESSAGE,
+            payload={"topic": "heartbeat", "body_md": "ok"},
+        ),
+    )
+    return {
+        "orchestration": MockBackend(silent, name="orch"),
+        "critic": MockCriticBackend(),
+    }
+
+
+def _coord(session_dir: Path) -> Coordinator:
+    return Coordinator(session_dir, backends=_silent_backends())
+
+
+def _resume_pending(state) -> bool:
+    """Compute resume_pending_revalidation the same way session_facts.py does."""
+    stack_len = len(state.optimization_stack)
+    validated_len = int(state.cumulative_gain_validated_stack_len or 0)
+    working_gen = int(getattr(state, "working_recipe_generation", 0) or 0)
+    validated_gen = int(state.validated_recipe_generation or 0)
+    return stack_len > validated_len or working_gen != validated_gen
+
+
+def _set_resume_pending(state, value: bool) -> None:
+    """Drive the underlying fields that session_facts reads to produce ``value``."""
+    if value:
+        # Make working_recipe_generation differ from validated so the computed flag is True.
+        state.working_recipe_generation = int(state.validated_recipe_generation or 0) + 1
+    else:
+        # Align the generations and stack lengths so the computed flag is False.
+        state.validated_recipe_generation = int(getattr(state, "working_recipe_generation", 0) or 0)
+        state.cumulative_gain_validated_stack_len = len(state.optimization_stack)
+
+
+def _task(kind: str, *, task_id: str = "t1", params: dict | None = None) -> Task:
+    return Task(
+        task_id=task_id,
+        kind=kind,
+        state="running",
+        params=params or {},
+        idempotency_key=f"{kind}-{task_id}",
+    )
+
+
+def _count_record_attempt(coord: Coordinator, monkeypatch) -> list[dict]:
+    """Spy that records every record_action_attempt call's arguments, forwarding to the real impl."""
+    calls: list[dict] = []
+    real = coord.shared_state.record_action_attempt
+
+    def spy(action, attempt):
+        calls.append({"action": action, "attempt": attempt})
+        return real(action, attempt)
+
+    monkeypatch.setattr(coord.shared_state, "record_action_attempt", spy)
+    return calls
+
+
+# GAP 1: sweep / conc_sweep early-return double-track — each records + saves + returns on its own, so the unified tail
+# record_action_attempt must not re-fire.
+@pytest.mark.asyncio
+async def test_promote_conc_sweep_records_once_and_returns_before_tail(session_dir, monkeypatch):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    calls = _count_record_attempt(coord, monkeypatch)
+
+    await coord.writeback.promote_to_shared_state(
+        "conc_sweep",
+        {
+            "status": "succeeded",
+            "summary": {"best_speedup": 1.3, "best_conc": 8},
+        },
+        task=_task("conc_sweep"),
+    )
+
+    # conc_sweep is NOT in _AUDIT_ACTIONS, so an audit attempt here could only
+    # ever return on the method's first line. The branch used to make the call
+    # anyway, assembling a rich extras dict that was dropped every time; it has
+    # been removed, and the sweep's skip reason, budget verdict and summary are
+    # recorded on the conc_sweep timeline event instead.
+    assert "conc_sweep" not in _AUDIT_ACTIONS
+    assert calls == []
+    # No conc_sweep_attempts ledger exists; record_conc_sweep wrote last_conc_sweep.
+    assert not hasattr(s, "conc_sweep_attempts")
+    assert s.last_conc_sweep.get("status") == "succeeded"
+    assert s.last_conc_sweep.get("summary", {}).get("best_speedup") == 1.3
+
+
+# GAP 2: changed / audit convergence for baseline / profile / explore / roofline.
+@pytest.mark.asyncio
+async def test_promote_baseline_writes_state_and_audit(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+
+    await coord.writeback.promote_to_shared_state(
+        "baseline",
+        {
+            "output_throughput": 100.0,
+            "warmup_round_tput": 80.0,
+            "accuracy": 0.9,
+            "subprocess_runtime_sec": 30.0,
+            "launch_evidence": {
+                "framework": "sglang",
+                "observed_server_identity": {"model_path": "/models/Qwen", "tp_size": 1},
+            },
+            "launch_evidence_path": "/baseline/launch_evidence.json",
+            "server_log_path": "/baseline/server.log",
+        },
+        task=_task("baseline"),
+    )
+
+    # Hot-measure contract: baseline_tput is the hot round, not the cold warmup.
+    assert s.baseline_tput == 100.0
+    assert s.baseline_accuracy == 0.9
+    assert s.baseline_runtime_sec == 30.0
+    assert s.current_best["action"] == "baseline"
+    assert s.current_best["tput"] == 100.0
+    assert s.current_best_measurement["launch_evidence_path"] == "/baseline/launch_evidence.json"
+    assert s.current_best_measurement["server_log_path"] == "/baseline/server.log"
+    assert s.current_best_measurement["observed_server_identity"] == {
+        "model_path": "/models/Qwen",
+        "tp_size": 1,
+    }
+    # Audit row: promoted with key_metric = output_throughput.
+    assert s.last_baseline["decision"] == "promoted"
+    assert s.last_baseline["status"] == "succeeded"
+    assert s.last_baseline["key_metric"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_promote_profile_writes_state_and_audit(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.current_best = {
+        "action": "explore",
+        "engine": "sglang",
+        "tput": 100.0,
+        "extra_server_args": "--attention-backend aiter",
+        "extra_envs": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE": "/tmp/tuned.csv"},
+    }
+
+    await coord.writeback.promote_to_shared_state(
+        "profile",
+        {
+            "status": "succeeded",
+            "main_trace_path": "/tmp/trace.json.gz",
+            "output_throughput": 150.0,
+        },
+        task=_task(
+            "profile",
+            params={
+                "base_extra_args": "--mem-fraction-static=0.9",
+                "framework": "vllm",
+                "precision": "fp8",
+                "model_path": "/models/qwen",
+                "tp": 1,
+                "conc": 64,
+                "isl": 1024,
+                "osl": 1024,
+                "max_model_len": 4096,
+            },
+        ),
+    )
+
+    assert s.last_profile_trace == "/tmp/trace.json.gz"
+    assert s.last_profile_status == "succeeded"
+    assert s.last_profile_args == "--mem-fraction-static=0.9"
+    assert s.last_profile_workload == s.profile_workload_context(
+        {
+            "base_extra_args": "--mem-fraction-static=0.9",
+            "framework": "vllm",
+            "precision": "fp8",
+            "model_path": "/models/qwen",
+            "tp": 1,
+            "conc": 64,
+            "isl": 1024,
+            "osl": 1024,
+            "max_model_len": 4096,
+        }
+    )
+    # A profiler-on measurement never moves current_best, however high it reads.
+    assert s.current_best["action"] == "explore"
+    assert s.current_best["tput"] == 100.0
+    assert s.cumulative_gain_validated == 0.0
+    # Audit row.
+    assert s.last_profile["decision"] == "promoted"
+    assert s.last_profile["status"] == "succeeded"
+    assert s.last_profile["extras"]["trace_path"] == "/tmp/trace.json.gz"
+    assert s.last_profile["extras"]["profile_args"] == "--mem-fraction-static=0.9"
+
+
+@pytest.mark.asyncio
+async def test_promote_profile_without_task_uses_shared_state_workload(session_dir):
+    coord = _coord(session_dir)
+    state = coord.shared_state
+    state.framework = "vllm"
+    state.precision = "fp8"
+    state.model_path = "/models/qwen"
+    state.tp = 1
+    state.conc = 64
+    state.isl = 1024
+    state.osl = 1024
+    state.max_model_len = 4096
+    state.current_best = {
+        "extra_envs": {"VLLM_ROCM_USE_AITER_LINEAR": "1"},
+    }
+
+    await coord.writeback.promote_to_shared_state(
+        "profile",
+        {
+            "status": "succeeded",
+            "main_trace_path": "/tmp/trace.json.gz",
+            "output_throughput": 100.0,
+        },
+        task=None,
+    )
+
+    assert state.last_profile_workload == state.current_profile_workload_context()
+
+
+@pytest.mark.asyncio
+async def test_promote_explore_promoted_writes_state_and_audit(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    winner = {"name": "v1", "fingerprint": "abc", "tput": 130.0}
+
+    await coord.writeback.promote_to_shared_state(
+        "explore",
+        {
+            "explore_search_update": {},
+            "winners": [winner],
+            "round_id": "r1",
+            "best_variant": winner,
+            "output_throughput": 130.0,
+            "best_gain_pct": 30.0,
+        },
+        task=_task("explore", params={"gap_canonical_id": "g1"}),
+    )
+
+    assert s.current_best["action"] == "explore"
+    assert s.current_best["tput"] == 130.0
+    accepted = s.explore_search.get("accepted") if isinstance(s.explore_search, dict) else None
+    assert isinstance(accepted, list) and len(accepted) == 1
+    # Audit row: promoted; extras carry the round + winner stats.
+    assert s.last_explore["decision"] == "promoted"
+    assert s.last_explore["status"] == "succeeded"
+    assert s.last_explore["extras"]["round_id"] == "r1"
+    assert s.last_explore["extras"]["winners_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["succeeded", "recovered"])
+async def test_promote_roofline_with_a_trace_writes_audit(session_dir, status):
+    """A trace salvaged from a failed profile run is analysed like any other."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.roofline_failure_streak = 2
+    s.last_trace_analyze = {"roofline_snapshot_id": 5, "analysis_md_path": "/tmp/a.md"}
+
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        {
+            "status": status,
+            "snapshot_id": 5,
+            "last_profile_trace": "/tmp/trace.gz",
+        },
+        task=_task("roofline"),
+    )
+
+    # roofline resets its failure streak on an analysed snapshot.
+    assert s.roofline_failure_streak == 0
+    # Audit row: promoted; snapshot_id taken from last_trace_analyze snapshot.
+    assert s.last_roofline["decision"] == "promoted"
+    assert s.last_roofline["extras"]["snapshot_id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_roofline_with_an_analysis_anchors_the_watermark(session_dir):
+    """A roofline that produced an analysis costs the next one a 10% climb."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.cumulative_gain_validated = 75.0
+    s.last_roofline_tput = 0.0
+    s.last_trace_analyze = {
+        "roofline_snapshot_id": 5,
+        "analysis_md_path": "/tmp/a.md",
+        "analysis_md_text": "# roofline\nattention is 64.8% of GPU time\n",
+    }
+
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        {"status": "succeeded", "snapshot_id": 5},
+        task=_task("roofline"),
+    )
+
+    assert s.last_roofline_tput == 175.0
+
+
+@pytest.mark.asyncio
+async def test_roofline_without_an_analysis_leaves_the_watermark_armed(session_dir):
+    """An empty analysis must not buy a cycle of silence."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.cumulative_gain_validated = 75.0
+    s.last_roofline_tput = 0.0
+    s.last_trace_analyze = {"roofline_snapshot_id": 5, "analysis_md_text": ""}
+
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        {"status": "succeeded", "snapshot_id": 5},
+        task=_task("roofline"),
+    )
+
+    assert s.last_roofline_tput == 0.0
+
+
+# GAP 3: successful profile with a trace clears the stale trace_analyze cache.
+@pytest.mark.asyncio
+async def test_promote_profile_with_trace_clears_last_trace_analyze(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.last_trace_analyze = {"stale": True, "roofline_snapshot_id": 9}
+
+    await coord.writeback.promote_to_shared_state(
+        "profile",
+        {
+            "status": "succeeded",
+            "main_trace_path": "/tmp/trace.json.gz",
+            "output_throughput": 150.0,
+        },
+        task=_task("profile", params={"base_extra_args": "--foo"}),
+    )
+
+    assert s.last_trace_analyze == {}
+
+
+# GAP 4: profile "skipped" arm audits as skipped and clears the pending roofline task, without touching current_best /
+# last_profile_trace.
+@pytest.mark.asyncio
+async def test_promote_profile_skipped_audits_and_clears_pending(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.auto_roofline_pending_task_id = "t1"
+
+    await coord.writeback.promote_to_shared_state(
+        "profile",
+        {
+            "status": "skipped",
+            "error_class": "no_profiler",
+            "error": "profiler disabled",
+        },
+        task=_task("profile", task_id="t1"),
+    )
+
+    # Pending roofline task cleared; audit row is a skipped verdict.
+    assert s.auto_roofline_pending_task_id == ""
+    assert s.last_profile["decision"] == "skipped"
+    assert s.last_profile["extras"]["error_class"] == "no_profiler"
+    # Skipped arm never promotes current_best.
+    assert not s.current_best or s.current_best.get("action") != "profile"
+
+
+# GAP 5: integrate_patch KEEP lifts current_best and clears pending_integrate; integrate_patch is NOT in
+# _AUDIT_ACTIONS so no last_integrate_patch is written.
+@pytest.mark.asyncio
+async def test_promote_integrate_patch_kept_lifts_and_clears_pending(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.pending_integrate = {"task_id": "t1"}
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 140.0,
+            "specialist_task_id": "spec-1",
+            "delta_pct": 40.0,
+            "extra_server_args_applied": "--kv-cache-dtype fp8",
+            "extra_envs_applied": {"FOO": "1"},
+            "workspace": "/w",
+        },
+        task=_task("integrate_patch", task_id="t1"),
+    )
+
+    assert s.current_best["action"] == "integrate_patch"
+    assert s.current_best["tput"] == 140.0
+    assert s.current_best["extra_server_args"] == "--kv-cache-dtype fp8"
+    assert s.current_best["extra_envs"] == {"FOO": "1"}
+    # pending_integrate sentinel cleared after the outcome is observed.
+    assert s.pending_integrate == {}
+    # Not an audited action: no last_integrate_patch attribute is created.
+    assert not hasattr(s, "last_integrate_patch")
+
+
+@pytest.mark.asyncio
+async def test_promote_integrate_patch_carries_nested_launch_evidence(session_dir):
+    """The grid proof remains attached after an integrate-patch KEEP lift."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    observed_identity = {"model_path": "/models/Qwen", "tp_size": 1}
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 140.0,
+            "specialist_task_id": "spec-1",
+            "workspace": "/benchmark",
+            "bench_result": {
+                "launch_evidence": {
+                    "framework": "sglang",
+                    "observed_server_identity": observed_identity,
+                },
+                "launch_evidence_path": "/slot/launch_evidence.json",
+                "server_log_path": "/slot/server.log",
+            },
+        },
+        task=_task("integrate_patch", task_id="t1"),
+    )
+
+    measurement = s.current_best_measurement
+    assert measurement["launch_evidence"]["observed_server_identity"] == observed_identity
+    assert measurement["launch_evidence_path"] == "/slot/launch_evidence.json"
+    assert measurement["server_log_path"] == "/slot/server.log"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["fusion", "integrate_patch"])
+@pytest.mark.parametrize("vetoed", [False, True], ids=["intvty_win", "intvty_regression"])
+async def test_integrate_nested_e2e_measurement_owns_promotion(session_dir, monkeypatch, lane, vetoed):
+    monkeypatch.setenv("HYPERLOOM_PERF_METRIC", "intvty_v1")
+    monkeypatch.setenv("HYPERLOOM_PERF_NOISE_PCT", "5")
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.framework = "sglang"
+    s.benchmark_mode = "agentx"
+    s.baseline_tput = 100.0
+    s.baseline_perf = {
+        "output_throughput": 100.0,
+        "total_throughput": 1000.0,
+        "e2e_norm_intvty_p90": 100.0,
+        "e2e_norm_intvty_p50": 100.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+    }
+    anchor = {
+        "action": "explore",
+        "tput": 100.0,
+        "total_throughput": 1100.0,
+        "e2e_norm_intvty_p90": 110.0,
+        "e2e_norm_intvty_p50": 110.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+        "extra_server_args": "",
+        "extra_envs": {},
+    }
+    s.current_best = dict(anchor)
+    s.cumulative_gain_validated = 10.0
+    prior_fusion = {"decision": "DISCARD", "kernel_id": "prior-fusion"}
+    s.last_fusion_integrate = dict(prior_fusion)
+    bench = {
+        "status": "succeeded",
+        "output_throughput": 105.0,
+        "total_token_throughput": 1200.0,
+        "input_throughput": 1110.0,
+        "e2e_norm_intvty_p90": 50.0 if vetoed else 120.0,
+        "e2e_norm_intvty_p50": 50.0 if vetoed else 120.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+        "tpot_p90_ms": 10.0,
+        "ttft_mean_ms": 12.0,
+        "e2el_mean_ms": 23.0,
+        "tpot_mean_ms": 4.0,
+        "workspace": "/e2e/benchmark",
+        "raw_result_path": "/e2e/raw.json",
+        "report_path": "/e2e/report.json",
+        "materialized_config": "/e2e/config.yaml",
+        "launch_evidence": {
+            "framework": "sglang",
+            "observed_server_identity": {"model_path": "/models/e2e", "tp_size": 2},
+            "observed_server_launch_flags": "--model-path /models/e2e --tp-size 2",
+        },
+        "launch_evidence_path": "/e2e/launch_evidence.json",
+        "server_log_path": "/e2e/server.log",
+        "extra_server_args": "--stale-measured-args",
+        "extra_envs": {"STALE_MEASURED_ENV": "1"},
+        "source_snapshot": "/stale/measured-snapshot",
+    }
+    result = {
+        **{key: f"/outer/{key}" for key in ("workspace", "raw_result_path", "report_path", "materialized_config")},
+        "status": "kept",
+        "output_throughput": 140.0,
+        "new_tput": 9999.0,
+        "total_throughput": 2000.0,
+        "input_throughput": 1860.0,
+        "e2e_norm_intvty_p90": 100.0,
+        "e2e_norm_intvty_p50": 100.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+        "tpot_p90_ms": 99.0,
+        "ttft_mean_ms": 99.0,
+        "e2el_mean_ms": 99.0,
+        "tpot_mean_ms": 99.0,
+        "source": "forge_fusion",
+        "action_label": "fusion",
+        "kernel_id": "fuse-e2e",
+        "integration_id": "integration-e2e",
+        "patch_path": "/authored/kernel.patch",
+        "specialist_task_id": "spec-e2e",
+        "extra_server_args": "--page-size 32",
+        "extra_server_args_applied": "--page-size 32",
+        "extra_envs": {"ACCEPTED_ENV": "1"},
+        "extra_envs_applied": {"ACCEPTED_ENV": "1"},
+        **_keep_result(session_dir, import_root="python"),
+        "launch_evidence": {
+            "framework": "sglang",
+            "observed_server_identity": {"model_path": "/models/stale", "tp_size": 8},
+            "observed_server_launch_flags": "--model-path /models/stale --tp-size 8",
+        },
+        "launch_evidence_path": "/outer/launch_evidence.json",
+        "server_log_path": "/outer/server.log",
+        "bench_result": bench,
+    }
+    candidates = []
+    real_lift = coord.writeback.lift_to_current_best
+
+    def capture_lift(action, tput, variant, **kwargs):
+        candidates.append((tput, variant))
+        return real_lift(action, tput, variant, **kwargs)
+
+    monkeypatch.setattr(coord.writeback, "lift_to_current_best", capture_lift)
+    if lane == "fusion":
+        await coord.writeback.record_integrate_keep(result)
+    else:
+        await coord.writeback._promote_integrate_patch(
+            result, _task("integrate_patch"), promote_outcome._PromoteOutcome(verdict=Verdict.RECORDED)
+        )
+
+    if vetoed:
+        assert s.current_best == anchor
+        assert s.optimization_stack == []
+        assert s.current_best_measurement == {}
+        assert s.cumulative_gain_validated == 10.0
+        assert s.cumulative_gain_validated_stack_len == 0
+        assert s.last_fusion_integrate == prior_fusion
+        return
+
+    assert s.current_best["tput"] == 105.0
+    assert s.current_best["total_throughput"] == 1200.0
+    assert s.current_best["input_throughput"] == 1110.0
+    assert s.current_best["e2e_norm_intvty_p90"] == 120.0
+    assert s.cumulative_gain_validated == pytest.approx(20.0)
+    assert s.cumulative_gain_validated_stack_len == 1
+    assert len(s.optimization_stack) == 1
+    entry = s.optimization_stack[0]
+    assert entry["action"] == lane
+    assert entry["tput"] == 105.0
+    assert entry["workspace"] == bench["workspace"]
+    assert s.current_best["extra_server_args"] == "--page-size 32"
+    assert s.current_best["extra_envs"] == {"ACCEPTED_ENV": "1"}
+    assert entry["candidate_extra_server_args"] == "--page-size 32"
+    if lane == "fusion":
+        assert entry["patch_path"] == result["patch_path"]
+        assert entry["integration_id"] == result["integration_id"]
+        assert s.last_fusion_integrate["decision"] == "KEEP"
+        assert s.last_fusion_integrate["kernel_id"] == "fuse-e2e"
+    else:
+        assert entry["candidate_extra_envs"] == {"ACCEPTED_ENV": "1"}
+        assert entry["source_snapshot"] == result["source_snapshot"]
+        assert entry["source_manifest"] == result["source_manifest"]
+        assert entry["framework_root"] == result["framework_root"]
+
+    [(new_tput, candidate)] = candidates
+    assert new_tput == bench["output_throughput"]
+    for key in ("ttft_mean_ms", "e2el_mean_ms", "tpot_mean_ms", "tpot_p90_ms", "workspace"):
+        assert candidate[key] == s.current_best[key] == bench[key]
+    for key in ("raw_result_path", "report_path", "materialized_config"):
+        assert candidate[key] == bench[key]
+    measurement = s.current_best_measurement
+    assert measurement["tput"] == bench["output_throughput"]
+    assert measurement["benchmark_workspace"] == bench["workspace"]
+    for key in ("launch_evidence", "launch_evidence_path", "server_log_path"):
+        assert measurement[key] == bench[key]
+    assert measurement["identity_verification_status"] == "verified_observed"
+    spec = coord.writeback.build_env_spec()
+    assert (
+        spec["measurement_identity"]["observed_server_identity"] == bench["launch_evidence"]["observed_server_identity"]
+    )
+    assert spec["config"]["server_launch_flags"] == bench["launch_evidence"]["observed_server_launch_flags"]
+    assert measurement["declared_launch_identity"] == spec["launch_identity"]
+
+
+@pytest.mark.asyncio
+async def test_promote_integrate_patch_refuses_a_keep_below_the_anchor(session_dir):
+    """A KEEP measured below the live anchor is not adopted; the promotion says so."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.current_best = {"action": "explore", "tput": 200.0, "extra_server_args": "", "extra_envs": {}}
+
+    result = {
+        "status": "kept",
+        "output_throughput": 140.0,
+        "specialist_task_id": "spec-1",
+        "delta_pct": 40.0,
+    }
+    outcome = await coord.writeback.promote_to_shared_state(
+        "integrate_patch", result, task=_task("integrate_patch", task_id="t1")
+    )
+
+    assert outcome.verdict is Verdict.REFUSED
+    assert s.current_best["tput"] == 200.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "tput", "expected"),
+    [
+        ("kept", 260.0, Verdict.ADOPTED),
+        ("reverted", 190.0, Verdict.REVERTED),
+        ("accuracy_unavailable_reject", 190.0, Verdict.REVERTED),
+        ("regression", 190.0, Verdict.REVERTED),
+        ("kept_inert", 201.0, Verdict.RECORDED),
+        ("apply_failed", None, Verdict.FAILED),
+        ("rejected_by_critic", None, Verdict.FAILED),
+        ("no_patches", None, Verdict.FAILED),
+        ("applied_no_bench", None, Verdict.FAILED),
+        ("failed", None, Verdict.FAILED),
+        ("skipped", None, Verdict.FAILED),
+    ],
+)
+async def test_promote_integrate_patch_settles_one_verdict(session_dir, status, tput, expected):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.current_best = {"action": "explore", "tput": 200.0, "extra_server_args": "", "extra_envs": {}}
+    result: dict = {"status": status, "specialist_task_id": "spec-1"}
+    if tput is not None:
+        result["output_throughput"] = tput
+
+    outcome = await coord.writeback.promote_to_shared_state(
+        "integrate_patch", result, task=_task("integrate_patch", task_id="t1")
+    )
+
+    assert outcome.verdict is expected
+    assert (s.current_best["tput"] == tput) is (expected is Verdict.ADOPTED)
+
+
+@pytest.mark.asyncio
+async def test_a_lift_refused_integrate_patch_is_not_journalled_keep(session_dir, monkeypatch):
+    """The whole settlement reads the promotion's verdict: journal, settle row and intervention mix."""
+    from hyperloom.inference_optimizer.breakdown.recorder import phase_event
+
+    settled: list[dict] = []
+    monkeypatch.setattr(phase_event, "record_settle", lambda settlement: settled.append(vars(settlement)))
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.current_best = {"action": "explore", "tput": 200.0, "extra_server_args": "", "extra_envs": {}}
+    s.optimization_stack = [{"action": "explore", "variant_name": "v0", "tput": 200.0}]
+    task = _task("integrate_patch", task_id="t-refused")
+    result = SubAgentResult(
+        task_id=task.task_id,
+        state="succeeded",
+        result={"status": "kept", "output_throughput": 150.0, "delta_pct": 50.0},
+    )
+
+    await coord.dispatcher.reap_dispatched_task(task, result)
+
+    assert len(s.optimization_stack) == 1
+    assert s.current_best["tput"] == 200.0
+    (entry,) = [e for e in coord.recipe_journal.ensure_journal().entries if e.task_id == "t-refused"]
+    assert entry.outcome == OUTCOME_NO_PROMOTE
+    assert [row["change_type"] for row in s.intervention_mix] == ["code_patch_attempt"]
+    assert [row["decision"] for row in settled] == ["refused"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("specialist", {"runner_status": "ok", "specialist_done": {"proposal_set": []}}),
+        ("report", {"status": "succeeded"}),
+        ("session_breakdown", {"status": "succeeded"}),
+        ("target_analysis", {"status": "ok"}),
+    ],
+)
+async def test_a_step_without_adoption_semantics_is_never_journalled_keep(session_dir, kind, payload):
+    """A successful specialist or report adopts nothing; the journal must not claim a KEEP."""
+    coord = _coord(session_dir)
+    task = _task(kind, task_id=f"t-{kind}")
+
+    outcome = await coord.writeback.promote_to_shared_state(kind, dict(payload), task=task)
+    await coord.recipe_journal.fact_write_hook(
+        task=task,
+        result=SubAgentResult(task.task_id, "succeeded", payload),
+        verdict=outcome.verdict,
+    )
+
+    assert outcome.verdict is Verdict.RECORDED
+    (entry,) = [e for e in coord.recipe_journal.ensure_journal().entries if e.task_id == task.task_id]
+    assert entry.outcome == OUTCOME_RECORDED
+
+
+@pytest.mark.asyncio
+async def test_forge_loop_integrate_keep_lands_a_journal_entry(session_dir):
+    """Reproduces a real session: a forge-loop kernel_rewrite_controller KEEP lands on
+    optimization_stack via record_integrate_keep, which never went through the generic
+    fact_write_hook -> _record_fact_per_task path every dispatched Task uses to append its own
+    optimization_journal.json row. The journal's header (final_throughput/total_gain_pct) ends up
+    naming a KEEP its own entries list never records."""
+    from hyperloom.inference_optimizer.session.optimization_journal import OUTCOME_KEEP
+
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+
+    await coord.writeback.record_integrate_keep(
+        {
+            "status": "kept",
+            "output_throughput": 140.0,
+            "kernel_id": "kernel:forge-loop:fwd_grouped_kernel_stage1:sglang:0.5.17:triton:mi355x",
+            "integration_id": "int-forge-1",
+            "gain_pct": 7.72,
+            "backend": "forge",
+            "engine": "kernel_rewrite_controller",
+        }
+    )
+
+    assert s.optimization_stack[0]["action"] == "integrate"
+    journal = coord.recipe_journal.ensure_journal()
+    matches = [e for e in journal.entries if e.task_id == "int-forge-1"]
+    assert len(matches) == 1
+    entry = matches[0]
+    assert entry.outcome == OUTCOME_KEEP
+    assert entry.gain_pct == 7.72
+    assert entry.throughput_after == 140.0
+    assert entry.variant_name == "kernel:forge-loop:fwd_grouped_kernel_stage1:sglang:0.5.17:triton:mi355x"
+    assert entry.lever_kind == "kernel"
+
+
+@pytest.mark.asyncio
+async def test_fusion_integrate_keep_lands_a_journal_entry(session_dir):
+    """The fusion sibling of the same lane must land a journal entry too."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+
+    await coord.writeback.record_integrate_keep(
+        {
+            "status": "kept",
+            "output_throughput": 120.0,
+            "kernel_id": "fuse-rmsnorm-silu",
+            "integration_id": "int-fusion-1",
+            "gain_pct": 2.0,
+            "source": "forge_fusion",
+            "action_label": "fusion",
+        }
+    )
+
+    assert s.optimization_stack[0]["action"] == "fusion"
+    journal = coord.recipe_journal.ensure_journal()
+    matches = [e for e in journal.entries if e.task_id == "int-fusion-1"]
+    assert len(matches) == 1
+    assert matches[0].variant_name == "fuse-rmsnorm-silu"
+
+
+@pytest.mark.asyncio
+async def test_integrate_patch_preserves_proposal_owner_across_phase_change(
+    session_dir,
+):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.phase = "KERNEL_AGENT"
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 110.0,
+            "specialist_task_id": "spec-framework",
+            "delta_pct": 10.0,
+            "extra_server_args_applied": "--quantization fp8_per_channel",
+            "workspace": "/w",
+        },
+        task=_task(
+            "integrate_patch",
+            task_id="t-cross-phase",
+            params={
+                "specialist_task_id": "spec-framework",
+                "source_phase": "FRAMEWORK_AGENT",
+                "domain": "serving_specialist",
+                "provenance": "specialist:serving_specialist",
+                "gap_canonical_id": "gap.framework.fp8",
+                "gap_layer": "framework",
+                "framework_agent_authoring": True,
+            },
+        ),
+    )
+
+    entry = s.optimization_stack[0]
+    assert entry["source_phase"] == "FRAMEWORK_AGENT"
+    assert entry["domain"] == "serving_specialist"
+    assert entry["provenance"] == "specialist:serving_specialist"
+    assert entry["gap_canonical_id"] == "gap.framework.fp8"
+    assert entry["framework_agent_authoring"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_phase", ["EXPLORE", "FRAMEWORK_AGENT"])
+async def test_integrate_keep_stages_patch_for_proposal_owner(session_dir, tmp_path, monkeypatch, source_phase):
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    patch = tmp_path / f"{source_phase.lower()}.diff"
+    patch.write_bytes(f"{source_phase} bytes".encode())
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 120.0,
+            "specialist_task_id": f"spec-{source_phase.lower()}",
+            "source_phase": source_phase,
+            "patches_applied": [str(patch)],
+        },
+        task=_task(
+            "integrate_patch",
+            params={
+                "specialist_task_id": f"spec-{source_phase.lower()}",
+                "source_phase": source_phase,
+            },
+        ),
+    )
+
+    staged = KnowledgeSections(draft).staged("patch")
+    ref = f"patch/overlays/000000/00-{source_phase.lower()}.patch"
+    assert staged.knowledge["patches"] == [ref]
+    assert (draft / "files" / ref).read_bytes() == patch.read_bytes()
+    assert KnowledgeSections(draft).staged("explore") is None
+    # Explore and framework KEEPs share the one patch column, so both record the same owner marker rather than the old
+    # per-column explore/framework label.
+    assert coord.shared_state.optimization_stack[-1]["kb_required_owner"] == "PATCH"
+
+
+@pytest.mark.asyncio
+async def test_a_config_lever_keep_stages_under_the_configuration_section(session_dir, tmp_path, monkeypatch):
+    """A KEEP that touched nothing on disk belongs to the configuration lever."""
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 120.0,
+            "lever_kind": LEVER_CONFIG,
+            "source_phase": "EXPLORE",
+            "extra_server_args": "--page-size 32",
+            "patches_applied": [],
+        },
+        task=_task("integrate_patch", params={"source_phase": "EXPLORE"}),
+    )
+
+    stack = coord.shared_state.optimization_stack
+    assert stack and stack[-1]["lever_kind"] == LEVER_CONFIG
+    assert _is_patch_column_keep({"source_phase": "EXPLORE"}, {"lever_kind": LEVER_CONFIG}) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["reverted", "kept_inert"])
+async def test_integrate_nonpromotion_never_stages_patch(session_dir, tmp_path, monkeypatch, status):
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    patch = tmp_path / "not-kept.patch"
+    patch.write_bytes(b"do not stage")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": status,
+            "output_throughput": 90.0,
+            "source_phase": "EXPLORE",
+            "patches_applied": [str(patch)],
+        },
+        task=_task(
+            "integrate_patch",
+            params={"source_phase": "EXPLORE"},
+        ),
+    )
+
+    assert KnowledgeSections(draft).sections() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("benchmark_mode", ["", "agentx"], ids=["synthetic", "agentx"])
+async def test_prebaseline_enablement_patch_is_config_only_not_gain(session_dir, monkeypatch, benchmark_mode):
+    """A patch required to establish baseline stays reproducible but has no gain."""
+    monkeypatch.delenv("HYPERLOOM_PERF_METRIC", raising=False)
+    monkeypatch.delenv("HYPERLOOM_AGENTX", raising=False)
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.framework = "sglang"
+    s.benchmark_mode = benchmark_mode
+    s.baseline_tput = 0.0
+    s.pending_integrate = {"task_id": "t-enable"}
+    validate = Mock()
+    watermark = AsyncMock()
+    monkeypatch.setattr(coord.writeback, "validate", validate)
+    monkeypatch.setattr(coord.phase_kernel, "maybe_enqueue_watermark_roofline", watermark)
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "enablement": True,
+            "output_throughput": 140.0,
+            "specialist_task_id": "spec-enable",
+            "extra_server_args_applied": "--mem-fraction-static 0.95",
+            "workspace": "/w",
+        },
+        task=_task(
+            "integrate_patch",
+            task_id="t-enable",
+            params={"enablement": True},
+        ),
+    )
+
+    assert len(s.optimization_stack) == 1
+    entry = s.optimization_stack[0]
+    assert entry["action"] == "integrate_patch"
+    assert entry["baseline_enablement"] is True
+    assert entry["attribution_eligible"] is False
+    assert entry["recipe_publishable"] is False
+    assert s.current_best["action"] == "integrate_patch"
+    assert s.current_best["extra_server_args"] == "--mem-fraction-static 0.95"
+    assert s.current_best["optimization_stack"] == s.optimization_stack
+    assert s.current_best_measurement["tput"] == 140.0
+    assert s.baseline_tput == 0.0
+    assert s.gain_per_stack_entry == [None]
+    assert s.cumulative_gain_validated == 0.0
+    assert s.cumulative_gain_validated_stack_len == 0
+    assert s.pending_integrate == {}
+    validate.assert_not_called()
+    watermark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postbaseline_enablement_config_is_not_recipe_publishable(
+    session_dir,
+):
+    coord = _coord(session_dir)
+    state = coord.shared_state
+    state.baseline_tput = 100.0
+    state.current_best = {"action": "baseline", "tput": 100.0}
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "enablement": True,
+            "output_throughput": 110.0,
+            "specialist_task_id": "spec-enable-late",
+            "extra_envs_applied": {"SGLANG_ENABLEMENT_ONLY": "1"},
+        },
+        task=_task(
+            "integrate_patch",
+            task_id="t-enable-late",
+            params={"enablement": True, "source_phase": "FRAMEWORK_AGENT"},
+        ),
+    )
+
+    assert state.optimization_stack[-1]["recipe_publishable"] is False
+    # recipe_publishable is a config-layer filter applied inside build_publishable_recipe_config; has_new_keep counts
+    # an enablement KEEP as "new work" so the KB write proceeds and publishes patches.
+    assert has_new_keep(state) is True
+
+
+@pytest.mark.asyncio
+async def test_promote_integrate_patch_reverted_keeps_current_best(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.current_best = {"action": "baseline", "tput": 100.0}
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "reverted",
+            "output_throughput": 90.0,
+            "specialist_task_id": "spec-2",
+        },
+        task=_task("integrate_patch", task_id="t2"),
+    )
+
+    # A reverted patch never lifts current_best.
+    assert s.current_best["action"] == "baseline"
+    assert s.current_best["tput"] == 100.0
+
+
+# GAP 6: an upstream-PR integrate_patch lifts current_best on KEEP.
+@pytest.mark.asyncio
+async def test_promote_framework_agent_kept_lifts_and_records_progress(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.phase = "KERNEL_AGENT"
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "delta_pct": 30.0,
+            "specialist_task_id": "https://x/pull/1",
+            "workspace": "/w",
+            "source_phase": "FRAMEWORK_AGENT",
+        },
+        task=_task(
+            "integrate_patch",
+            task_id="t1",
+            params={
+                "framework_agent_candidate_id": "https://x/pull/1",
+                "batch_id": "b1",
+                "patch_source": "upstream_pr",
+                "source_phase": "FRAMEWORK_AGENT",
+            },
+        ),
+    )
+
+    assert s.current_best["action"] == "integrate_patch"
+    assert s.current_best["tput"] == 130.0
+    assert s.optimization_stack[-1]["source_phase"] == "FRAMEWORK_AGENT"
+    # The stack variant must be the canonical candidate key, undecorated, so resume can reconcile it against the
+    # recorded KEEP.
+    assert s.optimization_stack[-1]["variant_name"] == "https://x/pull/1"
+
+
+@pytest.mark.asyncio
+async def test_framework_agent_keep_stages_returned_raw_patch(session_dir, tmp_path, monkeypatch):
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    patch = tmp_path / "pr-7.patch"
+    patch.write_bytes(b"raw framework diff")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "specialist_task_id": "https://x/pull/7",
+            "patches_applied": [str(patch)],
+        },
+        task=_task(
+            "integrate_patch",
+            params={"patch_source": "upstream_pr", "source_phase": "FRAMEWORK_AGENT"},
+        ),
+    )
+
+    staged = KnowledgeSections(draft).staged("patch")
+    ref = "patch/overlays/000000/00-pr-7.patch"
+    assert staged.knowledge["patches"] == [ref]
+    assert (draft / "files" / ref).read_bytes() == patch.read_bytes()
+    row = staged.knowledge["provenance"][0]
+    assert row["stack_index"] == 0
+    assert row["base_sha"] == ""
+    assert row["complete"] is True
+    assert row["artifacts_outside_root"] == 0
+    assert row["realized"] is False
+    # No snapshot ran, so the delivered patch is the only absolute origin known.
+    assert row["host_origin"] == {"sources": [str(patch)]}
+
+
+@pytest.mark.asyncio
+async def test_realized_diff_replaces_the_delivered_patch(session_dir, tmp_path, monkeypatch):
+    """The realized diff is what landed, so publishing both would apply it twice."""
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    delivered = tmp_path / "delivered.patch"
+    delivered.write_bytes(b"as delivered")
+    realized = tmp_path / "snapshot" / "realized.patch"
+    realized.parent.mkdir()
+    realized.write_bytes(b"as landed")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "specialist_task_id": "spec-realized",
+            "patches_applied": [str(delivered)],
+            "source_realized_patch": str(realized),
+            "base_sha": "abc123",
+            "source_snapshot_complete": True,
+            "source_artifacts_outside_root": 2,
+            "framework_root": "/sglang",
+            "source_snapshot": str(realized.parent),
+        },
+        task=_task("integrate_patch", params={"source_phase": "FRAMEWORK_AGENT"}),
+    )
+
+    staged = KnowledgeSections(draft).staged("patch")
+    ref = "patch/overlays/000000/00-realized.patch"
+    assert staged.knowledge["patches"] == [ref]
+    assert (draft / "files" / ref).read_bytes() == b"as landed"
+    row = staged.knowledge["provenance"][0]
+    assert row["realized"] is True
+    assert row["base_sha"] == "abc123"
+    assert row["artifacts_outside_root"] == 2
+    # Where the KEEP came from has to survive the handoff, not just the result, and it lands on the ref so overlays
+    # from two trees stay distinguishable.
+    assert row["host_origin"]["apply_roots"] == {ref: "/sglang"}
+    assert row["host_origin"]["snapshot"] == str(realized.parent)
+    assert row["host_origin"]["sources"] == [str(realized)]
+
+
+@pytest.mark.asyncio
+async def test_delivered_patch_is_the_fallback_when_no_realized_diff(session_dir, tmp_path, monkeypatch):
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    delivered = tmp_path / "delivered.patch"
+    delivered.write_bytes(b"as delivered")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "specialist_task_id": "spec-fallback",
+            "patches_applied": [str(delivered)],
+            # A non-git tree harvests no realized diff.
+            "source_realized_patch": "",
+        },
+        task=_task("integrate_patch", params={"source_phase": "FRAMEWORK_AGENT"}),
+    )
+
+    staged = KnowledgeSections(draft).staged("patch")
+    assert staged.knowledge["patches"] == ["patch/overlays/000000/00-delivered.patch"]
+    assert staged.knowledge["provenance"][0]["realized"] is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_patches_applied_never_scans_stale_workspace(session_dir, tmp_path, monkeypatch):
+    draft = tmp_path / "kb-draft"
+    monkeypatch.setenv("KB_DRAFT_DIR", str(draft))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "rejected.diff").write_bytes(b"rejected stale bytes")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "candidate": {"pr_url": "https://x/pull/8"},
+            "patches_applied": [],
+            "workspace": str(workspace),
+        },
+        task=_task("integrate_patch"),
+    )
+
+    # Final config comes from current_best at CLOSE; an explicit empty patch list neither scans stale workspace files
+    # nor creates an owner section.
+    assert KnowledgeSections(draft).staged("framework") is None
+    assert coord.shared_state.kb_stage_outbox == []
+    # A config-only KEEP must not mark a required patch owner; otherwise CLOSE would reject the record for missing
+    # required section staging.
+    assert "kb_required_owner" not in coord.shared_state.optimization_stack[-1]
+
+
+@pytest.mark.asyncio
+async def test_local_mode_without_remote_draft_does_not_enqueue_outbox(session_dir, tmp_path, monkeypatch):
+    monkeypatch.delenv("KB_DRAFT_DIR", raising=False)
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "local")
+    patch = tmp_path / "accepted.patch"
+    patch.write_bytes(b"accepted")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "candidate": {"pr_url": "https://x/pull/10"},
+            "patches_applied": [str(patch)],
+        },
+        task=_task("integrate_patch"),
+    )
+
+    assert coord.shared_state.kb_stage_outbox == []
+    assert "kb_required_owner" not in coord.shared_state.optimization_stack[0]
+
+
+@pytest.mark.asyncio
+async def test_keep_kb_hook_runs_only_after_authoritative_save(session_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("KB_DRAFT_DIR", str(tmp_path / "draft"))
+    monkeypatch.setenv("KNOWLEDGE_STORE_MODE", "remote")
+    patch = tmp_path / "pr.patch"
+    patch.write_bytes(b"raw diff")
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 100.0
+    events: list[str] = []
+    real_save = coord.shared_state.save
+
+    def _save(*args, **kwargs):
+        events.append("save")
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(coord.shared_state, "save", _save)
+    monkeypatch.setattr(
+        coord.writeback,
+        "_stage_agent_keep",
+        lambda _row: events.append("stage") or True,
+    )
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 130.0,
+            "specialist_task_id": "https://x/pull/9",
+            "patches_applied": [str(patch)],
+        },
+        task=_task("integrate_patch", params={"source_phase": "FRAMEWORK_AGENT"}),
+    )
+
+    assert events[0:2] == ["save", "stage"]
+    assert coord.shared_state.kb_stage_outbox == []
+
+
+def test_outbox_drain_acknowledges_only_confirmed_success(
+    session_dir,
+    monkeypatch,
+):
+    coord = _coord(session_dir)
+    patch = session_dir / "accepted.patch"
+    patch.write_text("patch", encoding="utf-8")
+    row = {
+        "id": "FRAMEWORK_AGENT:0",
+        "owner": "FRAMEWORK_AGENT",
+        "stack_index": 0,
+        "include_patches": True,
+        "patch_sources": [str(patch)],
+        "missing_patch_sources": [],
+    }
+    coord.shared_state.kb_stage_outbox = [row]
+    monkeypatch.setattr(
+        coord.writeback,
+        "_stage_agent_keep",
+        lambda _row: False,
+    )
+
+    coord.writeback._drain_agent_keep_outbox()
+
+    assert coord.shared_state.kb_stage_outbox == [row]
+
+
+def test_outbox_dead_letters_missing_patch_without_blocking_close(
+    session_dir,
+) -> None:
+    coord = _coord(session_dir)
+    coord.shared_state.optimization_stack = [
+        {
+            "action": "framework",
+            "kb_required_owner": "FRAMEWORK_AGENT",
+        }
+    ]
+    row = {
+        "id": "FRAMEWORK_AGENT:0",
+        "owner": "FRAMEWORK_AGENT",
+        "stack_index": 0,
+        "include_patches": True,
+        "patch_sources": [str(session_dir / "gone.patch")],
+        "missing_patch_sources": [],
+    }
+    coord.shared_state.kb_stage_outbox = [row]
+
+    coord.writeback._drain_agent_keep_outbox()
+
+    assert coord.shared_state.kb_stage_outbox == []
+    assert coord.shared_state.kb_stage_dead_letter[0]["id"] == row["id"]
+    assert coord.shared_state.kb_stage_dead_letter[0]["reason"] == ("patch_source_missing")
+    assert "kb_required_owner" not in (coord.shared_state.optimization_stack[0])
+
+
+@pytest.mark.asyncio
+async def test_resume_settles_state_before_draining_kb_outbox(
+    session_dir,
+    monkeypatch,
+):
+    """The outbox drains after the recovery pass, from the durable config."""
+    coord = _coord(session_dir)
+    coord.writeback._resumed_from = {"is_resume": True}
+    coord.shared_state.optimization_stack = [
+        {
+            "action": "explore",
+            "variant_name": "winner",
+            "candidate_extra_server_args": "--new",
+            "extra_envs": {"NEW_ENV": "1"},
+            "tput": 120.0,
+        }
+    ]
+    coord.shared_state.current_best = {
+        "extra_server_args": "--new",
+        "extra_envs": {"NEW_ENV": "1"},
+        "tput": 120.0,
+    }
+    coord.shared_state.cumulative_gain_validated_stack_len = 1
+    coord.shared_state.kb_stage_outbox = [
+        {
+            "id": "EXPLORE:0",
+            "owner": "EXPLORE",
+            "stack_index": 0,
+            "include_patches": False,
+            "patch_sources": [],
+            "missing_patch_sources": [],
+        }
+    ]
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    for name in (
+        "_resume_recover_pending_integrate",
+        "_resume_recover_pending_targeted_build",
+        "_resume_recover_pending_warm_replay",
+        "_resume_recover_pending_revalidation",
+        "_resume_recover_orphaned_keeps",
+    ):
+        monkeypatch.setattr(coord.writeback, name, _noop)
+    monkeypatch.setattr(coord.bus, "record_observation", _noop)
+
+    events: list[str] = []
+    staged: list[dict] = []
+
+    def _save(_session_dir):
+        events.append("save")
+
+    def _stage(_row):
+        events.append("stage")
+        staged.append(dict(coord.shared_state.current_best))
+        return True
+
+    monkeypatch.setattr(coord.shared_state, "save", _save)
+    monkeypatch.setattr(coord.writeback, "_stage_agent_keep", _stage)
+
+    await coord.writeback._resume_consistency_pass()
+
+    assert events.index("save") < events.index("stage")
+    assert staged[0]["extra_server_args"] == "--new"
+    assert staged[0]["extra_envs"] == {"NEW_ENV": "1"}
+    assert coord.shared_state.kb_stage_outbox == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+# GAP 7: replay_warm_recipe routes through promote_warm_replay (self-saves) and never sets outcome.changed, so the
+# unified tail neither audits nor re-saves.
+@pytest.mark.asyncio
+async def test_promote_replay_warm_recipe_routes_and_skips_tail(session_dir, monkeypatch):
+    coord = _coord(session_dir)
+    calls = _count_record_attempt(coord, monkeypatch)
+
+    warm_calls: list[dict] = []
+
+    def _spy_warm(result, *, task=None):
+        warm_calls.append({"result": result, "task": task})
+
+    # promote_warm_replay lives on the phase_prelude collaborator; also stub the deferred PRELUDE analysis enqueue so the
+    # test stays hermetic.
+    monkeypatch.setattr(coord.phase_prelude, "promote_warm_replay", _spy_warm)
+
+    async def _noop_prelude(*a, **k):
+        return None
+
+    monkeypatch.setattr(
+        coord.phase_prelude,
+        "maybe_enqueue_prelude_initial_analysis_after_baseline",
+        _noop_prelude,
+    )
+
+    await coord.writeback.promote_to_shared_state(
+        "replay_warm_recipe",
+        {"status": "succeeded", "output_throughput": 120.0},
+        task=_task("replay_warm_recipe", task_id="t1"),
+    )
+
+    # The dedicated warm-replay promote path ran exactly once with the result.
+    assert len(warm_calls) == 1
+    assert warm_calls[0]["result"]["output_throughput"] == 120.0
+    # replay_warm_recipe is not audited by the unified tail.
+    assert all(c["action"] != "replay_warm_recipe" for c in calls)
+
+
+# GAP 8: roofline failure (status != succeeded/skipped) bumps the failure streak and audits as discarded (roofline IS
+# an audited action).
+@pytest.mark.asyncio
+async def test_promote_roofline_failed_bumps_streak_and_audits_discarded(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.roofline_failure_streak = 2
+    s.auto_roofline_pending_task_id = "t1"
+
+    await coord.writeback.promote_to_shared_state(
+        "roofline",
+        {
+            "status": "failed",
+            "phase": "trace_analyze",
+            "error_class": "tracelens_error",
+            "error": "boom",
+        },
+        task=_task("roofline", task_id="t1"),
+    )
+
+    # Streak incremented; pending pointer cleared.
+    assert s.roofline_failure_streak == 3
+    assert s.auto_roofline_pending_task_id == ""
+    # Audit row: discarded, with the failure context in extras.
+    assert s.last_roofline["decision"] == "discarded"
+    assert s.last_roofline["status"] == "succeeded"  # record_action_attempt stamps the attempt status
+    assert s.last_roofline["extras"]["error_class"] == "tracelens_error"
+    assert s.last_roofline["extras"]["phase"] == "trace_analyze"
+
+
+# GAP 9: explore resume_stack_revalidate (native, non-GEAK) with a valid tput clears resume_pending_revalidation and
+# does NOT promote a variant.
+@pytest.mark.asyncio
+async def test_promote_explore_resume_revalidate_clears_pending(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    s.current_best = {"action": "explore", "tput": 130.0}
+    _set_resume_pending(s, True)
+
+    await coord.writeback.promote_to_shared_state(
+        "explore",
+        {
+            "explore_search_update": {},
+            "winners": [],  # revalidation confirms the stack, never adds a variant
+            "round_id": "rv1",
+            "output_throughput": 128.0,
+        },
+        task=_task(
+            "explore",
+            task_id="t1",
+            params={"source": "stack_revalidate"},
+        ),
+    )
+
+    # A valid rebench clears the pending flag; current_best is not re-promoted.
+    assert _resume_pending(s) is False
+    assert s.current_best["action"] == "explore"
+    assert s.current_best["tput"] == 130.0
+
+
+@pytest.mark.asyncio
+async def test_promote_explore_resume_revalidate_keeps_pending_on_empty_rebench(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 100.0
+    _set_resume_pending(s, True)
+
+    await coord.writeback.promote_to_shared_state(
+        "explore",
+        {
+            "explore_search_update": {},
+            "winners": [],
+            "round_id": "rv2",
+            "output_throughput": None,  # failed/empty rebench
+        },
+        task=_task(
+            "explore",
+            task_id="t2",
+            params={"source": "stack_revalidate"},
+        ),
+    )
+
+    # No valid measurement -> the flag stays set so reports keep warning.
+    assert _resume_pending(s) is True
+
+
+# GAP 10: every _PROMOTE_HANDLERS value resolves to a callable on the class, so a typo or unregistered handler is
+# caught at test time, not at runtime.
+@pytest.mark.parametrize(
+    "task_kind,handler_name",
+    list(WritebackCollaborator._PROMOTE_HANDLERS.items()),
+)
+def test_promote_handlers_are_callable(task_kind, handler_name):
+    handler = getattr(WritebackCollaborator, handler_name, None)
+    assert callable(handler), f"{task_kind!r} -> {handler_name!r} is not a callable on WritebackCollaborator"
+
+
+# Env preservation across layers and source_snapshot propagation
+
+
+@pytest.mark.asyncio
+async def test_integrate_keep_preserves_prior_explore_envs(session_dir):
+    """An artifact-only integrate KEEP must not erase envs from the explore layer."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1083.0
+    s.current_best = {
+        "action": "explore",
+        "tput": 4616.0,
+        "extra_server_args": "--no-scheduler-reserve-full-isl",
+        "extra_envs": {"VLLM_ROCM_USE_AITER_MOE": "0"},
+    }
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "kept",
+            "output_throughput": 4700.0,
+            "specialist_task_id": "spec-keep",
+        },
+        task=_task("integrate_patch", task_id="t-keep"),
+    )
+
+    assert s.current_best["extra_envs"].get("VLLM_ROCM_USE_AITER_MOE") == "0", (
+        "explore env must survive artifact-only integrate KEEP"
+    )
+
+
+def test_lift_applies_unset_envs_before_new_envs(session_dir):
+    coord = _coord(session_dir)
+    coord.shared_state.current_best = {
+        "action": "explore",
+        "tput": 1000.0,
+        "extra_server_args": "",
+        "extra_envs": {"KEEP": "old", "DROP": "old", "RESTORE": "old"},
+    }
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1100.0,
+        {
+            "name": "env-update",
+            "extra_server_args": "",
+            "extra_envs": {"KEEP": "new", "RESTORE": "new"},
+            "unset_envs": ["DROP", "RESTORE"],
+        },
+    )
+
+    assert coord.shared_state.current_best["extra_envs"] == {
+        "KEEP": "new",
+        "RESTORE": "new",
+    }
+
+
+def test_lift_persists_recipe_delta_separately_from_runtime_config(session_dir):
+    coord = _coord(session_dir)
+    coord.shared_state.current_best = {
+        "action": "baseline",
+        "tput": 1000.0,
+        "extra_server_args": "--hld-only",
+        "extra_envs": {"SGLANG_ENABLEMENT_ONLY": "1"},
+    }
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1100.0,
+        {
+            "name": "optimized",
+            "candidate_extra_server_args": "--page-size 64",
+            "candidate_extra_envs": {"VLLM_OPTIMIZED": "1"},
+            "recipe_delta": {
+                "extra_server_args": "--page-size 64",
+                "extra_envs": {"VLLM_OPTIMIZED": "1"},
+                "remove_args": [],
+                "unset_envs": [],
+                "args_mode": "append",
+            },
+            "extra_server_args": "--hld-only --page-size 64",
+            "extra_envs": {
+                "SGLANG_ENABLEMENT_ONLY": "1",
+                "VLLM_OPTIMIZED": "1",
+            },
+        },
+    )
+
+    top = coord.shared_state.optimization_stack[-1]
+    assert top["recipe_delta"] == {
+        "extra_server_args": "--page-size 64",
+        "extra_envs": {"VLLM_OPTIMIZED": "1"},
+        "remove_args": [],
+        "unset_envs": [],
+        "args_mode": "append",
+    }
+    assert "--hld-only" in coord.shared_state.current_best["extra_server_args"]
+    assert "--hld-only" not in top["recipe_delta"]["extra_server_args"]
+
+
+def test_lift_is_the_only_writer_so_an_ablated_env_stays_gone(session_dir):
+    """A later winner that drops an inherited env must not see it come back."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1100.0,
+        {"name": "adds-env", "extra_server_args": "--flag-a 1", "extra_envs": {"SGLANG_OLD": "1"}},
+    )
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1200.0,
+        {
+            "name": "drops-env",
+            "extra_server_args": "--flag-a 1",
+            "extra_envs": {"SGLANG_NEW": "1"},
+            "unset_envs": ["SGLANG_OLD"],
+        },
+    )
+
+    assert s.current_best["extra_envs"] == {"SGLANG_NEW": "1"}
+    assert [e["variant_name"] for e in s.optimization_stack] == ["adds-env", "drops-env"]
+
+
+def test_lift_strips_a_harness_flag_inherited_from_the_previous_current_best(session_dir):
+    """Issue #1192: the flag came back through the previous current_best re-merge."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 6137.0
+    s.current_best = {
+        "action": "replay_warm_recipe",
+        "tput": 6165.0,
+        "extra_server_args": "--no-enable-prefix-caching",
+        "extra_envs": {},
+    }
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        8063.0,
+        {
+            "name": "aiter-fp8-kv-cache",
+            "candidate_extra_server_args": "--kv-cache-dtype fp8",
+            "extra_server_args": "--kv-cache-dtype fp8",
+            "effective_extra_server_args": "--no-enable-prefix-caching --kv-cache-dtype fp8",
+            "extra_envs": {"VLLM_ROCM_USE_AITER": "1"},
+        },
+    )
+
+    assert s.current_best["extra_server_args"] == "--kv-cache-dtype fp8"
+    assert s.current_best["effective_extra_server_args"] == "--kv-cache-dtype fp8"
+    top = s.optimization_stack[-1]
+    assert top["extra_server_args"] == "--kv-cache-dtype fp8"
+    assert top["candidate_extra_server_args"] == "--kv-cache-dtype fp8"
+
+
+def test_lift_strips_a_harness_flag_a_winner_proposed_directly(session_dir):
+    """A winner whose own delta is the harness flag publishes no serving change."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {
+        "action": "explore",
+        "tput": 1100.0,
+        "extra_server_args": "--max-num-seqs 256",
+        "extra_envs": {},
+    }
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1200.0,
+        {
+            "name": "no-prefix-cache",
+            "candidate_extra_server_args": "--no-enable-prefix-caching",
+            "extra_server_args": "--max-num-seqs 256 --no-enable-prefix-caching",
+            "extra_envs": {},
+        },
+    )
+
+    assert s.current_best["extra_server_args"] == "--max-num-seqs 256"
+    assert s.optimization_stack[-1]["candidate_extra_server_args"] == ""
+
+
+def test_lift_refuses_a_winner_that_does_not_beat_the_anchor(session_dir):
+    """A measurement below current_best must leave config and stack untouched."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1500.0,
+        {"name": "good", "extra_server_args": "--flag-a 1", "extra_envs": {"A": "1"}},
+    )
+
+    lifted = coord.writeback.lift_to_current_best(
+        "gemm_tuning",
+        1100.0,
+        {"name": "worse", "extra_server_args": "--flag-b 2", "extra_envs": {"B": "2"}},
+    )
+
+    assert lifted is False
+    assert s.current_best["tput"] == 1500.0
+    assert s.current_best["extra_envs"] == {"A": "1"}
+    assert [e["variant_name"] for e in s.optimization_stack] == ["good"]
+
+
+def test_lift_keeps_entry_extra_off_current_best(session_dir):
+    """Artifact and provenance handles belong to the stack entry, not the config."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    coord.writeback.lift_to_current_best(
+        "gemm_tuning",
+        1200.0,
+        {"name": "geak_a8w8", "extra_server_args": "", "extra_envs": {"AITER_CONFIG": "/tuned.csv"}},
+        entry_extra={"tuned_file": "/tuned.csv", "backend": "geak", "empty": "", "absent": None},
+    )
+
+    entry = s.optimization_stack[-1]
+    assert entry["tuned_file"] == "/tuned.csv"
+    assert entry["backend"] == "geak"
+    assert "empty" not in entry
+    assert "absent" not in entry
+    assert "tuned_file" not in s.current_best
+    assert "backend" not in s.current_best
+
+
+def test_env_spec_reports_the_config_current_best_was_measured_on(session_dir):
+    """The GEAK handoff must describe current_best, ablations included."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1100.0,
+        {"name": "v1", "extra_server_args": "--flag-a 1", "extra_envs": {"OLD": "1"}},
+    )
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1200.0,
+        {
+            "name": "v2",
+            "extra_server_args": "--flag-a 1",
+            "extra_envs": {"NEW": "1"},
+            "unset_envs": ["OLD"],
+            "final_overlay": "/overlay/build",
+        },
+    )
+
+    spec = coord.writeback.build_env_spec()
+
+    assert spec["config"]["extra_envs"] == {"NEW": "1"}
+    assert spec["config"]["extra_server_args"] == "--flag-a 1"
+    assert spec["overlay_pythonpath"] == "/overlay/build"
+
+
+def test_env_spec_routes_a_flag_stored_under_extra_envs_back_into_args(session_dir):
+    """A ``-``-prefixed env key is a server arg; exporting it would drop it."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    coord.writeback.lift_to_current_best(
+        "integrate_patch",
+        1200.0,
+        {
+            "name": "patch-1",
+            "extra_server_args": "--flag-a 1",
+            "extra_envs": {"REAL_ENV": "1", "--compilation-config": "3"},
+        },
+    )
+
+    spec = coord.writeback.build_env_spec()
+
+    assert spec["config"]["extra_envs"] == {"REAL_ENV": "1"}
+    args = spec["config"]["extra_server_args"].split()
+    assert args[args.index("--compilation-config") + 1] == "3"
+    assert "--flag-a" in args
+
+
+def test_lift_carries_the_active_overlay_forward(session_dir):
+    """An authored-kernel overlay outlives the KEEP that built it."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    coord.writeback.lift_to_current_best(
+        "geak_e2e",
+        1200.0,
+        {"name": "geak", "extra_server_args": "", "extra_envs": {}, "final_overlay": "/overlay/build"},
+    )
+    assert s.current_best["final_overlay"] == "/overlay/build"
+    assert s.optimization_stack[-1]["final_overlay"] == "/overlay/build"
+
+    coord.writeback.lift_to_current_best(
+        "explore",
+        1300.0,
+        {"name": "flags-only", "extra_server_args": "--flag-a 1", "extra_envs": {}},
+    )
+    assert s.current_best["final_overlay"] == "/overlay/build"
+
+
+@pytest.mark.asyncio
+async def test_lift_copies_source_snapshot_into_stack_entry(session_dir):
+    """Source snapshot manifest and changed files reach the stack entry."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {"action": "baseline", "tput": 1000.0, "extra_server_args": "", "extra_envs": {}}
+
+    coord.writeback.lift_to_current_best(
+        "integrate_patch",
+        1500.0,
+        {
+            "name": "patch-1",
+            "candidate_extra_server_args": "",
+            "extra_envs": {},
+            "tput": 1500.0,
+            "scope": "source_patch",
+            "source_snapshot": "/session/optimization_stack/src/abc123",
+            "source_manifest": "/session/optimization_stack/src/abc123/manifest.json",
+            "target_files": ["vllm/model_executor/layers/quantization/foo.py"],
+            "framework_root": "/opt/vllm",
+            "base_sha": "deadbeef",
+        },
+    )
+
+    top = s.optimization_stack[-1]
+    assert top.get("source_snapshot") == "/session/optimization_stack/src/abc123"
+    assert top.get("source_manifest") == ("/session/optimization_stack/src/abc123/manifest.json")
+    assert top.get("target_files") == ["vllm/model_executor/layers/quantization/foo.py"]
+    assert top.get("framework_root") == "/opt/vllm"
+    assert top.get("base_sha") == "deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_drain_cancels_queued_baselines_but_spares_revalidation(session_dir):
+    """A succeeded baseline drains its backlog; the enablement revalidation survives."""
+    from hyperloom.orchestrator.actions.executors._accuracy_gate import (
+        ENABLEMENT_REVALIDATION_REASON,
+    )
+
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 2195.86
+
+    stale_a, _ = await coord.tasks.create_or_return_existing(
+        TaskSpec(kind="baseline", params={}, idempotency_key="bl-a")
+    )
+    stale_b, _ = await coord.tasks.create_or_return_existing(
+        TaskSpec(kind="baseline", params={"tag": "x"}, idempotency_key="bl-b")
+    )
+    reval, _ = await coord.tasks.create_or_return_existing(
+        TaskSpec(
+            kind="baseline",
+            params={"reason": ENABLEMENT_REVALIDATION_REASON},
+            idempotency_key="bl-reval",
+        ),
+    )
+    other, _ = await coord.tasks.create_or_return_existing(TaskSpec(kind="explore", params={}, idempotency_key="ex-a"))
+
+    cancelled = await coord.writeback.drain_queued_baselines(reason="baseline_established")
+
+    assert set(cancelled) == {stale_a.task_id, stale_b.task_id}
+    assert (await coord.tasks.get(reval.task_id)).state == "queued"
+    assert (await coord.tasks.get(other.task_id)).state == "queued"
+    assert (await coord.tasks.get(stale_a.task_id)).state == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_drain_spares_the_tracked_revalidation_task_id(session_dir):
+    """The tracked id is honoured even when params carry no revalidation reason."""
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 1000.0
+    reval, _ = await coord.tasks.create_or_return_existing(
+        TaskSpec(kind="baseline", params={}, idempotency_key="bl-tracked")
+    )
+    coord.shared_state.enablement.revalidation_task_id = reval.task_id
+
+    assert await coord.writeback.drain_queued_baselines(reason="baseline_established") == []
+    assert (await coord.tasks.get(reval.task_id)).state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_promote_baseline_drains_the_backlog(session_dir):
+    """The drain is wired into promotion, not just available as a helper."""
+    coord = _coord(session_dir)
+    stale, _ = await coord.tasks.create_or_return_existing(
+        TaskSpec(kind="baseline", params={}, idempotency_key="bl-stale")
+    )
+
+    await coord.writeback.promote_to_shared_state(
+        "baseline",
+        {"status": "succeeded", "output_throughput": 2185.95},
+        task=_task("baseline", task_id="t-first"),
+    )
+
+    assert coord.shared_state.baseline_tput == 2185.95
+    assert (await coord.tasks.get(stale.task_id)).state == "cancelled"
+
+
+def test_lift_refuses_winner_that_does_not_beat_current_best(session_dir):
+    """current_best never moves down, even for a winner its executor called a KEEP."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 2195.86
+    s.current_best = {
+        "action": "replay_warm_recipe",
+        "tput": 2358.80,
+        "extra_server_args": "--enable-aiter-allreduce-fusion",
+        "extra_envs": {"SGLANG_USE_AITER": "1"},
+    }
+    s.optimization_stack = [{"action": "replay_warm_recipe", "variant_name": "warm_replay"}]
+    s.gain_per_stack_entry = [7.908]
+
+    lifted = coord.writeback.lift_to_current_best(
+        "explore",
+        2355.46,
+        {
+            "name": "minimax-fused-swiglu+moe-combine",
+            "candidate_extra_server_args": "--trust-remote-code",
+            "extra_envs": {"SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE": "1"},
+            "tput": 2355.46,
+        },
+    )
+
+    assert lifted is False
+    assert s.current_best["tput"] == 2358.80
+    assert len(s.optimization_stack) == 1
+    assert s.gain_per_stack_entry == [7.908]
+
+
+def test_lift_refuses_winner_below_baseline_when_stack_is_empty(session_dir):
+    """Before any validated layer the baseline is the anchor, and it holds too."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    lifted = coord.writeback.lift_to_current_best(
+        "explore",
+        900.0,
+        {"name": "regression", "candidate_extra_server_args": "--slow", "extra_envs": {}},
+    )
+
+    assert lifted is False
+    assert not s.current_best
+    assert s.optimization_stack == []
+
+
+def test_lift_accepts_winner_that_beats_current_best(session_dir):
+    """The guard only blocks regressions; a genuine win still lifts."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {"action": "baseline", "tput": 1000.0, "extra_server_args": "", "extra_envs": {}}
+
+    lifted = coord.writeback.lift_to_current_best(
+        "explore",
+        1100.0,
+        {"name": "real-win", "candidate_extra_server_args": "--fast", "extra_envs": {}},
+    )
+
+    assert lifted is True
+    assert s.current_best["tput"] == 1100.0
+    assert s.optimization_stack[-1]["variant_name"] == "real-win"
+
+
+class TestWritebackRequiredAxes:
+    @pytest.fixture
+    def coord(self, session_dir, monkeypatch):
+        monkeypatch.setenv("HYPERLOOM_PERF_METRIC", "intvty_v1")
+        monkeypatch.setenv("HYPERLOOM_PERF_NOISE_PCT", "5")
+        coord = _coord(session_dir)
+        state = coord.shared_state
+        state.framework = "sglang"
+        state.benchmark_mode = "agentx"
+        state.baseline_tput = 100.0
+        state.baseline_perf = {
+            "output_throughput": 100.0,
+            "total_throughput": 1000.0,
+            "e2e_norm_intvty_p90": 100.0,
+            "e2e_norm_intvty_p50": 100.0,
+            "duration_seconds": 900.0,
+            "request_error_rate": 0.0,
+        }
+        state.current_best = {
+            "action": "explore",
+            "variant_name": "prior",
+            "tput": 120.0,
+            "total_throughput": 1200.0,
+            "e2e_norm_intvty_p90": 120.0,
+            "e2e_norm_intvty_p50": 120.0,
+            "duration_seconds": 900.0,
+            "request_error_rate": 0.0,
+            "extra_server_args": "--page-size 16",
+            "extra_envs": {"PRIOR_ENV": "1"},
+        }
+        state.optimization_stack = [{"action": "explore", "variant_name": "prior", "tput": 120.0}]
+        state.gain_per_stack_entry = [20.0]
+        state.cumulative_gain_validated = 20.0
+        state.cumulative_gain_validated_ts = "2026-01-01T00:00:00+00:00"
+        state.cumulative_gain_validated_stack_len = 1
+        coord.writeback._stamp_current_best_measurement(
+            {
+                "workspace": "/prior/benchmark",
+                "launch_evidence": {
+                    "framework": "sglang",
+                    "observed_server_identity": {"model_path": "/models/prior", "tp_size": 1},
+                    "observed_server_launch_flags": "--model-path /models/prior --tp-size 1",
+                },
+            }
+        )
+        return coord
+
+    @staticmethod
+    def _candidate():
+        return {
+            "name": "next",
+            "output_throughput": 150.0,
+            "tput": 150.0,
+            "total_throughput": 1600.0,
+            "e2e_norm_intvty_p90": 150.0,
+            "e2e_norm_intvty_p50": 150.0,
+            "duration_seconds": 900.0,
+            "request_error_rate": 0.0,
+            "extra_server_args": "--page-size 32",
+            "extra_envs": {"NEXT_ENV": "1"},
+            "unset_envs": ["PRIOR_ENV"],
+            "workspace": "/next/benchmark",
+            "launch_evidence": {
+                "framework": "sglang",
+                "observed_server_identity": {"model_path": "/models/next", "tp_size": 2},
+                "observed_server_launch_flags": "--model-path /models/next --tp-size 2",
+            },
+        }
+
+    @staticmethod
+    def _validation_state(state):
+        return (
+            state.cumulative_gain_validated,
+            state.cumulative_gain_validated_ts,
+            state.cumulative_gain_validated_stack_len,
+        )
+
+    @pytest.mark.parametrize("missing_from", ["candidate", "current_best", "baseline"])
+    @pytest.mark.parametrize("axis", ["total_throughput", "e2e_norm_intvty_p90"])
+    def test_lift_refuses_missing_required_axes_without_mutation(self, coord, missing_from, axis):
+        state = coord.shared_state
+        candidate = self._candidate()
+        if missing_from == "candidate":
+            candidate.pop(axis)
+        elif missing_from == "current_best":
+            state.current_best.pop(axis)
+        else:
+            state.current_best = {}
+            state.current_best_measurement = {}
+            state.optimization_stack = []
+            state.gain_per_stack_entry = []
+            state.cumulative_gain_validated_stack_len = 0
+            state.baseline_perf.pop(axis)
+        before = state.to_dict()
+        original_candidate = deepcopy(candidate)
+
+        lifted = coord.writeback.lift_to_current_best("explore", 150.0, candidate)
+
+        assert lifted is False
+        assert state.to_dict() == before
+        assert candidate == original_candidate
+
+    @pytest.mark.parametrize("axis", ["total_throughput", "e2e_norm_intvty_p90"])
+    def test_prebaseline_markers_cannot_bypass_measured_baseline(self, coord, axis):
+        state = coord.shared_state
+        candidate = self._candidate()
+        candidate.pop(axis)
+        candidate.update(baseline_enablement=True, attribution_eligible=False)
+        before = state.to_dict()
+        original_candidate = deepcopy(candidate)
+
+        lifted = coord.writeback.lift_to_current_best("integrate_patch", 150.0, candidate)
+
+        assert lifted is False
+        assert state.to_dict() == before
+        assert candidate == original_candidate
+
+    @pytest.mark.parametrize("missing_from", ["candidate", "baseline"])
+    @pytest.mark.parametrize("axis", ["total_throughput", "e2e_norm_intvty_p90"])
+    def test_cumulative_missing_required_axes_preserves_validation(self, coord, monkeypatch, missing_from, axis):
+        from hyperloom.inference_optimizer.breakdown.recorder import stack_event
+
+        state = coord.shared_state
+        candidate = self._candidate()
+        if missing_from == "candidate":
+            candidate.pop(axis)
+        else:
+            state.baseline_perf.pop(axis)
+        state.optimization_stack.append({"action": "explore", "variant_name": "unvalidated", "tput": 150.0})
+        state.gain_per_stack_entry.append(None)
+        before = state.to_dict()
+        record = Mock()
+        monkeypatch.setattr(stack_event, "record_validation", record)
+
+        coord.writeback.validate(150.0, candidate, ts="2026-01-02T00:00:00+00:00")
+
+        assert state.to_dict() == before
+        record.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("lane", ["integrate", "integrate_patch", "explore"])
+    @pytest.mark.parametrize("axis", ["total_throughput", "e2e_norm_intvty_p90"])
+    async def test_complete_local_winner_with_missing_baseline_axes_skips_validation(
+        self, coord, monkeypatch, lane, axis
+    ):
+        from hyperloom.inference_optimizer.breakdown.recorder import stack_event
+
+        state = coord.shared_state
+        state.baseline_perf.pop(axis)
+        prior_validation = self._validation_state(state)
+        prior_measurement = deepcopy(state.current_best_measurement)
+        prior_entry = deepcopy(state.optimization_stack[0])
+        record = Mock()
+        watermark = AsyncMock()
+        monkeypatch.setattr(stack_event, "record_validation", record)
+        monkeypatch.setattr(coord.phase_kernel, "maybe_enqueue_watermark_roofline", watermark)
+        candidate = self._candidate()
+        outcome = promote_outcome._PromoteOutcome(verdict=Verdict.RECORDED)
+        if lane == "integrate":
+            await coord.writeback.record_integrate_keep(
+                {
+                    "decision": "KEEP",
+                    "new_tput": 150.0,
+                    "kernel_id": "next",
+                    "extra_server_args": candidate["extra_server_args"],
+                    "extra_envs": candidate["extra_envs"],
+                    "bench_result": candidate,
+                }
+            )
+        elif lane == "integrate_patch":
+            await coord.writeback._promote_integrate_patch(
+                {
+                    "status": "kept",
+                    "output_throughput": 150.0,
+                    "specialist_task_id": "next",
+                    "extra_server_args_applied": candidate["extra_server_args"],
+                    "extra_envs_applied": candidate["extra_envs"],
+                    "bench_result": candidate,
+                },
+                _task("integrate_patch"),
+                outcome,
+            )
+        else:
+            await coord.writeback._promote_explore(
+                {
+                    "winners": [{**candidate, "fingerprint": "fp-next"}],
+                    "best_variant": candidate,
+                    "output_throughput": 150.0,
+                    "round_id": "r-local-win",
+                },
+                _task("explore"),
+                outcome,
+            )
+
+        assert state.current_best["action"] == lane
+        assert state.current_best["variant_name"] == "next"
+        assert state.current_best["tput"] == 150.0
+        assert state.current_best["total_throughput"] == 1600.0
+        assert state.current_best["e2e_norm_intvty_p90"] == 150.0
+        assert state.current_best["extra_server_args"] == "--page-size 32"
+        assert state.current_best["extra_envs"]["NEXT_ENV"] == "1"
+        assert len(state.optimization_stack) == 2
+        assert state.optimization_stack[0] == prior_entry
+        assert state.optimization_stack[-1]["variant_name"] == "next"
+        assert state.current_best_measurement != prior_measurement
+        assert state.current_best_measurement["benchmark_workspace"] == candidate["workspace"]
+        assert state.current_best_measurement["observed_server_identity"] == {
+            "model_path": "/models/next",
+            "tp_size": 2,
+        }
+        assert self._validation_state(state) == prior_validation
+        assert state.working_recipe_generation == state.validated_recipe_generation + 1
+        assert state.optimization_stack_has_unvalidated_keeps()
+        record.assert_not_called()
+        watermark.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("axis", ["total_throughput", "e2e_norm_intvty_p90"])
+    async def test_incomparable_resume_revalidation_remains_pending(self, coord, monkeypatch, axis):
+        from hyperloom.inference_optimizer.breakdown.recorder import stack_event
+
+        state = coord.shared_state
+        _set_resume_pending(state, True)
+        prior_validation = self._validation_state(state)
+        prior_best = deepcopy(state.current_best)
+        prior_measurement = deepcopy(state.current_best_measurement)
+        prior_stack = deepcopy(state.optimization_stack)
+        candidate = self._candidate()
+        candidate.pop(axis)
+        record = Mock()
+        monkeypatch.setattr(stack_event, "record_validation", record)
+
+        await coord.writeback._promote_explore(
+            {**candidate, "winners": [], "round_id": "r-incomparable-revalidation"},
+            _task("explore", params={"source": "stack_revalidate"}),
+            promote_outcome._PromoteOutcome(verdict=Verdict.RECORDED),
+        )
+
+        assert _resume_pending(state) is True
+        assert self._validation_state(state) == prior_validation
+        assert state.current_best == prior_best
+        assert state.current_best_measurement == prior_measurement
+        assert state.optimization_stack == prior_stack
+        record.assert_not_called()
+
+    def test_keeps_whose_throughput_losses_sum_past_the_band_still_validate(self, coord, monkeypatch):
+        from hyperloom.inference_optimizer.breakdown.recorder import stack_event
+
+        monkeypatch.setattr(stack_event, "record_validation", Mock())
+        state = coord.shared_state
+        state.current_best["total_throughput"] = state.baseline_perf["total_throughput"]
+        total, intvty = state.current_best["total_throughput"], state.current_best["e2e_norm_intvty_p90"]
+        # Each lift trades 4% throughput (inside the 5% band) for interactivity; by the third the
+        # stack sits past the band against baseline, which must not stop the gain from following it.
+        for step in range(3):
+            total *= 0.96
+            intvty *= 1.10
+            candidate = {
+                **self._candidate(),
+                "name": f"step{step}",
+                "extra_server_args": f"--page-size {64 << step}",
+                "total_throughput": total,
+                "e2e_norm_intvty_p90": intvty,
+                "e2e_norm_intvty_p50": intvty,
+                "duration_seconds": 900.0,
+                "request_error_rate": 0.0,
+            }
+            assert coord.writeback.lift_to_current_best("explore", 150.0, candidate)
+            assert coord.writeback.validate(150.0, candidate)
+            assert state.cumulative_gain_validated == pytest.approx(intvty - 100.0)
+            assert not state.optimization_stack_has_unvalidated_keeps()
+        assert total < state.baseline_perf["total_throughput"] * 0.95
+
+    def test_explicit_output_without_intvty_axes_still_lifts_and_validates(self, coord, monkeypatch):
+        from hyperloom.inference_optimizer.breakdown.recorder import stack_event
+
+        monkeypatch.setenv("HYPERLOOM_PERF_METRIC", "output_throughput")
+        state = coord.shared_state
+        candidate = self._candidate()
+        for axis in ("total_throughput", "e2e_norm_intvty_p90"):
+            state.baseline_perf.pop(axis)
+            state.current_best.pop(axis)
+            candidate.pop(axis)
+        record = Mock()
+        monkeypatch.setattr(stack_event, "record_validation", record)
+
+        lifted = coord.writeback.lift_to_current_best("explore", 150.0, candidate)
+        coord.writeback.validate(150.0, candidate, ts="2026-01-02T00:00:00+00:00")
+
+        assert lifted is True
+        assert state.current_best["tput"] == 150.0
+        assert state.current_best["extra_envs"] == {"NEXT_ENV": "1"}
+        assert len(state.optimization_stack) == 2
+        assert self._validation_state(state) == (50.0, "2026-01-02T00:00:00+00:00", 2)
+        assert state.validated_recipe_generation == state.working_recipe_generation == 1
+        assert not state.optimization_stack_has_unvalidated_keeps()
+        record.assert_called_once()
+        assert record.call_args.args[0].graded.reference == 100.0
+        assert record.call_args.args[0].graded.candidate == 150.0
+
+
+def test_lift_does_not_double_append_same_fingerprint(session_dir):
+    """A renamed variant with the same content fingerprint must not add a second stack entry."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    fp = "shared_fp_abc123"
+    s.optimization_stack = [{"action": "explore", "variant_name": "original", "fingerprint": fp, "tput": 1100.0}]
+    s.current_best = {"action": "explore", "tput": 1100.0, "extra_server_args": "--fast", "extra_envs": {}}
+
+    lifted = coord.writeback.lift_to_current_best(
+        "explore",
+        1200.0,
+        {"name": "renamed", "fingerprint": fp, "candidate_extra_server_args": "--fast", "extra_envs": {}},
+    )
+
+    # current_best refreshed but stack not duplicated.
+    assert lifted is True
+    assert s.current_best["tput"] == 1200.0
+    assert len(s.optimization_stack) == 1
+    assert s.optimization_stack[0]["variant_name"] == "original"
+
+
+def test_lift_at_or_below_anchor_does_not_modify_stack(session_dir):
+    """An accepted rerun that does not beat the live anchor leaves current_best unchanged."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    fp = "shared_fp_rerun"
+    s.optimization_stack = [{"action": "explore", "variant_name": "prior", "fingerprint": fp, "tput": 1100.0}]
+    s.current_best = {"action": "explore", "tput": 1100.0, "extra_server_args": "--fast", "extra_envs": {}}
+
+    lifted = coord.writeback.lift_to_current_best(
+        "explore",
+        1050.0,  # below current anchor of 1100
+        {"name": "prior_rerun", "fingerprint": fp, "candidate_extra_server_args": "--fast", "extra_envs": {}},
+    )
+
+    assert lifted is False
+    assert s.current_best["tput"] == 1100.0
+    assert len(s.optimization_stack) == 1
+
+
+@pytest.mark.asyncio
+async def test_promote_explore_two_winners_produce_two_stack_entries(session_dir):
+    """Every winner applied in a round must get its own optimization_stack entry."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    # Winner A: gains 10 %, measured tput 1100.
+    winner_a = {
+        "name": "w-a",
+        "fingerprint": "fp_a",
+        "tput": 1100.0,
+        "candidate_extra_server_args": "--flag-a 1",
+        "extra_server_args": "--flag-a 1",
+        "extra_envs": {},
+        "gain_pct": 10.0,
+    }
+    winner_b = {
+        "name": "w-b",
+        "fingerprint": "fp_b",
+        "tput": 1210.0,
+        "candidate_extra_server_args": "--flag-b 2",
+        "extra_server_args": "--flag-a 1 --flag-b 2",
+        "extra_envs": {},
+        "gain_pct": 10.0,
+    }
+
+    await coord.writeback.promote_to_shared_state(
+        "explore",
+        {
+            "explore_search_update": {},
+            "winners": [winner_a, winner_b],
+            "round_id": "r1",
+            "best_variant": winner_a,
+            "output_throughput": 1210.0,
+            "best_gain_pct": 10.0,
+        },
+        task=_task("explore", params={"gap_canonical_id": "g1"}),
+    )
+
+    assert len(s.optimization_stack) == 2
+    assert s.optimization_stack[0]["variant_name"] == "w-a"
+    assert s.optimization_stack[0]["tput"] == 1100.0
+    assert s.optimization_stack[1]["variant_name"] == "w-b"
+    assert s.optimization_stack[1]["tput"] == 1210.0
+    assert s.current_best["tput"] == 1210.0
+    # gain_per_stack_entry must be index-aligned with optimization_stack.
+    assert len(s.gain_per_stack_entry) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "last_tput,last_total,last_intvty,rejected",
+    [(130.0, 1250.0, 125.0, False), (90.0, 1250.0, 125.0, True), (140.0, 1150.0, 115.0, True)],
+    ids=["last_winner_intvty", "last_output_drop_rejected", "last_duplicate_recorded"],
+)
+async def test_promote_explore_cumulative_uses_last_lifted_measurement(
+    session_dir, monkeypatch, last_tput, last_total, last_intvty, rejected
+):
+    """Cumulative validation must use the last successful lift's own measurement."""
+    monkeypatch.setenv("HYPERLOOM_PERF_METRIC", "intvty_v1")
+    monkeypatch.setenv("HYPERLOOM_PERF_NOISE_PCT", "5")
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.framework = "sglang"
+    s.benchmark_mode = "agentx"
+    s.baseline_tput = 100.0
+    s.baseline_perf = {
+        "output_throughput": 100.0,
+        "total_throughput": 1000.0,
+        "e2e_norm_intvty_p90": 100.0,
+        "e2e_norm_intvty_p50": 100.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+    }
+    s.current_best = {
+        "action": "baseline",
+        "tput": 100.0,
+        "total_throughput": 1000.0,
+        "e2e_norm_intvty_p90": 100.0,
+        "e2e_norm_intvty_p50": 100.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+    }
+    first = {
+        "name": "first",
+        "fingerprint": "fp_first",
+        "tput": 120.0,
+        "total_throughput": 1200.0,
+        "input_throughput": 1080.0,
+        "e2e_norm_intvty_p90": 120.0,
+        "e2e_norm_intvty_p50": 120.0,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+        "tpot_p90_ms": 10.0,
+        "gain_pct": 20.0,
+        "candidate_extra_server_args": "--flag-a 1",
+        "extra_server_args": "--flag-a 1",
+        "workspace": "/first/benchmark",
+        "launch_evidence_path": "/first/launch_evidence.json",
+        "server_log_path": "/first/server.log",
+    }
+    last = {
+        "name": "last",
+        "fingerprint": first["fingerprint"] if rejected else "fp_last",
+        "tput": last_tput,
+        "total_throughput": last_total,
+        "input_throughput": last_total - last_tput,
+        "e2e_norm_intvty_p90": last_intvty,
+        "e2e_norm_intvty_p50": last_intvty,
+        "duration_seconds": 900.0,
+        "request_error_rate": 0.0,
+        "tpot_p90_ms": 9.0,
+        "gain_pct": 4.0,
+        "candidate_extra_server_args": "--flag-b 2",
+        "extra_server_args": "--flag-a 1 --flag-b 2",
+        "workspace": "/last/benchmark",
+        "launch_evidence_path": "/last/launch_evidence.json",
+        "server_log_path": "/last/server.log",
+    }
+    updates = []
+    real_update = coord.writeback.validate
+
+    def capture_update(new_tput, measurement, **kwargs):
+        updates.append((new_tput, dict(measurement), kwargs.get("measurement_basis")))
+        return real_update(new_tput, measurement, **kwargs)
+
+    monkeypatch.setattr(coord.writeback, "validate", capture_update)
+    await coord.writeback.promote_to_shared_state(
+        "explore",
+        {
+            "explore_search_update": {},
+            "winners": [first, last],
+            "round_id": "r-last-lift",
+            "best_variant": first,
+            "best_gain_pct": first["gain_pct"],
+            "output_throughput": last_tput,
+        },
+        task=_task("explore", params={"gap_canonical_id": "g1"}),
+    )
+
+    expected = first if rejected else last
+    stack_len = 1 if rejected else 2
+    assert s.current_best["variant_name"] == expected["name"]
+    assert s.current_best["tput"] == expected["tput"]
+    assert s.current_best["total_throughput"] == expected["total_throughput"]
+    assert s.current_best["input_throughput"] == expected["input_throughput"]
+    assert len(s.optimization_stack) == stack_len
+    assert s.optimization_stack[-1]["variant_name"] == expected["name"]
+    assert s.cumulative_gain_validated == pytest.approx(20.0 if rejected else 25.0)
+    assert s.cumulative_gain_validated_stack_len == stack_len
+    [(new_tput, measurement, basis)] = updates
+    assert new_tput == expected["tput"]
+    assert {key: measurement[key] for key in expected} == expected
+    assert basis == "e2e_decision_round"
+    assert s.current_best_measurement["benchmark_workspace"] == expected["workspace"]
+    assert s.current_best_measurement["launch_evidence_path"] == expected["launch_evidence_path"]
+    assert s.current_best_measurement["server_log_path"] == expected["server_log_path"]
+
+
+@pytest.mark.asyncio
+async def test_promote_explore_multi_winner_dedup_skips_already_stacked(session_dir):
+    """A winner whose fingerprint is already in the stack must not add a duplicate."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+
+    existing_fp = "fp_existing"
+    s.optimization_stack = [
+        {
+            "action": "explore",
+            "variant_name": "prior",
+            "fingerprint": existing_fp,
+            "tput": 1100.0,
+            "extra_server_args": "--flag-a 1",
+            "candidate_extra_server_args": "--flag-a 1",
+            "extra_envs": {},
+        }
+    ]
+    s.current_best = {"action": "explore", "tput": 1100.0, "extra_server_args": "--flag-a 1", "extra_envs": {}}
+
+    winner_new = {
+        "name": "w-new",
+        "fingerprint": "fp_new",
+        "tput": 1210.0,
+        "candidate_extra_server_args": "--flag-b 2",
+        "extra_server_args": "--flag-a 1 --flag-b 2",
+        "extra_envs": {},
+        "gain_pct": 10.0,
+    }
+    winner_dup = {
+        "name": "prior-renamed",
+        "fingerprint": existing_fp,
+        "tput": 1300.0,
+        "candidate_extra_server_args": "--flag-a 1",
+        "extra_server_args": "--flag-a 1",
+        "extra_envs": {},
+        "gain_pct": 5.0,
+    }
+
+    await coord.writeback.promote_to_shared_state(
+        "explore",
+        {
+            "explore_search_update": {},
+            "winners": [winner_new, winner_dup],
+            "round_id": "r2",
+            "best_variant": winner_new,
+            "output_throughput": 1300.0,
+            "best_gain_pct": 10.0,
+        },
+        task=_task("explore", task_id="t2", params={"gap_canonical_id": "g1"}),
+    )
+
+    # Only the new winner's entry is appended; the duplicate fingerprint is skipped.
+    assert len(s.optimization_stack) == 2
+    assert s.optimization_stack[1]["variant_name"] == "w-new"
+
+
+async def test_integrate_keep_carries_the_stack_env_layer(session_dir):
+    """A kernel integrate publishes args and envs from the same config."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {
+        "action": "explore",
+        "tput": 1000.0,
+        "extra_server_args": "--kv-cache-dtype fp8_e4m3",
+        "extra_envs": {"VLLM_ROCM_USE_AITER": "1"},
+    }
+
+    await coord.writeback.record_integrate_keep(
+        {"new_tput": 1200.0, "kernel_id": "k001", "integration_id": "i1"},
+    )
+
+    assert s.current_best["extra_envs"] == {"VLLM_ROCM_USE_AITER": "1"}
+    assert s.current_best["extra_server_args"] == "--kv-cache-dtype fp8_e4m3"
+
+
+async def test_integrate_keep_lets_a_tuning_env_delta_win(session_dir):
+    """A forge-GEMM KEEP ships ``result['extra_envs']``; it must survive the promote."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {"action": "explore", "tput": 1000.0, "extra_envs": {"KEEP_ME": "1", "TUNED": "old"}}
+
+    await coord.writeback.record_integrate_keep(
+        {"new_tput": 1200.0, "kernel_id": "k002", "extra_envs": {"TUNED": "new"}},
+    )
+
+    assert s.current_best["extra_envs"] == {"KEEP_ME": "1", "TUNED": "new"}
+
+
+async def test_fusion_origin_integrate_keep_lifts_as_fusion(session_dir):
+    """A fusion sibling drained through the shared lane must land as ``fusion``."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {"action": "explore", "tput": 1000.0, "extra_envs": {}}
+
+    await coord.writeback.record_integrate_keep(
+        {
+            "new_tput": 1300.0,
+            "kernel_id": "fuse_a",
+            "integration_id": "i-fuse",
+            "gain_pct": 30.0,
+            "patch_path": "/out/fuse_a.patch",
+            "extra_envs": {"ZAYA_FUSED_A": "1"},
+            "source": "forge_fusion",
+            "action_label": "fusion",
+        },
+    )
+
+    assert s.current_best["action"] == "fusion"
+    # current_best is a pure config record; the engine label lives on the entry.
+    assert "engine" not in s.current_best
+    entry = s.optimization_stack[-1]
+    assert entry["action"] == "fusion"
+    assert entry["engine"] == "forge_fusion"
+    assert entry["backend"] == "forge"
+    # The remote-recipe fusion export gates on this being a KEEP.
+    assert s.last_fusion_integrate["decision"] == "KEEP"
+    assert s.last_fusion_integrate["kernel_id"] == "fuse_a"
+
+
+async def test_fusion_integrate_refused_lift_does_not_mark_keep(session_dir):
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {"action": "explore", "tput": 1500.0}
+
+    await coord.writeback.record_integrate_keep(
+        {
+            "new_tput": 1300.0,
+            "kernel_id": "refused-fusion",
+            "source": "forge_fusion",
+            "action_label": "fusion",
+        },
+    )
+
+    assert s.current_best == {"action": "explore", "tput": 1500.0}
+    assert s.optimization_stack == []
+    assert s.last_fusion_integrate == {}
+    assert s.cumulative_gain_validated == 0.0
+
+
+async def test_a_plain_integrate_keep_is_not_relabelled_fusion(session_dir):
+    """The fusion branch is opt-in: an un-marked result stays a plain integrate."""
+    coord = _coord(session_dir)
+    s = coord.shared_state
+    s.baseline_tput = 1000.0
+    s.current_best = {"action": "explore", "tput": 1000.0, "extra_envs": {}}
+
+    await coord.writeback.record_integrate_keep(
+        {"new_tput": 1200.0, "kernel_id": "k003", "integration_id": "i3"},
+    )
+
+    assert s.current_best["action"] == "integrate"
+    assert s.last_fusion_integrate == {}
+    assert s.optimization_stack[-1].get("engine") != "forge_fusion"
+
+
+# ── source-layer handles: executor result → stack entry → env_spec ──────────
+
+
+def _keep_result(tmp_path: Path, *, import_root: str, complete: bool = True) -> dict:
+    """An integrate_patch KEEP result with a materialized snapshot on disk."""
+    snapshot = tmp_path / "snap"
+    (snapshot / "files" / import_root).mkdir(parents=True)
+    return {
+        "source_snapshot": str(snapshot),
+        "source_manifest": str(snapshot / "manifest.json"),
+        "target_files": ["python/sglang/srt/server.py"],
+        "framework_root": "/sgl-workspace/sglang",
+        "base_sha": "abc123",
+        "source_import_root": import_root,
+        "source_snapshot_complete": complete,
+    }
+
+
+def test_source_layer_handles_carry_every_field_the_stack_entry_needs(tmp_path):
+    """A lift path that forwards a subset silently degrades the GEAK overlay."""
+    handles = keep_patch_column._source_layer_handles(_keep_result(tmp_path, import_root="python"))
+
+    assert handles["source_import_root"] == "python"
+    assert handles["source_snapshot_complete"] is True
+    assert handles["framework_root"] == "/sgl-workspace/sglang"
+    assert handles["base_sha"] == "abc123"
+    assert handles["target_files"] == ["python/sglang/srt/server.py"]
+    assert handles["source_snapshot"].endswith("snap")
+
+
+def test_source_layer_handles_omit_a_completeness_the_result_never_recorded():
+    """Absent must stay absent so legacy entries still read their manifest."""
+    handles = keep_patch_column._source_layer_handles({"source_snapshot": "/snap"})
+
+    assert "source_snapshot_complete" not in handles
+
+
+def test_env_spec_hands_geak_the_import_root_not_the_snapshot_top(session_dir, tmp_path):
+    """GEAK PYTHONPATHs this value; the snapshot top holds no importable module."""
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 1000.0
+    result = _keep_result(tmp_path, import_root="python")
+
+    coord.writeback.lift_to_current_best(
+        "integrate_patch",
+        1200.0,
+        {"name": "patch-1", "scope": "source_patch", **keep_patch_column._source_layer_handles(result)},
+    )
+    spec = coord.writeback.build_env_spec()
+
+    (snapshot,) = spec["source_snapshots"]
+    assert snapshot["snapshot_dir"] == str(tmp_path / "snap" / "files" / "python")
+    assert snapshot["reproducible"] is True
+
+
+def test_env_spec_overlay_stops_at_files_for_a_dist_packages_install(session_dir, tmp_path):
+    """No import root means modules already start at the tree root."""
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 1000.0
+    result = _keep_result(tmp_path, import_root="")
+
+    coord.writeback.lift_to_current_best(
+        "integrate_patch",
+        1200.0,
+        {"name": "patch-1", "scope": "source_patch", **keep_patch_column._source_layer_handles(result)},
+    )
+    spec = coord.writeback.build_env_spec()
+
+    (snapshot,) = spec["source_snapshots"]
+    assert snapshot["snapshot_dir"] == str(tmp_path / "snap" / "files")
+
+
+def test_env_spec_refuses_an_incomplete_snapshot(session_dir, tmp_path):
+    """GEAK drops a non-reproducible entry, so False must survive the lift."""
+    coord = _coord(session_dir)
+    coord.shared_state.baseline_tput = 1000.0
+    result = _keep_result(tmp_path, import_root="python", complete=False)
+
+    coord.writeback.lift_to_current_best(
+        "integrate_patch",
+        1200.0,
+        {"name": "patch-1", "scope": "source_patch", **keep_patch_column._source_layer_handles(result)},
+    )
+    spec = coord.writeback.build_env_spec()
+
+    (snapshot,) = spec["source_snapshots"]
+    assert snapshot["reproducible"] is False
+
+
+# ---------------------------------------------------------------------------
+# A promoted result can still carry a failure: "apply_failed" / "reverted" both
+# promote, so the failure log is the only record of why a patch did not land.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_promote_records_a_failure_carried_by_a_promoted_result(session_dir):
+    coord = _coord(session_dir)
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {
+            "status": "apply_failed",
+            "error_class": "patch_target_missing",
+            "error": "target absent from /srv/vllm",
+        },
+        task=_task("integrate_patch", task_id="ip1"),
+    )
+
+    failures = coord.shared_state.last_action_failures
+    assert [f["action"] for f in failures] == ["integrate_patch"]
+    assert failures[0]["error_class"] == "patch_target_missing"
+
+
+@pytest.mark.asyncio
+async def test_promote_leaves_a_clean_result_out_of_the_failure_log(session_dir):
+    coord = _coord(session_dir)
+
+    await coord.writeback.promote_to_shared_state(
+        "integrate_patch",
+        {"status": "kept", "delta_pct": 2.0},
+        task=_task("integrate_patch", task_id="ip2"),
+    )
+
+    assert coord.shared_state.last_action_failures == []
+
+
+@pytest.mark.asyncio
+async def test_a_config_attempt_is_ledgered_with_no_timeline_open(session_dir):
+    """The row is what the dryness judgment reads, so no recorder may gate it.
+
+    The recorder lives for one FRAMEWORK_AGENT entry; a round settling in SWEEP
+    finds it closed, which is how every row outside that window went missing.
+    """
+    coord = _coord(session_dir)
+    assert coord.phase_framework.timeline() is None
+
+    await coord.recipe_journal.fact_write_hook(
+        task=_task("explore", task_id="ex-1"),
+        result=SubAgentResult(
+            task_id="ex-1",
+            state="succeeded",
+            result={
+                "round_id": "explore-004",
+                "per_variant_outcomes": [
+                    {
+                        "outcome": "REVERT",
+                        "fingerprint": "fp-1",
+                        "variant_name": "v-1",
+                        "provenance": "llm_direct",
+                        "metrics": {"gain_pct": -1.5, "base_tput": 1000.0, "tput": 985.0},
+                    },
+                    {"outcome": "SKIPPED_DEDUP", "fingerprint": "fp-2", "variant_name": "v-2"},
+                ],
+            },
+        ),
+        verdict=Verdict.REVERTED,
+    )
+
+    # The deduped variant was never measured, so it is not an attempt.
+    (row,) = coord.shared_state.attempts
+    assert row["lever_kind"] == LEVER_CONFIG
+    assert row["outcome"] == "REVERT"
+    assert row["adopted"] is False
+    assert row["round_id"] == "explore-004"
+    assert row["fingerprint"] == "fp-1"
+    assert row["gain_pct"] == -1.5

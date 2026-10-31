@@ -1,0 +1,202 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""A lease-reaped task death must count as a failure for its action."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.inference_optimizer.session.paths import make_session_dir
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.loop.dispatcher import DispatcherCollaborator
+from hyperloom.orchestrator.loop.sub_agent_runner import SubAgentResult
+from hyperloom.orchestrator.roles import (
+    MockBackend,
+    MockCriticBackend,
+    ScriptedPlan,
+)
+from hyperloom.orchestrator.state.task_registry import TaskSpec
+
+# Far above any real pid on Linux, so the liveness probe proves it dead.
+_DEAD_PID = 2_147_483_646
+
+
+@pytest.fixture
+def session_dir(tmp_path, monkeypatch) -> Path:
+    from hyperloom.orchestrator.bus.resource_lock import SqliteLeaseBackend
+
+    monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr("hyperloom.orchestrator.bus.resource_lock.local_owner_scope", lambda: "test-node")
+    monkeypatch.setattr(SqliteLeaseBackend, "_pid_alive", staticmethod(lambda pid: pid != _DEAD_PID))
+    return make_session_dir()
+
+
+def _silent_backends() -> dict[str, object]:
+    silent = ScriptedPlan(
+        turns=[],
+        default_intent=Intent(
+            type=IntentType.SEND_MESSAGE,
+            payload={"topic": "heartbeat", "body_md": "ok"},
+        ),
+    )
+    return {
+        "orchestration": MockBackend(silent, name="orch"),
+        "kernel_agent": MockBackend(silent, name="kernel_agent"),
+        "critic": MockCriticBackend(),
+    }
+
+
+async def _running_task_with_dead_lease(
+    coord: Coordinator,
+    *,
+    kind: str = "baseline",
+    key: str,
+    params: dict[str, Any] | None = None,
+):
+    """Create a running task holding a lease from a provably dead process."""
+    task, _ = await coord.tasks.create_or_return_existing(TaskSpec(kind=kind, params=params or {}, idempotency_key=key))
+    await coord.tasks.transition(task.task_id, "running")
+    coord.db.raw.execute(
+        "INSERT INTO leases(lane, holder_id, task_id, action, pid, acquired_at, expires_at) VALUES (?,?,?,?,?,?,?)",
+        (
+            "benchmark_lane",
+            task.task_id,
+            task.task_id,
+            kind,
+            _DEAD_PID,
+            "2026-01-01T00:00:00+00:00",
+            "2099-12-31T23:59:59+00:00",
+        ),
+    )
+    coord.db.raw.execute("UPDATE leases SET owner_scope='test-node' WHERE task_id=?", (task.task_id,))
+    coord.db.raw.commit()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_pump_counts_lease_reaped_baseline_as_failure(session_dir):
+    c = Coordinator(session_dir, backends=_silent_backends())
+    try:
+        task = await _running_task_with_dead_lease(c, key="k-dead-1")
+        await c.dispatcher.pump_dispatcher_once()
+        assert (await c.tasks.get(task.task_id)).state == "failed"
+        assert c.shared_state.baseline_failure_streak == 1
+        assert c.shared_state.baseline_total_failures == 1
+        entry = c.shared_state.last_action_failures[-1]
+        assert entry["action"] == "baseline"
+        assert entry["task_id"] == task.task_id
+        assert entry["error_class"] == "dead_holder_reaped"
+        assert c.shared_state.baseline_attempts[-1]["status"] == "failed"
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_pump_accounts_for_the_reconcilers_confirmed_deaths(session_dir):
+    import time
+
+    c = Coordinator(session_dir, backends=_silent_backends())
+    try:
+        task = await _running_task_with_dead_lease(c, key="reconciler-death")
+        report = await c.reconciler.run(time.time())
+        assert report.failed_tasks == [task.task_id]
+        await c.dispatcher.pump_dispatcher_once()
+        await c.dispatcher.pump_dispatcher_once()
+        assert c.shared_state.baseline_total_failures == 1
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_three_lease_reaped_baselines_trip_the_streak_stop(session_dir):
+    """--enablement=off: three lease-reaped baselines trip the three-strike stop."""
+    c = Coordinator(session_dir, backends=_silent_backends())
+    c.shared_state.enablement_mode = "off"
+    try:
+        for i in range(3):
+            await _running_task_with_dead_lease(c, key=f"k-dead-streak-{i}")
+            await c.dispatcher.pump_dispatcher_once()
+        assert c.shared_state.baseline_failure_streak == 3
+        assert c.shared_state.stop_reason == "baseline_failed"
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_accounting_is_idempotent_per_task(session_dir):
+    c = Coordinator(session_dir, backends=_silent_backends())
+    try:
+        task = await _running_task_with_dead_lease(c, key="k-dead-once")
+        await c.dispatcher.pump_dispatcher_once()
+        await c.dispatcher._account_dead_holder_failures([task.task_id], reason="dead_holder_pump")
+        assert c.shared_state.baseline_failure_streak == 1
+        assert len(c.shared_state.last_action_failures) == 1
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("result_owed", "streak"), [(False, 1), (True, 0)])
+async def test_a_reaped_discovery_round_settles_once(session_dir, monkeypatch, result_owed, streak):
+    """An orphaned discovery round settles as failed, or the pump re-fetches it as in flight for the whole phase.
+
+    A round whose execution still owes a result is left to the reap of that result.
+    """
+    c = Coordinator(session_dir, backends=_silent_backends())
+    monkeypatch.setattr(c.dispatcher, "owes_result", lambda _task_id: result_owed)
+    try:
+        task = await _running_task_with_dead_lease(
+            c,
+            kind="specialist",
+            key="candidate-discovery:candidate_pool_empty:r0",
+            params={"candidate_discovery": True, "domain": "candidate_discovery_specialist"},
+        )
+        await c.dispatcher.pump_dispatcher_once()
+        assert (await c.tasks.get(task.task_id)).state == "failed"
+        assert c.shared_state.framework_agent_discover_failures == streak
+    finally:
+        await c.stop()
+
+
+class _ReapStub:
+    """Minimal coordinator shell for the reap-path double-count guard."""
+
+    def __init__(self) -> None:
+        self.unpromotable: list[str] = []
+        self.gpu_specialist_pool = SimpleNamespace(release=self._noop_async)
+        self.bus = SimpleNamespace(append_and_seq=self._noop_async, record_observation=self._noop_async)
+        self.shared_state = SimpleNamespace(phase="PRELUDE", macro_cycle=0)
+        _outer = self
+        self.writeback = SimpleNamespace(
+            handle_unpromotable_result=lambda task, result: _outer._handle_unpromotable_result(task, result)
+        )
+
+    async def _noop_async(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _handle_unpromotable_result(self, task: Any, _result: Any) -> None:
+        self.unpromotable.append(task.task_id)
+
+    def record_exception(self, **_kwargs: Any) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_reap_skips_failure_accounting_already_charged():
+    stub = _ReapStub()
+    disp = DispatcherCollaborator(stub)
+    task = SimpleNamespace(task_id="t-dead", kind="baseline", params={})
+    result = SubAgentResult(task_id=task.task_id, state="failed", result={"status": "failed"})
+
+    await disp.reap_dispatched_task(task, result)
+    assert stub.unpromotable == ["t-dead"]
+
+    disp._dead_holder_accounted.add(task.task_id)
+    await disp.reap_dispatched_task(task, result)
+    assert stub.unpromotable == ["t-dead"]

@@ -1,0 +1,414 @@
+"""Tests for the --quantize quantization prelude."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import types
+from pathlib import Path
+
+import pytest
+
+from hyperloom_common.env import EnvValueError, env_bool
+from hyperloom.inference_optimizer.cli import parser as cli_parser
+from hyperloom.inference_optimizer.cli import bootstrap as cli_bootstrap
+from hyperloom.inference_optimizer.cli import quantization as cli_quantization
+from hyperloom.orchestrator.phases import quantization_request_handlers as qrh
+from hyperloom.orchestrator.phases import quantization_schemes as qs
+
+
+@pytest.fixture(autouse=True)
+def _enable_quant_by_default(monkeypatch):
+    """Default the deterministic master switch ON so CLI-hook tests reach the adapter."""
+    monkeypatch.setenv("HYPERLOOM_QUANTIZE_ENABLED", "1")
+
+
+# fakes
+
+
+def _fake_result(status: str, qdir: str | None, *, final="x", eval_gap=None, run_dir: str | None = None):
+    """Build a stand-in for quantization_agent.QuantSkillRunResult."""
+    assessment = types.SimpleNamespace(final=final, eval_gap=eval_gap)
+    return types.SimpleNamespace(
+        status=status,
+        quantized_model_dir=Path(qdir) if qdir else None,
+        assessment=assessment,
+        run_dir=Path(run_dir) if run_dir else None,
+    )
+
+
+def _patch_quantize(monkeypatch: pytest.MonkeyPatch, result):
+    """Replace quantize_via_prompt with an async stub that records its call and returns ``result``."""
+    import hyperloom.agents.quantization as quantization_agent
+
+    calls: list[dict] = []
+
+    async def _fake(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return result
+
+    monkeypatch.setattr(quantization_agent, "quantize_via_prompt", _fake)
+    return calls
+
+
+# Group A — parser
+
+
+def _parse(argv: list[str]):
+    return cli_parser._build_parser().parse_args(["optimize", "--model", "/tmp/m", *argv])
+
+
+def test_quantize_flag_defaults_none():
+    args = _parse([])
+    assert getattr(args, "quantize") is None
+
+
+def test_quantize_flag_captures_prompt():
+    args = _parse(["--quantize", "fp8, exclude lm_head"])
+    assert args.quantize == "fp8, exclude lm_head"
+
+
+def test_quantize_scheme_flag_parses():
+    args = _parse(["--quantize-scheme", "fp8"])
+    assert args.quantize_scheme == "fp8"
+
+
+def test_quantize_scheme_rejects_unknown_choice():
+    with pytest.raises(SystemExit):  # argparse rejects invalid choice
+        _parse(["--quantize-scheme", "fp16_made_up"])
+
+
+# Group A2 — scheme registry
+
+
+def test_resolve_scheme_none_returns_none():
+    assert qs.resolve_scheme_prompt(None) is None
+    assert qs.resolve_scheme_prompt("none") is None
+
+
+def test_resolve_scheme_known_returns_prompt():
+    assert qs.resolve_scheme_prompt("fp8") == "Quantization strategy:\nApply fp8 as the global quantization scheme."
+
+
+def test_resolve_scheme_has_no_hardcoded_defaults():
+    # The agent must not bake in kv_cache / exclude_layers defaults.
+    p = qs.resolve_scheme_prompt("fp8")
+    assert "lm_head" not in p
+    assert "kv_cache" not in p
+    assert "Calibration" not in p
+    assert "Evaluation" not in p
+
+
+def test_scheme_choices_match_supported_set():
+    assert qs.QUANT_SCHEME_CHOICES == ["none", "fp8", "ptpc_fp8", "mxfp4", "mxfp4_fp8"]
+    assert "int8" not in qs.QUANT_SCHEME_CHOICES
+
+
+# Group A3 — GPU-constrained schemes
+
+
+def test_supported_schemes_mi355x_includes_mxfp4():
+    s = qs.supported_schemes("mi355x")
+    assert "mxfp4" in s and "mxfp4_fp8" in s and "fp8" in s and "ptpc_fp8" in s
+
+
+def test_supported_schemes_dcgpu_excludes_mxfp4():
+    for gpu in ("mi300x", "mi325x", "", None):
+        s = qs.supported_schemes(gpu)
+        assert "fp8" in s and "ptpc_fp8" in s
+        assert "mxfp4" not in s and "mxfp4_fp8" not in s
+
+
+def test_validate_scheme_mxfp4_on_mi300x_raises():
+    with pytest.raises(qs.SchemeNotSupportedError):
+        qs.validate_scheme("mxfp4", "mi300x")
+
+
+def test_validate_scheme_mxfp4_on_mi355x_ok():
+    qs.validate_scheme("mxfp4", "mi355x")  # no raise
+
+
+def test_validate_scheme_mxfp4_unknown_gpu_not_enforced():
+    # GPU resolved later via probe; not enforceable without a concrete target.
+    qs.validate_scheme("mxfp4", "")
+    qs.validate_scheme("mxfp4", None)
+
+
+def test_validate_scheme_fp8_anywhere_ok():
+    for gpu in ("mi300x", "mi325x", "mi355x", "", None):
+        qs.validate_scheme("fp8", gpu)
+
+
+def test_validate_scheme_none_is_noop():
+    qs.validate_scheme(None, "mi300x")
+    qs.validate_scheme("none", "mi300x")
+
+
+def test_validate_scheme_unknown_raises_valueerror():
+    with pytest.raises(ValueError):
+        qs.validate_scheme("bogus", "mi355x")
+
+
+# Group B — adapter status mapping
+
+
+def test_adapter_success_returns_quantized_dir(tmp_path, monkeypatch):
+    from hyperloom.agents.quantization import QuantSkillRunOptions
+
+    calls = _patch_quantize(monkeypatch, _fake_result("success", str(tmp_path / "q"), final=None, eval_gap=0.01))
+    out = asyncio.run(qrh.run_quantization_prelude_async(prompt="fp8", source_model="/models/src", workspace=tmp_path))
+    assert out == str(tmp_path / "q")
+    # source model + export dir folded into the effective prompt; the export dir is inside the run's own directory.
+    assert "/models/src" in calls[0]["prompt"]
+    assert "`quantized/` in your workspace" in calls[0]["prompt"]
+    assert str(tmp_path) not in calls[0]["prompt"]
+    assert "fp8" in calls[0]["prompt"]
+    assert calls[0]["options"] == QuantSkillRunOptions(interactive=False)
+    assert calls[0]["workspace"] == tmp_path
+
+
+def test_adapter_partial_with_model_returns_dir(tmp_path, monkeypatch):
+    _patch_quantize(monkeypatch, _fake_result("partial", str(tmp_path / "q"), final="eval_gap_exceeded"))
+    out = asyncio.run(qrh.run_quantization_prelude_async(prompt="fp8", source_model="/m", workspace=tmp_path))
+    assert out == str(tmp_path / "q")
+
+
+def test_adapter_partial_without_model_exits_4(tmp_path, monkeypatch):
+    _patch_quantize(monkeypatch, _fake_result("partial", None, final="must_validate_skipped"))
+    with pytest.raises(SystemExit) as ei:
+        asyncio.run(qrh.run_quantization_prelude_async(prompt="fp8", source_model="/m", workspace=tmp_path))
+    assert ei.value.code == 4
+
+
+def test_adapter_failed_exits_4(tmp_path, monkeypatch, capsys):
+    run_dir = str(tmp_path / "runs" / "r1")
+    _patch_quantize(monkeypatch, _fake_result("failed", None, final="exec_model_load_failed", run_dir=run_dir))
+    with pytest.raises(SystemExit) as ei:
+        asyncio.run(qrh.run_quantization_prelude_async(prompt="fp8", source_model="/m", workspace=tmp_path))
+    assert ei.value.code == 4
+    # The failure names the run directory that holds this run's diagnosis.
+    assert run_dir in capsys.readouterr().err
+
+
+# Group C — cli prelude hook
+
+
+class _Args:
+    def __init__(self, *, model, quantize=None, quantize_scheme=None, gpu_type=None):
+        self.model = Path(model)
+        self.quantize = quantize
+        self.quantize_scheme = quantize_scheme
+        self.gpu_type = gpu_type
+
+
+def test_prelude_noop_without_flag(monkeypatch):
+    called = {"n": 0}
+
+    async def _should_not_run(**kwargs):  # pragma: no cover - asserts non-call
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _should_not_run)
+    args = _Args(model="/models/src", quantize=None)
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert called["n"] == 0
+    assert str(args.model) == "/models/src"  # unchanged
+
+
+def test_prelude_rewrites_model_on_success(tmp_path, monkeypatch):
+    import hyperloom.inference_optimizer.session.paths as paths
+
+    monkeypatch.setattr(paths, "workspace_root", lambda: tmp_path)
+
+    async def _fake_async(*, prompt, source_model, workspace):
+        return str(tmp_path / "out" / "quantized")
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _fake_async)
+    monkeypatch.delenv("MODEL_PATH", raising=False)
+
+    args = _Args(model="/models/src", quantize="fp8")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+
+    assert str(args.model) == str(tmp_path / "out" / "quantized")
+    assert os.environ["MODEL_PATH"] == str(tmp_path / "out" / "quantized")
+
+
+def test_prelude_noop_when_scheme_none(monkeypatch):
+    called = {"n": 0}
+
+    async def _should_not_run(**kwargs):  # pragma: no cover - asserts non-call
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _should_not_run)
+    args = _Args(model="/models/src", quantize=None, quantize_scheme="none")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert called["n"] == 0
+    assert str(args.model) == "/models/src"
+
+
+def test_prelude_uses_scheme_enum_when_no_freetext(tmp_path, monkeypatch):
+    import hyperloom.inference_optimizer.session.paths as paths
+
+    monkeypatch.setattr(paths, "workspace_root", lambda: tmp_path)
+    seen = {}
+
+    async def _fake_async(*, prompt, source_model, workspace):
+        seen["prompt"] = prompt
+        return str(tmp_path / "q")
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _fake_async)
+    args = _Args(model="/models/src", quantize=None, quantize_scheme="fp8")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    # the fp8 enum resolved to its curated prompt.
+    assert "fp8" in seen["prompt"]
+    assert str(args.model) == str(tmp_path / "q")
+
+
+def test_prelude_skips_on_gpu_scheme_mismatch(tmp_path, monkeypatch, capsys):
+    # mxfp4 on mi300x is unsupported: report, skip quantization, continue.
+    called = {"n": 0}
+
+    async def _should_not_run(**kwargs):  # pragma: no cover - asserts non-call
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _should_not_run)
+    monkeypatch.delenv("GPU_TYPE", raising=False)
+    # Register the key so the marker the prelude writes does not leak into other tests.
+    monkeypatch.setenv("HYPERLOOM_QUANTIZATION_SKIPPED", "")
+    args = _Args(model="/models/src", quantize_scheme="mxfp4", gpu_type="mi300x")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert called["n"] == 0
+    assert str(args.model) == "/models/src"  # unchanged -> downstream un-quantized
+    captured = capsys.readouterr()
+    # Skip is detectable via stdout marker + env var.
+    assert "QUANTIZATION_SKIPPED" in captured.out
+    assert "MI355X" in (captured.out + captured.err)
+    assert os.environ.get("HYPERLOOM_QUANTIZATION_SKIPPED")
+
+
+def test_prelude_runs_mxfp4_on_mi355x(tmp_path, monkeypatch):
+    import hyperloom.inference_optimizer.session.paths as paths
+
+    monkeypatch.setattr(paths, "workspace_root", lambda: tmp_path)
+    monkeypatch.delenv("GPU_TYPE", raising=False)
+    seen = {}
+
+    async def _fake_async(*, prompt, source_model, workspace):
+        seen["prompt"] = prompt
+        return str(tmp_path / "q")
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _fake_async)
+    args = _Args(model="/models/src", quantize_scheme="mxfp4", gpu_type="mi355x")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert "mxfp4" in seen["prompt"]
+    assert str(args.model) == str(tmp_path / "q")
+
+
+def test_prelude_freetext_takes_priority_over_scheme(tmp_path, monkeypatch):
+    import hyperloom.inference_optimizer.session.paths as paths
+
+    monkeypatch.setattr(paths, "workspace_root", lambda: tmp_path)
+    seen = {}
+
+    async def _fake_async(*, prompt, source_model, workspace):
+        seen["prompt"] = prompt
+        return str(tmp_path / "q")
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _fake_async)
+    args = _Args(model="/models/src", quantize="custom mxfp4 prompt", quantize_scheme="fp8")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert seen["prompt"] == "custom mxfp4 prompt"  # free text wins
+
+
+def test_prelude_preserves_source_model_identity(tmp_path, monkeypatch):
+    """The prelude rewrites args.model to the generic ``.../quantized`` export dir, but the session / display model
+    identity must NOT collapse to ``quantized`` (else runs collide and the report loses the real model name).
+    """
+    import hyperloom.inference_optimizer.session.paths as paths
+
+    monkeypatch.setattr(paths, "workspace_root", lambda: tmp_path)
+
+    async def _fake_async(*, prompt, source_model, workspace):
+        # Mirror the real adapter: export dir basename is always "quantized".
+        return str(tmp_path / "quantization" / "google-gemma-4-26B-A4B-it" / "quantized")
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _fake_async)
+    monkeypatch.delenv("MODEL_PATH", raising=False)
+
+    args = _Args(model="/path/models/google-gemma-4-26B-A4B-it", quantize="fp8")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+
+    # Model path is rewritten to the generic quantized export dir ...
+    assert str(args.model).endswith("/quantized")
+    # ... but the identity used for session_dir / state / manifest is preserved.
+    name = cli_bootstrap.resolve_model_display_name(args)
+    assert name != "quantized"
+    assert name == "google-gemma-4-26B-A4B-it-quantized"
+
+
+def test_prelude_no_display_name_without_quantization(monkeypatch):
+    """Without quantization the prelude leaves args untouched, so the identity resolver falls back to the plain model-path basename."""
+    args = _Args(model="/models/Qwen3-32B", quantize=None)
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert getattr(args, "model_display_name", None) in (None, "")
+    assert cli_bootstrap.resolve_model_display_name(args) == "Qwen3-32B"
+
+
+# Group D — deterministic env switch ($HYPERLOOM_QUANTIZE_ENABLED)
+
+
+def test_prelude_env_gate_skips_when_disabled(monkeypatch, capsys):
+    """With $HYPERLOOM_QUANTIZE_ENABLED off, the prelude skips quantization even when --quantize is present."""
+    monkeypatch.setenv("HYPERLOOM_QUANTIZE_ENABLED", "0")
+    monkeypatch.setenv("HYPERLOOM_QUANTIZATION_SKIPPED", "")
+    called = {"n": 0}
+
+    async def _should_not_run(**kwargs):  # pragma: no cover - asserts non-call
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _should_not_run)
+    args = _Args(model="/models/src", quantize="fp8")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+
+    assert called["n"] == 0
+    assert str(args.model) == "/models/src"  # unchanged -> downstream un-quantized
+    captured = capsys.readouterr()
+    assert "QUANTIZATION_SKIPPED" in captured.out
+    assert os.environ.get("HYPERLOOM_QUANTIZATION_SKIPPED")
+
+
+def test_prelude_env_gate_skips_when_unset(monkeypatch):
+    """Unset env => disabled: quantization does not run."""
+    monkeypatch.delenv("HYPERLOOM_QUANTIZE_ENABLED", raising=False)
+    called = {"n": 0}
+
+    async def _should_not_run(**kwargs):  # pragma: no cover - asserts non-call
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr(qrh, "run_quantization_prelude_async", _should_not_run)
+    args = _Args(model="/models/src", quantize="fp8")
+    asyncio.run(cli_quantization._run_quantization_prelude(args))
+    assert called["n"] == 0
+    assert str(args.model) == "/models/src"
+
+
+def test_quantize_switch_token_vocabulary(monkeypatch):
+    for v in ("1", "true", "TRUE", "yes", "on", "On", " 1 "):
+        monkeypatch.setenv("HYPERLOOM_QUANTIZE_ENABLED", v)
+        assert env_bool("HYPERLOOM_QUANTIZE_ENABLED") is True
+    for v in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("HYPERLOOM_QUANTIZE_ENABLED", v)
+        assert env_bool("HYPERLOOM_QUANTIZE_ENABLED") is False
+    monkeypatch.delenv("HYPERLOOM_QUANTIZE_ENABLED", raising=False)
+    assert env_bool("HYPERLOOM_QUANTIZE_ENABLED") is False
+
+
+def test_an_unreadable_quantize_switch_is_not_silently_off(monkeypatch):
+    """Publishing an unquantized model as quantized is worse than refusing to start."""
+    monkeypatch.setenv("HYPERLOOM_QUANTIZE_ENABLED", "bogus")
+    with pytest.raises(EnvValueError, match="HYPERLOOM_QUANTIZE_ENABLED"):
+        env_bool("HYPERLOOM_QUANTIZE_ENABLED")

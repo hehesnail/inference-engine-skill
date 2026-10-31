@@ -1,0 +1,840 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for framework source-scope path-resolution helpers."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from hyperloom.inference_optimizer import framework_paths as fp
+from hyperloom.inference_optimizer import framework_registry as fr
+from hyperloom.inference_optimizer.protocol.action_surfaces import ACTION_CATALOGUE, FULL_ENABLED_ACTIONS
+from hyperloom.inference_optimizer.framework_paths import probe_framework_source_roots_for_env
+from hyperloom.orchestrator.prompts.prompt_builder import (
+    build_orchestration_prompt,
+    PromptAssets,
+    SessionContext,
+)
+from hyperloom.inference_optimizer.session.paths import asset_system_prompts_dir
+from hyperloom.orchestrator.kernel import patch_jit_cache, patch_rebuild
+
+
+@pytest.fixture(autouse=True)
+def _clean_framework_env(monkeypatch):
+    """Reset every env var the helpers read."""
+    for key in (
+        "INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS",
+        "INFERENCE_OPTIMIZER_SGLANG_SERVER_ARGS",
+        "INFERENCE_OPTIMIZER_VLLM_ARG_UTILS",
+        "INFERENCE_OPTIMIZER_ATOM_ARG_UTILS",
+        "VIRTUAL_ENV",
+        "VLLM_VENV_ROOT",
+        "DSL2_ROOT",
+        "FLYDSL_ROOT",
+        "FLYDSL_EXTRA_SOURCE_DIRS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+class TestNormalizeRoot:
+    def test_appends_trailing_slash(self):
+        assert fp._normalize_root("/sgl-workspace/aiter") == "/sgl-workspace/aiter/"
+
+    def test_preserves_existing_trailing_slash(self):
+        assert fp._normalize_root("/foo/") == "/foo/"
+
+    def test_empty_input_returns_empty(self):
+        assert fp._normalize_root("") == ""
+        assert fp._normalize_root("   ") == ""
+
+
+class TestFindSpecOrigin:
+    def test_returns_none_when_spec_missing(self, monkeypatch):
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name: None,
+        )
+        assert fp._find_spec_origin("does_not_matter") is None
+
+    def test_returns_none_when_origin_missing(self, monkeypatch):
+        spec = SimpleNamespace(origin=None)
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: spec)
+        assert fp._find_spec_origin("pkg") is None
+
+    def test_init_origin_returns_parent_dir(self, monkeypatch, tmp_path):
+        init = tmp_path / "pkg" / "__init__.py"
+        init.parent.mkdir(parents=True)
+        init.write_text("# stub")
+        spec = SimpleNamespace(origin=str(init))
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: spec)
+        assert fp._find_spec_origin("pkg") == init.parent
+
+    def test_handles_find_spec_raising(self, monkeypatch):
+        def boom(_):
+            raise ValueError("malformed")
+
+        monkeypatch.setattr(importlib.util, "find_spec", boom)
+        assert fp._find_spec_origin("pkg") is None
+
+
+class TestGlobInstallPackageRoots:
+    def test_finds_dist_packages_under_usr_local(self, tmp_path, monkeypatch):
+        base = tmp_path / "usr_local_lib" / "python3.12" / "dist-packages"
+        (base / "vllm").mkdir(parents=True)
+        (base / "aiter_meta").mkdir()
+        monkeypatch.setattr(
+            fp,
+            "_INSTALL_GLOB_PARENTS",
+            (tmp_path / "usr_local_lib",),
+        )
+        roots = fp._glob_install_package_roots()
+        assert any("dist-packages/vllm/" in r for r in roots)
+        assert any("dist-packages/aiter_meta/" in r for r in roots)
+
+
+class TestResolveFlydslSourceRoots:
+    def test_includes_default_roots(self):
+        assert "/opt/flydsl/" in fp.resolve_flydsl_source_roots()
+
+    @pytest.mark.parametrize("env_key", ["DSL2_ROOT", "FLYDSL_ROOT"])
+    def test_honours_flydsl_root_env(self, monkeypatch, env_key):
+        monkeypatch.setenv(env_key, "/checkouts/FlyDSL")
+        roots = fp.resolve_flydsl_source_roots()
+        # Both variants: the apply gate matches a lower-cased path verbatim,
+        # while a path-resolving consumer needs the real case.
+        assert "/checkouts/FlyDSL/" in roots
+        assert "/checkouts/flydsl/" in roots
+
+
+class TestResolveKernelSearchRoots:
+    def test_drops_roots_that_do_not_exist(self, monkeypatch, tmp_path):
+        """A pinned root that no longer exists must not reach the caller.
+
+        Grepping an absent directory yields no hits, which is indistinguishable
+        from a kernel whose source is genuinely absent -- the exact failure that
+        silently emptied kernel-opt's candidate list.
+        """
+        present = tmp_path / "vllm"
+        present.mkdir()
+        monkeypatch.setattr(
+            fp,
+            "_discover_installed_framework_roots",
+            lambda: (f"{present}/", "/gone/aiter/"),
+        )
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+        monkeypatch.setattr(fp, "resolve_flydsl_source_roots", lambda: ())
+        assert fp.resolve_kernel_search_roots() == (f"{present}/",)
+
+    def test_empty_when_nothing_is_installed(self, monkeypatch):
+        """No searchable root is reported as such, not as a silent success."""
+        monkeypatch.setattr(fp, "_discover_installed_framework_roots", lambda: ())
+        monkeypatch.setattr(fp, "_discover_scriptable_repo_roots", lambda: ())
+        monkeypatch.setattr(fp, "_discover_explicit_framework_root", lambda: ())
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ("/gone/vllm/",))
+        monkeypatch.setattr(fp, "resolve_flydsl_source_roots", lambda: ("/gone/flydsl/",))
+        assert fp.resolve_kernel_search_roots() == ()
+
+    def test_includes_roots_named_by_the_discovery_env(self, monkeypatch, tmp_path):
+        """install.sh writes the probed roots back for the next process."""
+        first = tmp_path / "custom-sglang"
+        second = tmp_path / "custom-vllm"
+        first.mkdir()
+        second.mkdir()
+        monkeypatch.setattr(fp, "_discover_installed_framework_roots", lambda: ())
+        monkeypatch.setenv(
+            "INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS",
+            f"{first}:{second}",
+        )
+        roots = fp.resolve_kernel_search_roots()
+        assert f"{first}/" in roots
+        assert f"{second}/" in roots
+
+    def test_drops_a_non_absolute_discovery_env_root(self, monkeypatch):
+        """A relative root cannot name a tree, so it never becomes one."""
+        monkeypatch.setattr(fp, "_discover_installed_framework_roots", lambda: ())
+        monkeypatch.setenv("INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS", "relative/path")
+        assert not any("relative/path" in root for root in fp.resolve_kernel_search_roots())
+
+    def test_includes_explicit_framework_checkout(self, monkeypatch, tmp_path):
+        """An editable checkout is invisible to importlib; the env var finds it."""
+        checkout = tmp_path / "my-vllm"
+        checkout.mkdir()
+        monkeypatch.setattr(fp, "_discover_installed_framework_roots", lambda: ())
+        monkeypatch.setenv(fp.GENERIC_FRAMEWORK_ROOT_ENV, str(checkout))
+        assert f"{checkout}/" in fp.resolve_kernel_search_roots()
+
+
+class TestResolveKnownSourcePrefixes:
+    """Classification prefixes, not directories anyone opens.
+
+    A kernel path reaches the classifier from a trace or a patch manifest
+    produced on a serving pod, so a root absent from the host doing the
+    classifying still names real source on the host that emitted it.
+    """
+
+    def test_keeps_static_layouts_that_are_absent_here(self, monkeypatch):
+        monkeypatch.setattr(fp, "_discover_installed_framework_roots", lambda: ())
+        prefixes = fp.resolve_known_source_prefixes()
+        assert "/app/ATOM/atom/" in prefixes
+        assert "/aiter_meta/csrc/" in prefixes
+
+    def test_includes_flydsl_roots(self):
+        assert "/opt/flydsl/" in fp.resolve_known_source_prefixes()
+
+    def test_is_not_existence_filtered_unlike_the_search_roots(self, monkeypatch):
+        """The two resolvers answer different questions and must not converge."""
+        monkeypatch.setattr(fp, "_discover_installed_framework_roots", lambda: ("/gone/vllm/",))
+        assert "/gone/vllm/" in fp.resolve_known_source_prefixes()
+        assert "/gone/vllm/" not in fp.resolve_kernel_search_roots()
+
+
+class TestEveryKernelSourcePackageIsDiscoverable:
+    """One package list, reached by all three discovery mechanisms.
+
+    ``sgl_kernel`` holds SGLang's kernel sources and was named by the tool that
+    greps for them but by none of the discovery paths here. Because this
+    resolver imports successfully in every non-standalone run, the tool's own
+    list was never consulted -- so a host with a standalone ``sgl_kernel`` wheel
+    reported it as searched and never searched it. A package present in only
+    some of the three mechanisms is the shape of that bug, so the tests below
+    assert all three derive from the same tuple.
+    """
+
+    def test_sgl_kernel_is_a_framework_source_package(self):
+        assert "sgl_kernel" in fp.FRAMEWORK_SOURCE_PACKAGES
+        assert "aiter_meta" in fp.FRAMEWORK_SOURCE_PACKAGES
+
+    def test_importlib_discovery_covers_every_package(self, monkeypatch, tmp_path):
+        """A standalone wheel is found by spec origin alone."""
+        located = tmp_path / "sgl_kernel"
+        located.mkdir()
+        monkeypatch.setattr(
+            fp,
+            "_find_spec_origin",
+            lambda name: str(located) if name == "sgl_kernel" else None,
+        )
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(fp, "_glob_install_package_roots", lambda: ())
+        assert f"{located}/" in fp._discover_installed_framework_roots()
+
+    def test_the_venv_glob_covers_every_package(self, monkeypatch, tmp_path):
+        """A wheel under ``$VIRTUAL_ENV`` that importlib cannot see."""
+        venv = tmp_path / "venv"
+        installed = venv / "lib" / "python3.12" / "site-packages" / "sgl_kernel"
+        installed.mkdir(parents=True)
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setattr(fp, "_glob_install_package_roots", lambda: ())
+        assert f"{installed}/" in fp._discover_installed_framework_roots()
+
+    def test_the_install_glob_covers_every_package(self, monkeypatch, tmp_path):
+        """Both ``site-`` and ``dist-`` spellings, under a bare install parent."""
+        for flavour in ("site", "dist"):
+            installed = tmp_path / flavour / "lib" / "python3.12" / f"{flavour}-packages" / "sgl_kernel"
+            installed.mkdir(parents=True)
+            monkeypatch.setattr(fp, "_INSTALL_GLOB_PARENTS", (tmp_path / flavour / "lib",))
+            assert f"{installed}/" in fp._glob_install_package_roots(), flavour
+
+    def test_a_standalone_sgl_kernel_wheel_becomes_a_search_root(self, monkeypatch, tmp_path):
+        """End to end: the only framework on the host is ``sgl_kernel``."""
+        installed = tmp_path / "lib" / "python3.12" / "dist-packages" / "sgl_kernel"
+        installed.mkdir(parents=True)
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setattr(fp, "_INSTALL_GLOB_PARENTS", (tmp_path / "lib",))
+        monkeypatch.setattr(fp, "_discover_scriptable_repo_roots", lambda: ())
+        monkeypatch.setattr(fp, "_discover_explicit_framework_root", lambda: ())
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+        monkeypatch.setattr(fp, "resolve_flydsl_source_roots", lambda: ())
+        assert fp.resolve_kernel_search_roots() == (f"{installed}/",)
+
+
+class TestFlydslExtraSourceDirs:
+    def test_lists_only_roots_that_exist(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FLYDSL_ROOT", str(tmp_path / "missing"))
+        assert fp.flydsl_extra_source_dirs() == ""
+
+        real = tmp_path / "flydsl"
+        real.mkdir()
+        monkeypatch.setenv("FLYDSL_ROOT", str(real))
+        assert fp.flydsl_extra_source_dirs() == str(real)
+
+    def test_preserves_an_operator_supplied_value(self, monkeypatch, tmp_path):
+        real = tmp_path / "flydsl"
+        real.mkdir()
+        monkeypatch.setenv("FLYDSL_ROOT", str(real))
+        monkeypatch.setenv("FLYDSL_EXTRA_SOURCE_DIRS", "/custom/dir")
+        assert fp.flydsl_extra_source_dirs() == f"/custom/dir:{real}"
+
+
+class TestProbeFrameworkSourceRootsForEnv:
+    def test_returns_existing_dirs_only(self, tmp_path, monkeypatch):
+        present = tmp_path / "fake_root"
+        present.mkdir()
+        monkeypatch.setattr(
+            fp,
+            "_discover_installed_framework_roots",
+            lambda: (
+                f"{present}/",
+                f"{tmp_path / 'missing'}/",
+            ),
+        )
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+        monkeypatch.setattr(fp, "resolve_flydsl_source_roots", lambda: ())
+        result = fp.probe_framework_source_roots_for_env()
+        assert result == f"{present}/"
+
+    def test_includes_site_packages_when_virtual_env_set(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        venv = tmp_path / "venv"
+        site = venv / "lib" / "python3.12" / "site-packages"
+        for name in ("vllm", "sglang", "aiter", "aiter_meta"):
+            (site / name).mkdir(parents=True)
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setattr(fp, "_glob_install_package_roots", lambda: ())
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+        result = fp.probe_framework_source_roots_for_env()
+        for name in ("vllm", "sglang", "aiter", "aiter_meta"):
+            assert f"{name}/" in result
+
+    def test_isolated_vllm_venv_root_fallback(self, tmp_path, monkeypatch):
+        # Isolated vLLM: main VIRTUAL_ENV has no vllm; VLLM_VENV_ROOT points at
+        # the isolated venv holding vllm + split AITER, which must be discovered.
+        main_venv = tmp_path / "opt-venv"
+        (main_venv / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+        iso_venv = tmp_path / "vllm-venv"
+        iso_site = iso_venv / "lib" / "python3.12" / "site-packages"
+        for name in ("vllm", "aiter", "aiter_meta"):
+            (iso_site / name).mkdir(parents=True)
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setattr(fp, "_glob_install_package_roots", lambda: ())
+        monkeypatch.setenv("VIRTUAL_ENV", str(main_venv))
+        monkeypatch.setenv("VLLM_VENV_ROOT", str(iso_venv))
+        result = fp._discover_installed_framework_roots()
+        assert any(r.endswith("/vllm/") for r in result)
+        assert any(r.endswith("/aiter/") for r in result)
+        assert any(r.endswith("/aiter_meta/") for r in result)
+
+    def test_dedupes_origins_against_defaults(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        monkeypatch.setattr(
+            fp,
+            "_DEFAULT_SOURCE_ROOTS",
+            (f"{shared}/",),
+        )
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: shared)
+        monkeypatch.setattr(fp, "_glob_install_package_roots", lambda: ())
+        monkeypatch.setattr(fp, "resolve_flydsl_source_roots", lambda: ())
+        result = fp.probe_framework_source_roots_for_env()
+        assert result == f"{shared}/"
+
+
+# xdit enablement
+
+
+class TestDefaultSourceRootsIncludesXdit:
+    def test_xdit_root_present_in_defaults(self):
+        """/app/xDiT/ must be in the PolicyGate source-file allowlist."""
+        assert any("/app/xDiT" in r for r in fp._DEFAULT_SOURCE_ROOTS), (
+            f"_DEFAULT_SOURCE_ROOTS missing xDiT entry: {fp._DEFAULT_SOURCE_ROOTS!r}"
+        )
+
+
+class TestScriptableRepoRootDiscovery:
+    """A scriptable framework runs from a checkout, not an installed package.
+
+    A live session probed the framework as ``missing`` with the checkout
+    checkout on disk, so PolicyGate would have rejected any patch against
+    ``hyvideo/`` and framework-agent had no source to work on.
+    """
+
+    def test_repo_path_env_lands_in_allowlist(self, tmp_path, monkeypatch):
+        checkout = tmp_path / "my-framework"
+        (checkout / "hyvideo").mkdir(parents=True)
+        monkeypatch.setenv("CUSTOM_REPO_PATH", str(checkout))
+
+        assert f"{checkout}/" in fp.resolve_kernel_search_roots()
+
+    def test_dir_alias_also_discovered(self, tmp_path, monkeypatch):
+        checkout = tmp_path / "my-framework"
+        checkout.mkdir()
+        monkeypatch.delenv("CUSTOM_REPO_PATH", raising=False)
+        monkeypatch.setenv("CUSTOM_DIR", str(checkout))
+
+        assert f"{checkout}/" in fp.resolve_kernel_search_roots()
+
+    def test_missing_checkout_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CUSTOM_REPO_PATH", str(tmp_path / "absent"))
+
+        assert not any("absent" in r for r in fp.resolve_kernel_search_roots())
+
+
+class TestGenericFrameworkRepoPath:
+    """A session is single-framework, so the operator should not need the prefix.
+
+    ``<FRAMEWORK>_REPO_PATH`` requires knowing the framework name before the right
+    variable can be set, and switching frameworks means switching variable names —
+    for a value that cannot collide, since the CLI locks ``$FRAMEWORK`` for the run.
+    The generic form is also the only way to point at a framework that is neither
+    pip-installed nor registered as scriptable, such as an editable vllm checkout.
+    """
+
+    def test_generic_env_lands_in_allowlist(self, tmp_path, monkeypatch):
+        checkout = tmp_path / "some-framework"
+        (checkout / "pkg").mkdir(parents=True)
+        monkeypatch.setenv("FRAMEWORK_REPO_PATH", str(checkout))
+
+        assert f"{checkout}/" in fp.resolve_kernel_search_roots()
+
+    def test_generic_env_works_for_a_non_scriptable_framework(self, tmp_path, monkeypatch):
+        """An editable vllm tree is not discoverable by importlib or site-packages."""
+        checkout = tmp_path / "vllm-src"
+        (checkout / "vllm").mkdir(parents=True)
+        monkeypatch.delenv("CUSTOM_REPO_PATH", raising=False)
+        monkeypatch.setenv("FRAMEWORK", "vllm")
+        monkeypatch.setenv("FRAMEWORK_REPO_PATH", str(checkout))
+
+        assert f"{checkout}/" in fp.resolve_kernel_search_roots()
+
+    def test_prefixed_value_still_wins_so_nothing_existing_changes(self, tmp_path, monkeypatch):
+        """Both are accepted, and the prefixed one keeps its precedence."""
+        prefixed = tmp_path / "prefixed"
+        (prefixed / "hyvideo").mkdir(parents=True)
+        generic = tmp_path / "generic"
+        generic.mkdir()
+        monkeypatch.setenv("CUSTOM_REPO_PATH", str(prefixed))
+        monkeypatch.setenv("FRAMEWORK_REPO_PATH", str(generic))
+
+        roots = fp.resolve_kernel_search_roots()
+        assert f"{prefixed}/" in roots
+        assert roots.index(f"{prefixed}/") < roots.index(f"{generic}/")
+
+    def test_missing_generic_checkout_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FRAMEWORK_REPO_PATH", str(tmp_path / "absent"))
+
+        assert not any("absent" in r for r in fp.resolve_kernel_search_roots())
+
+    def test_summary_accepts_repo_dirname(self, tmp_path, monkeypatch):
+        """The checkout dir is xDiT, not xdit — summary must still say ok."""
+        checkout = tmp_path / "xDiT"
+        checkout.mkdir()
+        monkeypatch.setenv("XDIT_REPO_PATH", str(checkout))
+
+        summary = fp.summarise_framework_root_discovery(fp.probe_framework_source_roots_for_env())
+
+        assert "xdit=ok" in summary
+
+
+class TestProbeIncludesXditWhenInstalled:
+    def test_xfuser_picked_up_via_find_spec(self, tmp_path, monkeypatch):
+        """A real ``find_spec('xfuser')`` origin is included."""
+        origin = tmp_path / "xfuser_pkg"
+        origin.mkdir()
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+
+        spec_map = {"xfuser": origin}
+        monkeypatch.setattr(
+            fp,
+            "_find_spec_origin",
+            lambda name: spec_map.get(name),
+        )
+        result = fp.probe_framework_source_roots_for_env()
+        assert f"{origin}/" in result
+
+    def test_xfuser_picked_up_via_venv_site_packages(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A wheel-installed xfuser is picked up via the VIRTUAL_ENV glob."""
+        venv = tmp_path / "venv"
+        site = venv / "lib" / "python3.12" / "site-packages"
+        (site / "xfuser").mkdir(parents=True)
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+        result = fp.probe_framework_source_roots_for_env()
+        assert "xfuser/" in result
+
+
+# atom enablement
+
+
+class TestDefaultSourceRootsIncludesAtom:
+    def test_atom_root_present_in_defaults(self):
+        """/app/ATOM/atom/ must be in the PolicyGate source-file allowlist."""
+        assert any("/app/ATOM/atom" in r for r in fp._DEFAULT_SOURCE_ROOTS), (
+            f"_DEFAULT_SOURCE_ROOTS missing atom entry: {fp._DEFAULT_SOURCE_ROOTS!r}"
+        )
+
+
+class TestProbeIncludesAtomWhenInstalled:
+    def test_atom_picked_up_via_find_spec(self, tmp_path, monkeypatch):
+        """A real ``find_spec('atom')`` origin is included even without a /app/ATOM/atom/ default root."""
+        origin = tmp_path / "atom_pkg"
+        origin.mkdir()
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+
+        spec_map = {"atom": origin}
+        monkeypatch.setattr(
+            fp,
+            "_find_spec_origin",
+            lambda name: spec_map.get(name),
+        )
+        result = fp.probe_framework_source_roots_for_env()
+        assert f"{origin}/" in result
+
+    def test_atom_picked_up_via_venv_site_packages(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A wheel-installed atom is picked up via the VIRTUAL_ENV ``python*/site-packages/atom`` glob."""
+        venv = tmp_path / "venv"
+        site = venv / "lib" / "python3.12" / "site-packages"
+        (site / "atom").mkdir(parents=True)
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", ())
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+        result = fp.probe_framework_source_roots_for_env()
+        assert "atom/" in result
+
+
+class TestSummariseFrameworkRootDiscovery:
+    def test_buckets_atom_ok(self):
+        """The install.sh log helper reports atom=ok when an atom root appears in the discovery string."""
+        out = fp.summarise_framework_root_discovery(
+            "/sgl-workspace/aiter/:/sgl-workspace/sglang/:/sgl-workspace/vllm/:/app/ATOM/atom/"
+        )
+        assert "atom=ok" in out
+        assert "sglang=ok" in out
+        assert "vllm=ok" in out
+        assert "aiter=ok" in out
+
+    def test_buckets_xdit_ok(self):
+        """Reports xdit=ok when /app/xDiT/ appears in the discovery string."""
+        out = fp.summarise_framework_root_discovery("/sgl-workspace/aiter/:/app/xDiT/")
+        assert "xdit=ok" in out
+        assert "aiter=ok" in out
+
+    def test_buckets_xdit_missing_when_absent(self):
+        out = fp.summarise_framework_root_discovery("/sgl-workspace/aiter/:/sgl-workspace/sglang/")
+        assert "xdit=missing" in out
+
+    def test_buckets_atom_missing_on_non_atom_box(self):
+        out = fp.summarise_framework_root_discovery("/sgl-workspace/aiter/:/sgl-workspace/sglang/:/sgl-workspace/vllm/")
+        assert "atom=missing" in out
+        assert "sglang=ok" in out
+
+    def test_handles_empty_input(self):
+        out = fp.summarise_framework_root_discovery("")
+        assert "atom=missing" in out
+        assert "sglang=missing" in out
+        assert "vllm=missing" in out
+        assert "aiter=missing" in out
+        assert "xdit=missing" in out
+
+    def test_does_not_substring_match_unrelated_paths(self):
+        """Only paths whose last directory IS ``atom`` count; a substring like ``atomic_kernel`` must not."""
+        out = fp.summarise_framework_root_discovery("/sgl-workspace/atomic_kernel/")
+        assert "atom=missing" in out
+
+    def test_does_not_substring_match_xdit_unrelated(self):
+        """A path like ``/xdit_tools/`` must not match the ``xdit`` bucket."""
+        out = fp.summarise_framework_root_discovery("/sgl-workspace/xdit_tools/")
+        assert "xdit=missing" in out
+
+    @pytest.mark.parametrize(
+        ("root", "bucket"),
+        [("/work/xdit/", "xdit"), ("/work/XDiT/", "xdit"), ("/opt/SGLang/", "sglang"), ("/app/ATOM/", "atom")],
+    )
+    def test_directory_names_match_case_insensitively(self, root, bucket):
+        assert f"{bucket}=ok" in fp.summarise_framework_root_discovery(root)
+
+    def test_lowercase_xdit_checkout_reads_as_the_tree_it_resolves_to(self, tmp_path, monkeypatch):
+        """The resolver and the summary must agree on an env-named checkout whatever its case."""
+        checkout = tmp_path / "xdit"
+        checkout.mkdir()
+        monkeypatch.setenv("XDIT_REPO_PATH", str(checkout))
+
+        assert fp.resolve_framework_tree("xdit") == f"{checkout}/"
+        assert "xdit=ok" in fp.summarise_framework_root_discovery(fp.probe_framework_source_roots_for_env())
+
+    def test_installed_xfuser_package_counts_as_xdit(self):
+        """xDiT installs as ``xfuser``; the root resolve_framework_tree picks must read as found here too."""
+        out = fp.summarise_framework_root_discovery("/usr/local/lib/python3.12/dist-packages/xfuser/")
+        assert "xdit=ok" in out
+
+
+class TestDerivedFromTheRegistry:
+    """A framework that declares its package or checkout is discovered without another edit here."""
+
+    def test_every_declared_package_is_discovered(self):
+        declared = {spec.python_package for spec in fr.FRAMEWORKS.values() if spec.python_package}
+        assert declared - set(fp.FRAMEWORK_SOURCE_PACKAGES) == set()
+
+    def test_every_declared_checkout_is_a_default_root(self):
+        declared = {spec.source_root for spec in fr.FRAMEWORKS.values() if spec.source_root}
+        assert declared - set(fp._DEFAULT_SOURCE_ROOTS) == set()
+
+
+class TestAtomPathPresentInAllThreeLocations:
+    """Pin atom-source-path entries across the three sister lists so a cleanup can't drop one."""
+
+    def test_atom_present_in_default_source_roots(self):
+        assert any("/app/atom/atom" in r.lower() for r in fp._DEFAULT_SOURCE_ROOTS)
+
+    def test_atom_present_in_reusable_source_roots(self):
+        assert any("/app/atom/atom" in r.lower() for r in fp.resolve_known_source_prefixes())
+
+    def test_atom_present_in_tracelens_reusable_roots(self):
+        """The kernel-agent's ``_REUSABLE_SOURCE_ROOTS`` must track the orchestrator-side list."""
+        from hyperloom.orchestrator.trace_analysis import _kernel_classification
+
+        text = Path(_kernel_classification.__file__).resolve().read_text(encoding="utf-8")
+        assert "/app/atom/atom/" in text.lower(), (
+            "src/hyperloom/orchestrator/trace_analysis/_kernel_classification.py _REUSABLE_SOURCE_ROOTS "
+            "is out of sync with src/hyperloom/orchestrator/kernel/"
+            "request_handlers._REUSABLE_SOURCE_ROOTS (atom missing)"
+        )
+
+    def test_kernel_request_handlers_and_tracelens_analysis_atom_paths_in_sync(self):
+        """The orchestrator gate and kernel-agent classifier derive reusable roots from the same source, so their atom subsets must match."""
+        from hyperloom.orchestrator.trace_analysis import _kernel_classification as kernel_classification
+
+        orch_atom = frozenset(r.lower() for r in fp.resolve_known_source_prefixes() if "/atom/" in r.lower())
+        kernel_classification._framework_source_roots.cache_clear()
+        ka_atom = frozenset(r.lower() for r in kernel_classification._reusable_roots() if "/atom/" in r.lower())
+        assert orch_atom, "orchestrator reusable roots carry no atom entry"
+        assert ka_atom, "tracelens reusable roots carry no atom entry"
+        assert orch_atom == ka_atom, f"atom subsets diverged — orch={sorted(orch_atom)!r} ka={sorted(ka_atom)!r}"
+
+
+# Source-root resolution + prompt injection
+def test_prompt_renders_framework_source_roots(registry=None):
+    registry = registry or ACTION_CATALOGUE
+    custom = ("/custom/sglang/", "/opt/venv/lib/python3.12/site-packages/vllm/")
+    text = build_orchestration_prompt(
+        action_registry=registry,
+        enabled_actions=FULL_ENABLED_ACTIONS,
+        session=SessionContext(framework="sglang", max_minutes=60, framework_source_roots=custom),
+        assets=PromptAssets(rules_fragment_path=asset_system_prompts_dir() / "orchestration.md"),
+    )
+    assert "framework_source_roots:" in text
+    assert "/custom/sglang/" in text
+    assert "site-packages/vllm/" in text
+
+
+def test_probe_framework_source_roots_includes_defaults(tmp_path, monkeypatch):
+    ws = tmp_path / "sgl-workspace" / "sglang"
+    ws.mkdir(parents=True)
+    monkeypatch.setattr(
+        "hyperloom.inference_optimizer.framework_paths._DEFAULT_SOURCE_ROOTS",
+        (str(ws) + "/",),
+    )
+    out = probe_framework_source_roots_for_env()
+    assert str(ws) in out or (str(ws) + "/") in out
+
+
+# apply_kernel_patch strategy detection
+def test_detect_strategy_accepts_dist_packages_vllm_py() -> None:
+    target = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/parameter.py",
+    )
+    strat = patch_rebuild._detect_strategy(target)
+    assert strat["compiled"] is False
+
+
+# --- aiter_meta split-wheel rebuild recognition (regression) ---
+# aiter device sources ship in the sibling ``aiter_meta`` package, so hot
+# kernels land under ``.../dist-packages/aiter_meta/csrc/...``. The JIT/cpp_itfs
+# rebuild gates keyed only ``/aiter/csrc/``, so a KEPT aiter_meta .cu deployed
+# but never re-JIT'd -> integrate saw a stale binary and REVERT'd
+# (fault_attempts_exhausted; observed 07.25-07.30 on Qwen3-8B/Llama/Mixtral).
+
+_AITER_META_CU = Path("/usr/local/lib/python3.12/dist-packages/aiter_meta/csrc/kernels/quant_kernels.cu")
+_AITER_META_CPP_ITFS_CU = Path("/usr/local/lib/python3.12/dist-packages/aiter_meta/csrc/cpp_itfs/mha_fwd.cu")
+
+
+def test_target_is_in_aiter_csrc_matches_aiter_meta() -> None:
+    # split-wheel layout must be recognised as an aiter csrc source
+    assert patch_jit_cache._target_is_in_aiter_csrc(_AITER_META_CU) is True
+    # classic layout still recognised
+    assert patch_jit_cache._target_is_in_aiter_csrc(Path("/sgl-workspace/aiter/csrc/kernels/quant_kernels.cu")) is True
+    # unrelated source stays out
+    assert (
+        patch_jit_cache._target_is_in_aiter_csrc(
+            Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/parameter.py")
+        )
+        is False
+    )
+
+
+def test_target_is_in_aiter_cpp_itfs_matches_aiter_meta() -> None:
+    assert patch_jit_cache._target_is_in_aiter_cpp_itfs(_AITER_META_CPP_ITFS_CU) is True
+    # a non-cpp_itfs aiter_meta source is csrc but NOT cpp_itfs
+    assert patch_jit_cache._target_is_in_aiter_cpp_itfs(_AITER_META_CU) is False
+
+
+def test_invalidate_aiter_jit_build_runs_for_aiter_meta_target(tmp_path) -> None:
+    jit_build = tmp_path / "aiter" / "jit" / "build"
+    jit_build.mkdir(parents=True)
+    (jit_build / "module_aiter_core.so").write_bytes(b"stale")
+    backup_dir = tmp_path / "backup"
+
+    res = patch_jit_cache._invalidate_aiter_jit_build(
+        _AITER_META_CU,
+        backup_dir,
+        jit_build_dir=jit_build,
+    )
+
+    assert res["status"] == "ok", res
+    assert not jit_build.exists()  # moved aside so the next import re-JITs
+    backups = list(backup_dir.glob("jit_build_*/module_aiter_core.so"))
+    assert len(backups) == 1
+
+
+def test_invalidate_aiter_jit_build_ignores_orphaned_prior_backup(
+    tmp_path,
+) -> None:
+    jit_build = tmp_path / "aiter" / "jit" / "build"
+    jit_build.mkdir(parents=True)
+    (jit_build / "first.so").write_bytes(b"first")
+    backup_dir = tmp_path / "backup"
+
+    first = patch_jit_cache._invalidate_aiter_jit_build(
+        _AITER_META_CU,
+        backup_dir,
+        jit_build_dir=jit_build,
+    )
+    jit_build.mkdir(parents=True)
+    (jit_build / "second.so").write_bytes(b"second")
+    second = patch_jit_cache._invalidate_aiter_jit_build(
+        _AITER_META_CU,
+        backup_dir,
+        jit_build_dir=jit_build,
+    )
+
+    assert first["status"] == "ok"
+    assert second["status"] == "ok"
+    assert first["backup_path"] != second["backup_path"]
+    assert Path(first["backup_path"]).is_dir()
+    assert Path(second["backup_path"]).is_dir()
+
+
+class TestPointSessionFrameworkRoot:
+    def test_every_resolver_names_the_pointed_root_over_a_prior_pin(self, monkeypatch, tmp_path):
+        prior = tmp_path / "image"
+        prior.mkdir()
+        checkout = tmp_path / "attempt-src"
+        checkout.mkdir()
+        monkeypatch.setenv("FRAMEWORK", "sglang")
+        monkeypatch.setenv("SGLANG_DIR", str(prior))
+        monkeypatch.setenv("SGLANG_REPO_PATH", "")
+        monkeypatch.setenv("FRAMEWORK_REPO_PATH", "")
+
+        fp.point_session_framework_root(str(checkout), "sglang")
+        assert fp.resolve_session_framework_root() == f"{checkout}/"
+        assert fp.resolve_framework_tree("sglang") == f"{checkout}/"
+
+
+class TestResolveFrameworkTree:
+    def test_prefixed_env_wins(self, monkeypatch, tmp_path):
+        tree = tmp_path / "sglang"
+        tree.mkdir()
+        monkeypatch.setenv("SGLANG_REPO_PATH", str(tree))
+        assert fp.resolve_framework_tree("sglang") == f"{tree}/"
+
+    def test_generic_env_is_used_when_no_prefixed_one(self, monkeypatch, tmp_path):
+        tree = tmp_path / "generic"
+        tree.mkdir()
+        monkeypatch.delenv("SGLANG_REPO_PATH", raising=False)
+        monkeypatch.delenv("SGLANG_DIR", raising=False)
+        monkeypatch.setenv("FRAMEWORK_REPO_PATH", str(tree))
+        assert fp.resolve_framework_tree("sglang") == f"{tree}/"
+
+    def test_absent_env_falls_to_package_origin(self, monkeypatch, tmp_path):
+        pkg_dir = tmp_path / "site-packages" / "vllm"
+        pkg_dir.mkdir(parents=True)
+        for key in ("VLLM_REPO_PATH", "VLLM_DIR", "FRAMEWORK_REPO_PATH"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: pkg_dir if name == "vllm" else None)
+        assert fp.resolve_framework_tree("vllm") == f"{pkg_dir}/"
+
+    def test_xdit_is_found_under_its_xfuser_package(self, monkeypatch, tmp_path):
+        """xDiT installs as ``xfuser``; there is no importable ``xdit`` package."""
+        pkg_dir = tmp_path / "xfuser"
+        pkg_dir.mkdir()
+        monkeypatch.delenv("FRAMEWORK_REPO_PATH", raising=False)
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: pkg_dir if name == "xfuser" else None)
+        assert fp.resolve_framework_tree("xdit") == f"{pkg_dir}/"
+
+    def test_xdit_default_checkout_is_named_after_its_repo(self, monkeypatch, tmp_path):
+        """The shipped default is ``/app/xDiT/``, the repo's directory name, not ``/xdit``."""
+        checkout = tmp_path / "xDiT"
+        checkout.mkdir()
+        monkeypatch.delenv("FRAMEWORK_REPO_PATH", raising=False)
+        monkeypatch.setattr(fp, "_find_spec_origin", lambda name: None)
+        monkeypatch.setattr(fp, "_DEFAULT_SOURCE_ROOTS", (f"{checkout}/",))
+        assert fp.resolve_framework_tree("xdit") == f"{checkout}/"
+
+    def test_a_framework_without_a_tree_resolves_to_nothing(self, monkeypatch):
+        for key in ("CUSTOM_REPO_PATH", "CUSTOM_DIR", "FRAMEWORK_REPO_PATH"):
+            monkeypatch.delenv(key, raising=False)
+        assert fp.resolve_framework_tree("custom") == ""
+
+    @pytest.mark.parametrize("name", ["not-a-framework", ""])
+    def test_unregistered_name_is_rejected(self, name):
+        with pytest.raises(KeyError):
+            fp.resolve_framework_tree(name)
+
+
+def _git_tracking(checkout: Path, *files: str) -> Path:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    for rel in files:
+        target = checkout / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"],
+        check=True,
+    )
+    return checkout
+
+
+class TestFrameworkApplyTree:
+    def test_a_package_in_a_checkout_is_edited_at_the_checkout(self, tmp_path):
+        checkout = _git_tracking(tmp_path / "sglang", "python/sglang/__init__.py")
+        tree = fp.framework_apply_tree(f"{checkout}/python/sglang/")
+        assert tree == fp.FrameworkTree(tree=checkout / "python" / "sglang", root=checkout, checkout=True)
+
+    def test_a_pip_installed_package_is_edited_in_place(self, tmp_path):
+        package = tmp_path / "site-packages" / "vllm"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        assert fp.framework_apply_tree(f"{package}/") == fp.FrameworkTree(tree=package, root=package, checkout=False)
+
+    def test_an_untracked_package_under_some_repository_is_not_that_repository(self, tmp_path):
+        project = _git_tracking(tmp_path / "project", "README.md")
+        package = project / ".venv" / "site-packages" / "vllm"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        assert fp.framework_apply_tree(str(package)) == fp.FrameworkTree(tree=package, root=package, checkout=False)
+
+    def test_nothing_named_is_nothing(self, tmp_path):
+        assert fp.framework_apply_tree("") is None
+        assert fp.framework_apply_tree(str(tmp_path / "absent")) is None

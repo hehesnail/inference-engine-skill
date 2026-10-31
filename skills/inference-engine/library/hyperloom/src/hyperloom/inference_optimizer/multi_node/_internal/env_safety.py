@@ -1,0 +1,35 @@
+"""Validate env keys forwarded over SSH to multi-node inference pods."""
+
+from __future__ import annotations
+
+import logging
+
+from hyperloom.common.env_safety import BLOCKED_UNTRUSTED_ENV_NAMES, valid_env_key
+
+log = logging.getLogger(__name__)
+
+
+def is_forward_env_key_allowed(key: str) -> bool:
+    """Return True when ``key`` may be forwarded over SSH to pod processes."""
+    if not valid_env_key(key):
+        return False
+    return key not in BLOCKED_UNTRUSTED_ENV_NAMES
+
+
+def filter_forward_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop disallowed keys from an env dict destined for SSH forwarding."""
+    out: dict[str, str] = {}
+    for raw_key, raw_val in env.items():
+        key = str(raw_key)
+        if is_forward_env_key_allowed(key):
+            out[key] = str(raw_val)
+        else:
+            log.warning("dropping disallowed multi-node forward env key %r", key)
+    return out
+
+
+def assert_forward_env_keys(env: dict[str, str]) -> None:
+    """Raise ValueError when any env key is not allowed for SSH forwarding."""
+    bad = [str(k) for k in env if not is_forward_env_key_allowed(str(k))]
+    if bad:
+        raise ValueError(f"disallowed SSH forward env keys: {bad!r}")

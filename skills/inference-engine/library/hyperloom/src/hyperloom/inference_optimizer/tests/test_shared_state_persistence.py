@@ -1,0 +1,498 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""SharedState + Coordinator integration tests."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+import pytest
+
+from hyperloom.orchestrator.roles import (
+    MockBackend,
+    MockCriticBackend,
+    ScriptedPlan,
+)
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.orchestrator.state.shared_state import SharedState
+from hyperloom.inference_optimizer.session.paths import make_session_dir
+
+
+@pytest.fixture
+def session_dir(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
+    return make_session_dir()
+
+
+def _heartbeat() -> Intent:
+    return Intent(type=IntentType.SEND_MESSAGE, payload={"topic": "heartbeat", "body_md": "ok"})
+
+
+def _backends_full() -> dict[str, object]:
+    silent = ScriptedPlan(turns=[], default_intent=_heartbeat())
+    return {
+        "orchestration": MockBackend(silent, name="orch"),
+        "critic": MockCriticBackend(),
+    }
+
+
+def test_shared_state_defaults_blank():
+    s = SharedState()
+    assert s.session_id == ""
+    assert s.baseline_tput == 0.0
+    assert s.cumulative_gain_validated == 0.0
+    assert s.crash_count == 0
+    assert s.pruned_families == []
+    assert s.current_best == {}
+
+
+def test_save_load_round_trip(tmp_path):
+    s = SharedState(
+        session_id="abc",
+        model_name="meta-llama/Llama-3.1-8B-Instruct",
+        baseline_tput=1840.0,
+        cumulative_gain_validated=12.5,
+        working_recipe_generation=3,
+        validated_recipe_generation=2,
+        pruned_families=["deep_kernel"],
+        current_best={"action": "backends", "tput": 2010.0},
+        last_fusion={"status": "complete", "kept": False},
+        last_fusion_integrate={"status": "ok", "decision": "KEEP"},
+    )
+    s.save(tmp_path)
+    s2 = SharedState.load_or_init(tmp_path)
+    assert s2.session_id == "abc"
+    assert s2.model_name == "meta-llama/Llama-3.1-8B-Instruct"
+    assert s2.baseline_tput == 1840.0
+    assert s2.cumulative_gain_validated == 12.5
+    assert (s2.working_recipe_generation, s2.validated_recipe_generation) == (3, 2)
+    assert s2.optimization_stack_has_unvalidated_keeps()
+    assert s2.pruned_families == ["deep_kernel"]
+    assert s2.current_best == {"action": "backends", "tput": 2010.0}
+    assert s2.last_fusion == {"status": "complete", "kept": False}
+    assert s2.last_fusion_integrate == {"status": "ok", "decision": "KEEP"}
+
+
+def test_a_session_saved_before_recipe_generations_loads_on_the_stack_watermark(tmp_path):
+    s = SharedState(
+        session_id="legacy", optimization_stack=[{"action": "explore"}], cumulative_gain_validated_stack_len=1
+    )
+    s.save(tmp_path)
+    path = tmp_path / "state.json"
+    payload = json.loads(path.read_text())
+    payload.pop("working_recipe_generation")
+    payload.pop("validated_recipe_generation")
+    path.write_text(json.dumps(payload))
+
+    s2 = SharedState.load_or_init(tmp_path)
+
+    assert (s2.working_recipe_generation, s2.validated_recipe_generation) == (0, 0)
+    assert not s2.optimization_stack_has_unvalidated_keeps()
+    s2.optimization_stack.append({"action": "explore"})
+    assert s2.optimization_stack_has_unvalidated_keeps()
+
+
+def test_profile_osl_round_trip(tmp_path):
+    # Explicit profile OSL must survive save/load across a fresh-shell resume.
+    s = SharedState(session_id="abc", osl=8192, profile_osl=512)
+    s.save(tmp_path)
+    s2 = SharedState.load_or_init(tmp_path)
+    assert s2.profile_osl == 512
+    assert SharedState(session_id="x").profile_osl == 0
+
+
+def test_tick_exception_round_trip(tmp_path):
+    s = SharedState(session_id="abc")
+    entry = s.record_tick_exception(
+        tick=7,
+        stage="tick_body",
+        agent="orchestration",
+        exc=RuntimeError("boom"),
+    )
+    s.save(tmp_path)
+
+    s2 = SharedState.load_or_init(tmp_path)
+    assert s2.last_tick_exception == entry
+    assert s2.last_tick_exception["tick"] == 7
+    assert s2.last_tick_exception["stage"] == "tick_body"
+    assert s2.last_tick_exception["agent"] == "orchestration"
+    assert s2.last_tick_exception["type"] == "RuntimeError"
+
+
+def test_load_or_init_returns_blank_when_missing(tmp_path):
+    s = SharedState.load_or_init(tmp_path)
+    assert s.session_id == ""
+    assert (tmp_path / "state.json").exists() is False
+
+
+def test_save_is_atomic(tmp_path):
+    """Concurrent readers must never see a partial write."""
+    s = SharedState(session_id="x")
+    s.save(tmp_path)
+    raw = (tmp_path / "state.json").read_text()
+    parsed = json.loads(raw)
+    assert parsed["session_id"] == "x"
+    leftovers = list(tmp_path.glob(".state-*"))
+    assert leftovers == []
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"crash_count": "bad"},
+        {"crash_timestamps": "bad"},
+        {"crash_timestamps": [100.0, "bad"]},
+    ],
+)
+def test_load_rejects_corrupt_state_without_rewriting_evidence(tmp_path, invalid):
+    path = tmp_path / "state.json"
+    raw = {"session_id": "damaged", "schema_version": 1, "incident_evidence": {"traceback": "original"}, **invalid}
+    original = json.dumps(raw, indent=2).encode("utf-8") + b"\n"
+    path.write_bytes(original)
+    modified_ns = path.stat().st_mtime_ns
+
+    with pytest.raises(ValueError, match=next(iter(invalid))):
+        SharedState.load_or_init(tmp_path)
+
+    assert path.read_bytes() == original
+    assert path.stat().st_mtime_ns == modified_ns
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json"]
+
+
+def test_load_legacy_state_keeps_defaults_without_rewriting_file(tmp_path):
+    path = tmp_path / "state.json"
+    original = b'{"session_id": "legacy", "unknown_future_field": 42}\n'
+    path.write_bytes(original)
+
+    state = SharedState.load_or_init(tmp_path)
+
+    assert state.session_id == "legacy"
+    assert state.crash_count == 0
+    assert state.crash_timestamps == []
+    assert not hasattr(state, "unknown_future_field")
+    assert path.read_bytes() == original
+
+
+def test_from_dict_drops_unknown_fields():
+    raw = {"session_id": "s", "unknown_future_field": 42, "baseline_tput": 100.0}
+    s = SharedState.from_dict(raw)
+    assert s.session_id == "s"
+    assert s.baseline_tput == 100.0
+    assert s.last_tick_exception == {}
+    assert not hasattr(s, "unknown_future_field")
+
+
+def test_add_pruned_family_idempotent():
+    s = SharedState()
+    assert s.add_pruned_family("deep_kernel") is True
+    assert s.add_pruned_family("deep_kernel") is False
+    assert s.pruned_families == ["deep_kernel"]
+
+
+def test_is_pruned():
+    s = SharedState(pruned_families=["long"])
+    assert s.is_pruned("long")
+    assert not s.is_pruned("prep")
+
+
+def test_increment_crash_count():
+    s = SharedState()
+    assert s.increment_crash_count() == 1
+    assert s.increment_crash_count(by=2) == 3
+    assert s.crash_count == 3
+
+
+def test_to_prompt_summary_contains_key_fields():
+    s = SharedState(
+        session_id="s1",
+        model_name="Llama-3",
+        baseline_tput=1840.0,
+        cumulative_gain_validated=10.0,
+        pruned_families=["deep_kernel"],
+    )
+    summary = s.to_prompt_summary()
+    assert "s1" in summary
+    assert "Llama-3" in summary
+    assert "1840" in summary
+    assert "10.0" in summary
+    assert "deep_kernel" in summary
+
+
+@pytest.mark.asyncio
+async def test_coordinator_loads_existing_shared_state(session_dir):
+    """Coordinator.__init__ must pick up an existing state.json (resume hook)."""
+    pre = SharedState(session_id="resumed", baseline_tput=2000.0, pruned_families=["deep_kernel"])
+    pre.save(session_dir)
+    c = Coordinator(session_dir, backends=_backends_full())
+    try:
+        assert c.shared_state.session_id == "resumed"
+        assert c.shared_state.baseline_tput == 2000.0
+        assert c.shared_state.is_pruned("deep_kernel")
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_prune_branch_persists(session_dir):
+    c = Coordinator(session_dir, backends=_backends_full())
+    try:
+        await c.router.handle_intent(
+            "orchestration",
+            Intent(
+                type=IntentType.PRUNE_BRANCH,
+                payload={"family": "deep_kernel", "reason": "3 fails"},
+            ),
+        )
+        assert "deep_kernel" in c.shared_state.pruned_families
+        on_disk = json.loads((session_dir / "state.json").read_text())
+        assert "deep_kernel" in on_disk["pruned_families"]
+    finally:
+        await c.stop()
+
+
+@pytest.mark.asyncio
+async def test_pruned_family_survives_coordinator_restart(session_dir):
+    c1 = Coordinator(session_dir, backends=_backends_full())
+    try:
+        await c1.router.handle_intent(
+            "orchestration",
+            Intent(
+                type=IntentType.PRUNE_BRANCH,
+                payload={"family": "target_analysis", "reason": "expensive"},
+            ),
+        )
+    finally:
+        await c1.stop()
+
+    # Fresh Coordinator must still observe the prune after restart.
+    c2 = Coordinator(session_dir, backends=_backends_full())
+    try:
+        assert c2.shared_state.is_pruned("target_analysis")
+        # Prune is advisory: a proposal the phase allows still reaches the pending queue.
+        await c2.router.handle_intent(
+            "orchestration",
+            Intent(
+                type=IntentType.PROPOSE_ACTION,
+                payload={"action_name": "target_analysis", "predicted_gain_pct": 5.0},
+            ),
+        )
+        assert c2.state.pending_proposals
+        obs = await c2.bus.tail(topic="observation")
+        assert any(m.payload.get("kind") == "proposal_pruned_advisory" for m in obs)
+    finally:
+        await c2.stop()
+
+
+def test_reference_fields_survive_resume(tmp_path):
+    """R3: reference_* fields persist through save → from_dict (resume)."""
+    s = SharedState(session_id="t", model_name="m", model_path="/x/m")
+    s.reference_server_args = "--block-size 128"
+    s.reference_envs = {"VLLM_USE_BREAKABLE_CUDAGRAPH": "0"}
+    s.reference_model = "minimaxm3"
+    restored = SharedState.from_dict(s.to_dict())
+    assert restored.reference_server_args == "--block-size 128"
+    assert restored.reference_envs == {"VLLM_USE_BREAKABLE_CUDAGRAPH": "0"}
+    assert restored.reference_model == "minimaxm3"
+
+
+def test_save_renders_current_setting_sh(tmp_path, monkeypatch):
+    """save() emits a re-parseable current_setting.sh from current_best."""
+    monkeypatch.setenv("FRAMEWORK", "vllm")
+    sd = tmp_path / "session"
+    sd.mkdir()
+    s = SharedState(session_id="t", model_name="m", model_path="/x/m")
+    s.current_best = {
+        "extra_server_args": "--block-size 128 --attention-backend TRITON_ATTN",
+        "extra_envs": {"VLLM_ROCM_USE_AITER": "1"},
+    }
+    s.save(sd)
+    out = sd / "current_setting.sh"
+    assert out.exists()
+    from hyperloom.inference_optimizer.reference_script import parse_reference_script
+
+    r = parse_reference_script(str(out), framework="vllm")
+    assert "--block-size 128" in r.server_args
+    assert "TRITON_ATTN" in r.server_args
+    assert r.envs.get("VLLM_ROCM_USE_AITER") == "1"
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        '--moe-backend aiter --speculative-config {"method":"dspark","num_speculative_tokens":5} '
+        "--max-num-seqs 128 --no-enable-prefix-caching",
+        # A native AgentX launch records its argv through shlex.join, which single-quotes the JSON.
+        '--moe-backend aiter --speculative-config \'{"method":"dspark","num_speculative_tokens":5}\' '
+        "--max-num-seqs 128 --no-enable-prefix-caching",
+    ],
+)
+def test_current_setting_carries_the_args_the_best_was_launched_with(tmp_path, recorded):
+    """The operator's base args reach the launcher, not only the optimizer's delta over them."""
+    state = SharedState(session_id="t", framework="vllm", reference_model="/models/M")
+    state.current_best = {
+        "extra_server_args": "",
+        "extra_envs": {},
+        "measurement": {"launch_evidence": {"requested_server_args": recorded}},
+    }
+    state.save(tmp_path)
+
+    from hyperloom.inference_optimizer.reference_script import parse_reference_script
+
+    recipe = parse_reference_script(str(tmp_path / "current_setting.sh"), framework="vllm")
+    assert recipe.server_args == (
+        '--moe-backend aiter --speculative-config {"method":"dspark","num_speculative_tokens":5} --max-num-seqs 128'
+    )
+
+
+def test_save_current_setting_prefers_persisted_framework(tmp_path, monkeypatch):
+    """A resumed session must not inherit an unrelated process framework."""
+    monkeypatch.setenv("FRAMEWORK", "sglang")
+    sd = tmp_path / "session"
+    sd.mkdir()
+    state = SharedState(session_id="t", model_name="m", model_path="/x/m")
+    state.framework = "vllm"
+    state.current_best = {"extra_server_args": "--kv-cache-dtype fp8", "extra_envs": {}}
+
+    state.save(sd)
+
+    text = (sd / "current_setting.sh").read_text(encoding="utf-8")
+    assert "vllm serve" in text
+    assert "sglang.launch_server" not in text
+
+
+@pytest.mark.parametrize("pythonpath_source", ["unset", "empty", "inherited", "configured"])
+def test_saved_current_setting_loads_overlay_in_child(tmp_path, pythonpath_source):
+    """A saved recipe loads the literal overlay ahead of the prior import path."""
+    overlay = tmp_path / "overlay ' $literal $(touch injected_dollar) `touch injected_backtick`"
+    package = overlay / "sglang"
+    package.mkdir(parents=True)
+    (overlay / "sitecustomize.py").write_text("")
+    (package / "__init__.py").write_text("")
+    (overlay / "overlay_probe.py").write_text("VALUE = 'selected overlay'\n")
+    (package / "launch_server.py").write_text(
+        "import json, os, sys\n"
+        "import overlay_probe\n"
+        "print(json.dumps({'pythonpath': os.environ['PYTHONPATH'], "
+        "'selected': overlay_probe.VALUE, 'argv': sys.argv[1:]}))\n"
+    )
+    inherited = tmp_path / "inherited path"
+    configured = tmp_path / "configured path"
+    for path in [inherited, configured]:
+        path.mkdir()
+        (path / "overlay_probe.py").write_text("VALUE = 'prior import path'\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    python = bindir / "python3"
+    python.write_text(f'#!/usr/bin/env bash\nexec {shlex.quote(sys.executable)} -B "$@"\n')
+    python.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bindir}:{os.defpath}")
+    env.pop("PYTHONPATH", None)
+    prior = ""
+    if pythonpath_source == "empty":
+        env["PYTHONPATH"] = ""
+    elif pythonpath_source in ("inherited", "configured"):
+        env["PYTHONPATH"] = str(inherited)
+        prior = str(inherited)
+    extra_envs = {}
+    if pythonpath_source == "configured":
+        extra_envs["PYTHONPATH"] = str(configured)
+        prior = str(configured)
+    state = SharedState(session_id="overlay", framework="sglang", reference_model="/models/M")
+    state.current_best = {
+        "extra_server_args": "--max-running-requests 4",
+        "extra_envs": extra_envs,
+        "final_overlay": str(overlay),
+    }
+    session = tmp_path / "session"
+    session.mkdir()
+    state.save(session)
+    restored = SharedState.load_or_init(session)
+    assert restored.current_best["final_overlay"] == str(overlay)
+    restored.save(session)
+
+    result = subprocess.run(
+        ["bash", "-eu", str(session / "current_setting.sh")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+
+    observed = json.loads(result.stdout)
+    assert observed["selected"] == "selected overlay"
+    assert observed["pythonpath"] == str(overlay) + (":" + prior if prior else "")
+    assert observed["argv"] == ["--model-path=/models/M", "--max-running-requests", "4"]
+    assert not (tmp_path / "injected_dollar").exists()
+    assert not (tmp_path / "injected_backtick").exists()
+
+
+@pytest.mark.parametrize("overlay", [None, ""])
+def test_current_setting_without_overlay_is_unchanged(tmp_path, overlay):
+    state = SharedState(session_id="plain", framework="sglang", reference_model="/models/M", tp=2)
+    state.current_best = {
+        "extra_server_args": "--max-running-requests 4",
+        "extra_envs": {"SGLANG_USE_AITER": "1"},
+    }
+    if overlay is not None:
+        state.current_best["final_overlay"] = overlay
+
+    state.save(tmp_path)
+
+    assert (tmp_path / "current_setting.sh").read_text() == (
+        "#!/usr/bin/env bash\n"
+        "# Auto-generated by hyperloom — current best launch recipe.\n"
+        "export MODEL=/models/M\n"
+        "export TP=2\n"
+        "export SGLANG_USE_AITER=1\n"
+        "\n"
+        "python3 -m sglang.launch_server --model-path=$MODEL --max-running-requests 4\n"
+    )
+
+
+def test_save_no_current_setting_when_no_best(tmp_path):
+    """No current_best → no current_setting.sh (0-degrade)."""
+    sd = tmp_path / "session"
+    sd.mkdir()
+    s = SharedState(session_id="t", model_name="m", model_path="/x/m")
+    s.save(sd)
+    assert not (sd / "current_setting.sh").exists()
+
+
+@pytest.mark.parametrize("invalid", [{"final_overlay": "/missing-overlay"}, {"unset_envs": ["PYTHONPATH"]}])
+def test_failed_current_setting_export_removes_stale_launcher_but_preserves_state(tmp_path, caplog, invalid):
+    state = SharedState(session_id="invalid-export", framework="sglang")
+    state.current_best = {"tput": 100.0, "extra_server_args": "--tp 8", "extra_envs": {"SGLANG_USE_AITER": "1"}}
+    state.save(tmp_path)
+    launcher = tmp_path / "current_setting.sh"
+    assert launcher.is_file()
+    state.current_best.update(invalid)
+    state.save(tmp_path)
+    assert not launcher.exists()
+    assert SharedState.load_or_init(tmp_path).current_best == state.current_best
+    assert "current_setting.sh render failed" in caplog.text
+
+
+def test_save_current_setting_includes_workload_identity(tmp_path, monkeypatch):
+    """current_setting.sh emits TP, MAX_MODEL_LEN, GPU_TYPE when set."""
+    monkeypatch.setenv("FRAMEWORK", "vllm")
+    sd = tmp_path / "session"
+    sd.mkdir()
+    s = SharedState(session_id="t", model_name="m", model_path="/x/m")
+    s.tp = 8
+    s.max_model_len = 65536
+    s.gpu_type = "mi300x"
+    s.current_best = {"extra_server_args": "--mem-fraction-static 0.8", "extra_envs": {}}
+    s.save(sd)
+    text = (sd / "current_setting.sh").read_text(encoding="utf-8")
+    assert "export TP=8" in text
+    assert "export MAX_MODEL_LEN=65536" in text
+    assert "export GPU_TYPE=mi300x" in text

@@ -1,0 +1,838 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Coverage for Coordinator pure/sync helper methods."""
+
+from __future__ import annotations
+
+import pytest
+
+from hyperloom.orchestrator.roles import (
+    Backend,
+    MockBackend,
+    ScriptedPlan,
+)
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.state.objective import TargetGainObjective
+from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
+from hyperloom.orchestrator.knowledge.recipe_journal import (
+    workload_kb_tags,
+)
+from hyperloom.orchestrator.loop.dispatcher import HeldLeases
+
+
+def _heartbeat() -> Intent:
+    return Intent(type=IntentType.SEND_MESSAGE, payload={"topic": "heartbeat", "body_md": "ok"})
+
+
+def _silent_plan() -> ScriptedPlan:
+    return ScriptedPlan(turns=[], default_intent=_heartbeat())
+
+
+def _build_backends() -> dict[str, Backend]:
+    return {name: MockBackend(_silent_plan(), name=name) for name in ("orchestration", "critic")}
+
+
+@pytest.fixture
+def coord(session_dir) -> Coordinator:
+    return Coordinator(session_dir, backends=_build_backends())
+
+
+# -- The specialist wall-clock deadline ------------------------------------
+def test_specialist_wall_budget_base_no_macro_cycle(coord: Coordinator) -> None:
+    # macro_cycle == 0 → base mode values (research 10min / patch 60min).
+    coord.shared_state.macro_cycle = 0
+    assert coord.dispatcher._specialist_wall_budget_sec(params={"mode": "research"}) == 10 * 60
+    assert coord.dispatcher._specialist_wall_budget_sec(params={"mode": "patch"}) == 60 * 60
+
+
+def test_specialist_wall_budget_macro_cycle_amplifies(coord: Coordinator) -> None:
+    coord.shared_state.macro_cycle = 1
+    assert coord.dispatcher._specialist_wall_budget_sec(params={"mode": "research"}) == 20 * 60
+    assert coord.dispatcher._specialist_wall_budget_sec(params={"mode": "patch"}) == 120 * 60
+
+
+def test_specialist_wall_budget_caps_at_4h(coord: Coordinator) -> None:
+    coord.shared_state.macro_cycle = 10
+    assert coord.dispatcher._specialist_wall_budget_sec(params={"mode": "patch"}) == 240 * 60
+    assert coord.dispatcher._specialist_wall_budget_sec(params={"mode": "research"}) == 110 * 60
+
+
+def test_bench_specialist_budget_covers_rebench_timeout(coord: Coordinator) -> None:
+    """Bench-capable specialists receive enough time for their advertised rebench."""
+    from hyperloom.orchestrator.bus.gpu_pool import GPU_LEASE_TTL_GRACE
+    from hyperloom.orchestrator.actions.executors._subprocess_kill import resolve_benchmark_timeouts
+
+    params = {"scope": "domain", "mode": "patch", "bench": True}
+    budget = coord.dispatcher._specialist_wall_budget_sec(params=params)
+
+    assert budget == max(60 * 60, resolve_benchmark_timeouts()[1] + 10 * 60)
+    assert coord.dispatcher.gpu_lease_ttl_sec(params=params) == pytest.approx(
+        int(budget * (1.0 + GPU_LEASE_TTL_GRACE)), abs=2
+    )
+
+
+def test_specialist_deadline_does_not_outlast_the_session(coord: Coordinator) -> None:
+    """A profile floor cannot extend a finite session past its own budget."""
+    coord.shared_state.max_minutes = 30
+    coord.shared_state.begin_leg()
+
+    deadline = coord.dispatcher._specialist_deadline(params={"scope": "domain", "mode": "patch", "bench": True})
+
+    assert deadline.remaining() == pytest.approx(30 * 60, abs=2)
+
+
+def test_a_spent_session_yields_an_expired_specialist_deadline(coord: Coordinator) -> None:
+    """An exhausted budget must tighten the specialist bound, never remove it."""
+    import time as _time
+
+    coord.shared_state.max_minutes = 30
+    coord.shared_state.begin_leg(now_unix=_time.time() - 3_600.0)
+
+    ample = coord.dispatcher._specialist_deadline(params={"mode": "patch"})
+    coord.shared_state.max_minutes = 240
+    coord.shared_state.begin_leg()
+    fresh = coord.dispatcher._specialist_deadline(params={"mode": "patch"})
+
+    assert ample.expired()
+    assert not fresh.expired()
+    assert ample.remaining() < fresh.remaining()
+
+
+def _phase_with_minutes_left(coord: Coordinator, monkeypatch: pytest.MonkeyPatch, phase: str, minutes: float) -> None:
+    from hyperloom.orchestrator.phases import machine_state
+
+    coord.shared_state.baseline_tput = 800.0
+    coord.shared_state.phase = phase
+    monkeypatch.setattr(machine_state, "phase_budget_remaining_seconds", lambda _state, **_kw: minutes * 60.0)
+
+
+def test_a_specialist_dispatched_in_a_gated_phase_stops_at_the_phase_end(
+    coord: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither its dispatch deadline nor a later lease extension carries a specialist past its phase's end."""
+    from types import SimpleNamespace
+
+    from hyperloom.orchestrator.specialists import wall_budget
+
+    _phase_with_minutes_left(coord, monkeypatch, "FRAMEWORK_AGENT", 15)
+    task = SimpleNamespace(task_id="spec-phase-end", kind="specialist", params={"mode": "patch"})
+
+    context = coord.dispatcher._dispatch_context(task)
+
+    try:
+        assert context["specialist_deadline"].remaining() == pytest.approx(15 * 60, abs=2)
+        assert wall_budget.grant_wall_budget_extension(task.task_id, 600) == 0.0
+    finally:
+        wall_budget.limit_wall_budget_extension(task.task_id, None)
+        wall_budget.clear_wall_budget_extension(task.task_id)
+
+
+def test_a_specialist_is_admitted_when_its_shortest_run_fits_the_phase(
+    coord: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admission asks for a mode's base budget, not the full wall budget the dispatch then tightens."""
+    _phase_with_minutes_left(coord, monkeypatch, "FRAMEWORK_AGENT", 30)
+
+    assert coord.dispatcher.admission_denial_for_action("specialist", params={"mode": "research"}) is None
+    denied = coord.dispatcher.admission_denial_for_action("specialist", params={"mode": "patch"})
+    assert denied is not None and denied.rule == "phase_time_budget"
+
+
+# -- GPU lease TTL re-source + structured-finally release -------------------
+def test_gpu_lease_ttl_grace_over_wall_budget(coord: Coordinator) -> None:
+    # TTL = wall_budget × (1 + grace); lease must outlive the kill.
+    from hyperloom.orchestrator.bus.gpu_pool import GPU_LEASE_TTL_GRACE
+
+    coord.shared_state.macro_cycle = 0
+    budget = coord.dispatcher._specialist_wall_budget_sec(params={"mode": "patch"})  # 3600
+    ttl = int(budget * (1.0 + GPU_LEASE_TTL_GRACE))
+    assert ttl == int(3600 * 1.1)
+    assert ttl >= budget
+    assert coord.dispatcher.gpu_lease_ttl_sec(params={"mode": "patch"}) == pytest.approx(ttl, abs=2)
+
+
+def test_run_dispatched_releases_gpu_lease_on_success(coord: Coordinator) -> None:
+    import asyncio
+
+    released: list[object] = []
+
+    class _Task:
+        task_id = "tg-ok"
+        kind = "explore"
+        requires_lanes: list = []
+
+    async def _fake_run_task(task, *, prebound_lease=None, extra_context=None, release_resources=None):
+        await release_resources()
+        return "RESULT"
+
+    async def _fake_release(lease):
+        released.append(lease)
+
+    coord.sub.run_task = _fake_run_task
+    coord.gpu_specialist_pool.release = _fake_release
+    sentinel_lease = object()
+    out = asyncio.run(
+        coord.dispatcher.run_task_registered(
+            _Task(), HeldLeases(prebound_lease=None, gpu_lease=sentinel_lease), extra_context={}
+        )
+    )
+    assert out == "RESULT"
+    assert released == [sentinel_lease]
+
+
+def test_run_dispatched_releases_gpu_lease_on_exception(coord: Coordinator) -> None:
+    import asyncio
+
+    released: list[object] = []
+
+    class _Task:
+        task_id = "tg-boom"
+        kind = "explore"
+        requires_lanes: list = []
+
+    async def _boom(task, *, prebound_lease=None, extra_context=None, release_resources=None):
+        try:
+            raise RuntimeError("subprocess crashed")
+        finally:
+            await release_resources()
+
+    async def _fake_release(lease):
+        released.append(lease)
+
+    coord.sub.run_task = _boom
+    coord.gpu_specialist_pool.release = _fake_release
+    sentinel_lease = object()
+    with pytest.raises(RuntimeError, match="subprocess crashed"):
+        asyncio.run(
+            coord.dispatcher.run_task_registered(
+                _Task(), HeldLeases(prebound_lease=None, gpu_lease=sentinel_lease), extra_context={}
+            )
+        )
+    # lease released via finally even though run_task raised.
+    assert released == [sentinel_lease]
+
+
+def test_run_dispatched_no_gpu_lease_is_noop(coord: Coordinator) -> None:
+    import asyncio
+
+    called: list[object] = []
+
+    class _Task:
+        task_id = "tc-cpu"
+        kind = "report"
+        requires_lanes: list = []
+
+    async def _fake_run_task(task, *, prebound_lease=None, extra_context=None, release_resources=None):
+        await release_resources()
+        return "CPU"
+
+    async def _fake_release(lease):
+        called.append(lease)
+
+    coord.sub.run_task = _fake_run_task
+    coord.gpu_specialist_pool.release = _fake_release
+    out = asyncio.run(
+        coord.dispatcher.run_task_registered(_Task(), HeldLeases(prebound_lease=None, gpu_lease=None), extra_context={})
+    )
+    assert out == "CPU"
+    assert called == []  # no GPU lease → release never called
+
+
+# -- static / pure helpers -------------------------------------------------
+def test_gap_layer_for_action(coord: Coordinator) -> None:
+    assert coord.gap_refresh._gap_layer_for_action("kernel_opt") == ("kernel_agent", "kernel_switch_specialist")
+    assert coord.gap_refresh._gap_layer_for_action("profile") == ("kernel_agent", "kernel_switch_specialist")
+    assert coord.gap_refresh._gap_layer_for_action("sweep") == ("framework", "serving_specialist")
+    assert coord.gap_refresh._gap_layer_for_action("baseline") == ("system", "system_specialist")
+    assert coord.gap_refresh._gap_layer_for_action("anything-else") == ("framework", "serving_specialist")
+
+
+def test_lanes_fit(coord: Coordinator) -> None:
+    assert coord.dispatcher._lanes_fit(["gpu"], {"gpu": 0}, {"gpu": 1}) is True
+    assert coord.dispatcher._lanes_fit(["gpu"], {"gpu": 1}, {"gpu": 1}) is False
+    assert coord.dispatcher._lanes_fit(["gpu"], {}, {"gpu": 0}) is False
+
+
+def test_pitfall_severity_for(coord: Coordinator) -> None:
+    assert coord.recipe_journal._pitfall_severity_for(None) is None
+    assert coord.recipe_journal._pitfall_severity_for({"error_class": "oom"}) is not None
+    assert coord.recipe_journal._pitfall_severity_for({"status": "crash"}) is not None
+    assert coord.recipe_journal._pitfall_severity_for({"gain_pct": -10.0}) is not None
+    assert coord.recipe_journal._pitfall_severity_for({"gain_pct": 2.0}) is None
+    assert coord.recipe_journal._pitfall_severity_for({"gain_pct": "bad"}) is None
+
+
+def test_is_promotable_result(coord: Coordinator) -> None:
+    assert coord.writeback.is_promotable_result("sweep", {"status": "succeeded"}) is True
+    assert coord.writeback.is_promotable_result("sweep", {"status": "failed"}) is False
+    assert coord.writeback.is_promotable_result("replay_warm_recipe", {"status": "failed"}) is True
+    assert coord.writeback.is_promotable_result("explore", {"status": "ok"}) is True
+    assert coord.writeback.is_promotable_result("explore", {"status": "failed"}) is False
+
+
+def test_is_promotable_result_baseline_eval_failed(coord: Coordinator) -> None:
+    measured = {"output_throughput": 1000.0, "completed_requests": 10}
+    assert coord.writeback.is_promotable_result("baseline", measured) is True
+    eval_failed = {**measured, "baseline_eval_failed": True}
+    assert coord.writeback.is_promotable_result("baseline", eval_failed) is False
+    # profile with the same key still promotes (blocker is baseline-only).
+    assert coord.writeback.is_promotable_result("profile", eval_failed) is True
+
+
+# -- phase / id helpers ----------------------------------------------------
+def test_journal_entry_phase(coord: Coordinator) -> None:
+    coord.shared_state.phase = ""
+    assert coord.recipe_journal.journal_entry_phase() == "UNKNOWN"
+    coord.shared_state.phase = "framework_agent"
+    assert coord.recipe_journal.journal_entry_phase() == "FRAMEWORK_AGENT"
+
+
+def test_source_session_id_prefers_recipe_kb(coord: Coordinator) -> None:
+    coord.shared_state.recipe_kb_session_id = "recipe-kb-99"
+    assert coord.recipe_journal._source_session_id() == "recipe-kb-99"
+    coord.shared_state.recipe_kb_session_id = ""
+    assert coord.recipe_journal._source_session_id() == coord.session_dir.name
+
+
+def test_internal_analysis_kind(coord: Coordinator) -> None:
+    coord.shared_state.enable_roofline = True
+    assert coord.phase_prelude.internal_analysis_kind() == "roofline"
+    coord.shared_state.enable_roofline = False
+    assert coord.phase_prelude.internal_analysis_kind() == "profile"
+
+
+# -- watermark / tput projection ------------------------------------------
+def test_current_tput_from_validated_gain(coord: Coordinator) -> None:
+    coord.shared_state.baseline_tput = 0.0
+    assert coord.phase_kernel.current_tput_from_validated_gain() == 0.0
+    coord.shared_state.baseline_tput = 100.0
+    coord.shared_state.cumulative_gain_validated = 10.0
+    assert coord.phase_kernel.current_tput_from_validated_gain() == pytest.approx(110.0)
+
+
+def test_needs_roofline_for_watermark_guards(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    # pending roofline -> never re-arm
+    ss.auto_roofline_pending_task_id = "task-1"
+    assert coord.phase_kernel._needs_roofline_for_watermark() is False
+    # no last roofline, no failure streak -> bootstrap guard
+    ss.auto_roofline_pending_task_id = ""
+    ss.last_roofline_tput = 0.0
+    ss.roofline_failure_streak = 0
+    assert coord.phase_kernel._needs_roofline_for_watermark() is False
+    # crossing the watermark over last roofline
+    ss.last_roofline_tput = 100.0
+    ss.baseline_tput = 100.0
+    ss.cumulative_gain_validated = 50.0
+    assert coord.phase_kernel._needs_roofline_for_watermark() is True
+
+
+# -- gap extraction --------------------------------------------------------
+def test_extract_gaps_from_baseline_empty(coord: Coordinator) -> None:
+    coord.shared_state.baseline_tput = 0.0
+    assert coord.gap_refresh._extract_gaps_from_baseline(coord.recipe_journal.workload_canonical_id()) == []
+
+
+def test_extract_gaps_from_baseline_populated(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.baseline_tput = 100.0
+    coord._current_objective = TargetGainObjective(target_gain_pct=12.0)
+    ss.baseline_failure_streak = 2
+    gaps = coord.gap_refresh._extract_gaps_from_baseline(coord.recipe_journal.workload_canonical_id())
+    ids = {g["canonical_id"].split("#")[-1] for g in gaps}
+    assert "throughput_below_target" in ids
+    assert "baseline_unstable" in ids
+    sev = {g["canonical_id"].split("#")[-1]: g["severity"] for g in gaps}
+    assert sev["throughput_below_target"] == "high"
+    assert sev["baseline_unstable"] == "high"
+
+
+def test_extract_gaps_from_attempts(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.baseline_tput = 100.0
+    ss.last_action_failures = [
+        {"action": "kernel_opt", "error_class": "oom", "variant_name": "v1"},
+        {"action": "kernel_opt", "error_class": "oom", "variant_name": "v2"},
+    ]
+    ss.params_no_promote_streak = 6
+    ss.explore_search = {"winners_history": []}
+    gaps = coord.gap_refresh._extract_gaps_from_attempts(coord.recipe_journal.workload_canonical_id())
+    cids = {g["canonical_id"] for g in gaps}
+    # distinct variant_names produce separate gaps; each has one attempt
+    fail_gaps = [g for g in gaps if "fail:kernel_opt:oom" in g["canonical_id"]]
+    assert len(fail_gaps) == 2
+    assert all(len(g["attempts"]) == 1 for g in fail_gaps)
+    # explore plateau gap fires at streak >= 3; >= 6 escalates it to high
+    plateau = [g for g in gaps if g["canonical_id"].endswith("explore_plateau")][0]
+    assert plateau["severity"] == "high"
+    assert cids
+
+
+def test_extract_gaps_no_variant_collapses(coord: Coordinator) -> None:
+    """Rows without variant_name still collapse into one gap (backward compat)."""
+    ss = coord.shared_state
+    ss.baseline_tput = 100.0
+    ss.last_action_failures = [
+        {"action": "explore", "error_class": "server_init_dead"},
+        {"action": "explore", "error_class": "server_init_dead"},
+    ]
+    ss.params_no_promote_streak = 0
+    ss.explore_search = {}
+    gaps = coord.gap_refresh._extract_gaps_from_attempts(coord.recipe_journal.workload_canonical_id())
+    fail_gaps = [g for g in gaps if "fail:explore:server_init_dead" in g["canonical_id"]]
+    assert len(fail_gaps) == 1
+    assert len(fail_gaps[0]["attempts"]) == 2
+
+
+def test_extract_gaps_symptom_uses_excerpt(coord: Coordinator) -> None:
+    """Symptom is built from the first non-empty excerpt line when available."""
+    ss = coord.shared_state
+    ss.baseline_tput = 100.0
+    ss.last_action_failures = [
+        {
+            "action": "explore",
+            "error_class": "server_init_dead",
+            "variant_name": "fp8_kv",
+            "error_excerpt": "mla_gluon[bh16bn128] requires batch_size=1, got 512",
+        },
+    ]
+    ss.params_no_promote_streak = 0
+    ss.explore_search = {}
+    gaps = coord.gap_refresh._extract_gaps_from_attempts(coord.recipe_journal.workload_canonical_id())
+    fail_gaps = [g for g in gaps if "fail:explore:server_init_dead" in g["canonical_id"]]
+    assert fail_gaps
+    assert "mla_gluon" in fail_gaps[0]["symptom"]
+
+
+# -- advisory blocks (empty-guard paths) ----------------------------------
+def test_advisory_blocks_empty_by_default(coord: Coordinator) -> None:
+    assert coord.conversation.plateau_advisory_block() == ""
+    assert coord.conversation.target_gap_advisory_block() == ""
+    assert coord.conversation._current_primary_gap() is None
+    assert coord.conversation._priors_match_advisory_block() == ""
+
+
+# -- specialist findings block --------------------------------------------
+def _round(domain: str, finding: str, confidence, questions=()) -> dict:
+    return {
+        "domain": domain,
+        "confidence": confidence,
+        "new_findings": [finding],
+        "residual_questions": list(questions),
+    }
+
+
+def _findings(coord: Coordinator) -> str:
+
+    return coord.conversation._specialist_findings_block()
+
+
+def test_specialist_findings_survive_a_non_numeric_confidence(coord: Coordinator) -> None:
+    """``confidence`` is an audit field, so no value of it can drop the section.
+
+    It reaches the row straight from the specialist's own JSON, and the schema
+    invites a free-form self-assessment, so a string or a dict there must not
+    cost every domain its findings.
+    """
+    coord.shared_state.specialist_rounds = [
+        _round("serving_specialist", "kv cache is the bottleneck", "high"),
+        _round("comm_specialist", "all_reduce dominates", {"level": "high"}),
+        _round("kernel_specialist", "gemm is fine", 0.7, questions=["what about fp8?"]),
+    ]
+
+    block = _findings(coord)
+
+    assert "kv cache is the bottleneck" in block
+    assert "all_reduce dominates" in block
+    assert "gemm is fine" in block
+    assert "[kernel_specialist] what about fp8?" in block
+
+
+def test_specialist_findings_are_ordered_newest_first(coord: Coordinator) -> None:
+    coord.shared_state.specialist_rounds = [
+        _round("serving_specialist", "older finding", 0.9),
+        _round("comm_specialist", "newer finding", 0.1),
+    ]
+
+    block = _findings(coord)
+
+    assert block.index("newer finding") < block.index("older finding")
+
+
+def test_specialist_findings_render_a_harvested_finding_once(coord: Coordinator) -> None:
+    """Harvesting copies a round's sourced findings into research hints; the block still shows each once."""
+    from hyperloom.inference_optimizer.baseline_comparison import research_hints
+
+    finding = {"what": "ngram spec decode stacks with expert parallel", "source": "measured r41"}
+    coord.shared_state.specialist_rounds = [_round("serving_specialist", finding, 0.8)]
+    research_hints.append_hints(coord.session_dir, [finding])
+
+    assert _findings(coord).count("ngram spec decode stacks with expert parallel") == 1
+
+
+def test_specialist_findings_keep_the_newest_within_their_budget(coord: Coordinator, monkeypatch) -> None:
+    from hyperloom.orchestrator.loop import conversation
+
+    monkeypatch.setattr(conversation, "_FINDINGS_PROMPT_CHARS", 200)
+    coord.shared_state.specialist_rounds = [
+        _round("serving_specialist", f"finding-{i:02d} " + "x" * 40, 0.5) for i in range(10)
+    ]
+
+    block = _findings(coord)
+
+    assert "finding-09" in block
+    assert "finding-00" not in block
+    assert "older omitted)" in block
+
+
+def test_specialist_findings_skip_rows_carrying_neither_findings_nor_questions(coord: Coordinator) -> None:
+    coord.shared_state.specialist_rounds = [
+        {"domain": "serving_specialist", "new_findings": [], "residual_questions": []},
+        "not a dict",
+    ]
+
+    assert _findings(coord) == ""
+    assert coord.conversation._recent_proposed_variants() == []
+
+
+def test_recent_proposed_variants_dedup(coord: Coordinator) -> None:
+    coord.shared_state.specialist_rounds = [
+        {"proposal_set": [{"name": "a"}, {"name": "b"}]},
+        {"proposal_set": [{"name": "b"}, {"name": "c"}, "not-a-dict"]},
+    ]
+    out = coord.conversation._recent_proposed_variants()
+    names = {v["name"] for v in out}
+    assert names == {"a", "b", "c"}
+
+
+# -- warm recipe + workload tags ------------------------------------------
+def test_warm_recipe_proven_items(coord: Coordinator) -> None:
+    coord.shared_state.warm_start_recipe = {}
+    assert coord.phase_prelude.warm_recipe_proven_items() == []
+    coord.shared_state.warm_start_recipe = {
+        "recipe": {
+            "attrs": {
+                "what_worked": [
+                    {"name": "fp8", "source": "kb"},
+                    {"name": "", "source": "skip"},
+                    "not-a-dict",
+                ]
+            }
+        },
+    }
+    out = coord.phase_prelude.warm_recipe_proven_items()
+    assert out == [{"name": "fp8", "source": "kb"}]
+
+
+def test_collect_workload_tags(coord: Coordinator, monkeypatch) -> None:
+    """The whole tag dict, because these keys are the warm-start reader's filter."""
+    monkeypatch.delenv("EP", raising=False)
+    ss = coord.shared_state
+    ss.framework = "sglang"
+    ss.model_class = "moe"
+    ss.model_name = "Qwen3-32B"
+    ss.precision = "fp8"
+    ss.tp = 8
+    ss.ep = 4
+    ss.conc = 64
+    ss.isl = 1024
+    ss.osl = 128
+    ss.max_model_len = 8192
+    ss.stack_fingerprint_meta = {
+        "sglang": "0.4.6",
+        "rocm": "6.3.1",
+        "aiter": "0.1.2",
+        "image_digest": "sha256:abc",
+    }
+    ss.baseline_workload_extra = {
+        "max_running_requests": 256,
+        "max_num_seqs": 128,
+        # A disabled toggle is a tag, not an absence.
+        "chunked_prefill_enabled": False,
+        "enable_torch_compile": True,
+        "quant_scheme": "  fp8_block  ",
+        "workload_mode": "serving",
+    }
+
+    assert workload_kb_tags(coord.shared_state) == {
+        "framework": "sglang",
+        "model_class": "moe",
+        "model_name": "Qwen3-32B",
+        "precision": "fp8",
+        "tp": 8,
+        "ep": 4,
+        "conc": 64,
+        "isl": 1024,
+        "osl": 128,
+        "max_model_len": 8192,
+        "framework_version": "0.4.6",
+        "rocm_version": "6.3.1",
+        "aiter_version": "0.1.2",
+        "image_digest": "sha256:abc",
+        "max_running_requests": 256,
+        "max_num_seqs": 128,
+        "chunked_prefill_enabled": False,
+        "enable_torch_compile": True,
+        "quant_scheme": "fp8_block",
+        "workload_mode": "serving",
+    }
+
+
+def test_workload_tags_read_ep_from_the_env_only_without_a_shared_state_value(coord: Coordinator, monkeypatch) -> None:
+    """``$EP`` is the legacy-SDK fallback."""
+    monkeypatch.setenv("EP", "2")
+    ss = coord.shared_state
+    ss.ep = 8
+
+    tags = workload_kb_tags(coord.shared_state)
+    assert tags["ep"] == 8
+
+    ss.ep = 0
+    assert workload_kb_tags(coord.shared_state)["ep"] == 2
+
+
+def test_an_unparseable_or_non_positive_parallelism_env_is_not_tagged(coord: Coordinator, monkeypatch) -> None:
+    monkeypatch.setenv("EP", "two")
+
+    tags = workload_kb_tags(coord.shared_state)
+    assert "ep" not in tags
+
+
+def test_workload_tags_survive_a_resumed_null_fingerprint_meta(coord: Coordinator, monkeypatch) -> None:
+    """``state.json`` is a system boundary: a null where a dict is declared must not raise here."""
+    monkeypatch.delenv("EP", raising=False)
+    ss = coord.shared_state
+    ss.framework = "vllm"
+    ss.model_class = ""
+    ss.stack_fingerprint_meta = None
+    ss.baseline_workload_extra = None
+
+    assert workload_kb_tags(coord.shared_state) == {"framework": "vllm"}
+
+
+def test_unknown_and_empty_fingerprint_entries_are_not_tagged(coord: Coordinator, monkeypatch) -> None:
+    monkeypatch.delenv("EP", raising=False)
+    ss = coord.shared_state
+    ss.framework = "vllm"
+    ss.model_class = ""
+    ss.stack_fingerprint_meta = {
+        "vllm": "unknown",
+        "rocm": "",
+        "aiter": "unknown",
+        "image_digest": "sha256:abc",
+    }
+
+    tags = workload_kb_tags(coord.shared_state)
+    assert tags == {"framework": "vllm", "image_digest": "sha256:abc"}
+
+
+# -- phase denial gate -----------------------------------------------------
+def test_the_coordinator_revalidation_baseline_is_not_phase_denied(coord: Coordinator) -> None:
+    """The revalidation pump prices its own action and never runs the phase gate."""
+    coord.shared_state.phase = "ENABLEMENT"
+    assert coord.dispatcher.time_budget_denial_for_action("baseline") is None
+    assert coord.dispatcher.admission_denial_for_action("baseline") is not None
+
+
+# -- sequence denial gates -------------------------------------------------
+def test_sequence_denial_for_action(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.stop_reason = ""
+    ss.baseline_tput = 0.0
+    # non-sequence action -> never denied
+    assert coord.dispatcher._sequence_denial_for_action("frobnicate") is None
+    # baseline itself allowed pre-baseline
+    assert coord.dispatcher._sequence_denial_for_action("baseline") is None
+    # explore denied until baseline measured
+    denied = coord.dispatcher._sequence_denial_for_action("explore")
+    assert denied is not None and denied.rule == "execution_order"
+    # once baseline measured -> allowed
+    ss.baseline_tput = 100.0
+    assert coord.dispatcher._sequence_denial_for_action("explore") is None
+
+
+def test_admission_denial_for_request(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.stop_reason = ""
+    ss.baseline_tput = 0.0
+    # non-kernel target -> not gated
+    assert coord.dispatcher.admission_denial_for_request("orchestration", "anything") is None
+    # trace_analyze always allowed
+    assert coord.dispatcher.admission_denial_for_request("kernel_agent", "trace_analyze") is None
+    # unknown handler kind -> not gated
+    assert coord.dispatcher.admission_denial_for_request("kernel_agent", "no_such_kind") is None
+
+
+def test_a_kernel_request_the_phase_cannot_fit_is_refused(coord: Coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request runs its handler inline, so admission is the only point the phase budget can refuse it."""
+    _phase_with_minutes_left(coord, monkeypatch, "KERNEL_AGENT", 10)
+
+    denied = coord.dispatcher.admission_denial_for_request("kernel_agent", "apply_patch")
+
+    assert denied is not None and denied.rule == "phase_time_budget"
+    assert "action='integrate'" in str(denied)
+
+
+def test_skip_gemm_tuning_env(coord: Coordinator, monkeypatch) -> None:
+    monkeypatch.delenv("INFERENCE_OPTIMIZER_SKIP_GEMM_TUNING", raising=False)
+    assert coord.phase_kernel._skip_gemm_tuning() is False
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_SKIP_GEMM_TUNING", "yes")
+    assert coord.phase_kernel._skip_gemm_tuning() is True
+
+
+def test_gemm_tuning_required_before_kernel_opt(coord: Coordinator, monkeypatch) -> None:
+    monkeypatch.delenv("INFERENCE_OPTIMIZER_SKIP_GEMM_TUNING", raising=False)
+    ss = coord.shared_state
+    ss.last_gemm_tuning = {}
+    # Any precision on a supported framework is eligible.
+    ss.framework = "sglang"
+    ss.precision = "fp16"
+    assert coord.phase_kernel._gemm_tuning_required_before_kernel_opt() is True
+    ss.precision = "bf16"
+    assert coord.phase_kernel._gemm_tuning_required_before_kernel_opt() is True
+    # Unsupported framework -> not eligible.
+    ss.framework = "trt-llm"
+    assert coord.phase_kernel._gemm_tuning_required_before_kernel_opt() is False
+    # Supported framework + terminal status -> not required.
+    ss.framework = "sglang"
+    ss.precision = "fp8"
+    ss.last_gemm_tuning = {"status": "succeeded"}
+    assert coord.phase_kernel._gemm_tuning_required_before_kernel_opt() is False
+
+
+# -- canonical id helpers --------------------------------------------------
+def test_workload_canonical_id_and_anchor(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.model_name = "Qwen3-32B"
+    ss.gpu_type = "mi300x"
+    ss.framework = "sglang"
+    ss.precision = "fp8"
+    cid = coord.recipe_journal.workload_canonical_id()
+    assert cid.startswith("inference:")
+    assert "mi300x" in cid
+    assert coord.recipe_journal.workload_canonical_id() == cid
+
+
+# -- framework candidate selection -------------------------------------
+def test_select_next_framework_agent_candidate(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.framework_agent_batches = []
+    assert coord.phase_framework._select_next_framework_agent_candidate() is None
+    ss.framework_agent_batches = [
+        {
+            "candidates": [
+                {"candidate_id": "c1"},
+                {"candidate_id": "c2"},
+            ],
+        }
+    ]
+    ss.framework_agent_phase_progress = [{"candidate_id": "c1"}]
+    nxt = coord.phase_framework._select_next_framework_agent_candidate()
+    assert nxt == {"candidate_id": "c2"}
+
+
+def test_unprocessed_framework_agent_candidates(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.framework_agent_batches = [
+        {
+            "candidates": [
+                {"candidate_id": "c1"},
+                {"candidate_id": "c2"},
+                {"candidate_id": "c3"},
+            ],
+        }
+    ]
+    ss.framework_agent_phase_progress = [{"candidate_id": "c1"}]
+    out = coord.phase_framework._unprocessed_framework_agent_candidates()
+    assert [c["candidate_id"] for c in out] == ["c2", "c3"]
+
+
+def test_select_next_framework_agent_candidate_takes_discovery_order(coord: Coordinator) -> None:
+    """Selection is linear: the discovery specialist already ranked the batch."""
+    ss = coord.shared_state
+    ss.framework_agent_batches = [{"candidates": [{"candidate_id": "c1"}, {"candidate_id": "c2"}]}]
+    ss.framework_agent_phase_progress = []
+    assert coord.phase_framework._select_next_framework_agent_candidate() == {"candidate_id": "c1"}
+
+
+def test_select_next_framework_agent_candidate_skips_processed(coord: Coordinator) -> None:
+    """A candidate with a terminal progress row is never handed out again."""
+    ss = coord.shared_state
+    ss.framework_agent_batches = [{"candidates": [{"candidate_id": "c1"}, {"candidate_id": "c2"}]}]
+    ss.framework_agent_phase_progress = [{"candidate_id": "c1", "status": "reverted"}]
+    assert coord.phase_framework._select_next_framework_agent_candidate() == {"candidate_id": "c2"}
+
+
+def test_select_next_framework_agent_candidate_none_when_all_processed(coord: Coordinator) -> None:
+    """An exhausted pool returns None -- the pump's signal to look for more."""
+    ss = coord.shared_state
+    ss.framework_agent_batches = [{"candidates": [{"candidate_id": "c1"}]}]
+    ss.framework_agent_phase_progress = [{"candidate_id": "c1", "status": "reverted"}]
+    assert coord.phase_framework._select_next_framework_agent_candidate() is None
+
+
+def test_framework_known_candidate_ids(coord: Coordinator) -> None:
+    ss = coord.shared_state
+    ss.framework_agent_batches = [
+        {"candidates": [{"candidate_id": "c1"}, {"pr_url": "u2"}]},
+    ]
+    ss.research_scout_seen_pr_ids = ["p3"]
+    ids = coord.phase_framework._framework_known_candidate_ids()
+    assert {"c1", "u2", "p3"}.issubset(ids)
+
+
+# -- module-level helpers --------------------------------------------------
+def test_first_present() -> None:
+    from hyperloom.orchestrator.loop.conversation import _first_present
+
+    assert _first_present({"a": 1, "b": 2}, ("x", "b", "a")) == 2
+    assert _first_present({"a": None, "b": 5}, ("a", "b")) == 5
+    assert _first_present({}, ("a",)) is None
+    assert _first_present("not-a-dict", ("a",)) is None
+
+
+def test_lifecycle_paths() -> None:
+    from hyperloom.orchestrator.loop.kernel_request import lifecycle_paths
+
+    assert lifecycle_paths("not-a-dict") == {}
+    out = lifecycle_paths({"patch_path": "/a/p.diff", "workspace": "", "other": "x"})
+    assert out == {"patch_path": "/a/p.diff"}
+
+
+def test_format_inbox_event_variants() -> None:
+    from hyperloom.orchestrator.loop.conversation import _format_inbox_event
+    from hyperloom.orchestrator.bus.message_bus import Message
+
+    delegated = Message.new(
+        "kernel_agent",
+        "orchestration",
+        "delegated_result",
+        {
+            "kind": "explore",
+            "state": "succeeded",
+            "result": {"status": "kept", "gain_pct": 5.0, "tput": 200.0, "kept": True},
+        },
+    )
+    line = _format_inbox_event(delegated)
+    assert "topic=delegated_result" in line
+    assert "status=" in line and "kept=" in line
+
+    verdict = Message.new(
+        "critic",
+        "orchestration",
+        "review_verdict",
+        {"target_proposal_msg_id": "m1", "verdict": "approve", "reasoning": "ok"},
+    )
+    assert "verdict='approve'" in _format_inbox_event(verdict)
+
+    obs = Message.new(
+        "coordinator",
+        "orchestration",
+        "observation",
+        {"kind": "policy_denied"},
+    )
+    assert "kind='policy_denied'" in _format_inbox_event(obs)
+
+    plain = Message.new("a", "b", "misc", {"x": 1})
+    assert "payload=" in _format_inbox_event(plain)

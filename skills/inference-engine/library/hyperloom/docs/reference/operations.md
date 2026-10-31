@@ -1,0 +1,410 @@
+---
+myst:
+    html_meta:
+        "description": "Operations guide for self-hosted Hyperloom. Covers Kubernetes sizing, USER_DATA_PATH backup, LLM gateway credential checks, observability, disaster recovery, and capacity planning."
+        "keywords": "Hyperloom, self-hosting, operations, Kubernetes, USER_DATA_PATH, backup, LLM gateway, observability, disaster recovery, AMD GPU, ROCm, capacity planning"
+---
+# Hyperloom self-hosting and operations guide
+
+This topic covers Kubernetes sizing, `USER_DATA_PATH` backup and
+retention, LLM gateway credential checks, log/metrics surface, and a
+disaster-recovery runbook.
+
+```{note}
+This topic is intended for Site reliability and platform engineers self-hosting
+Hyperloom on their own AMD GPU infrastructure (Kubernetes, bare metal, or a managed platform as a service (PaaS)). For the hosted Primus-Claw experience AMD owns operations; this document does not apply.
+```
+
+For application-level configuration see
+[Environment variables](environment-variables.md); for
+credential setup see [Hyperloom authentication and credentials](authentication.md); for
+recurring symptoms see [Troubleshooting Hyperloom](troubleshooting.md).
+
+```{note}
+Shell paths on this page follow the recommended `pip install --target .` layout.
+In a source checkout, replace the `hyperloom/` prefix with `src/hyperloom/`.
+The command blocks assume `REPO_ROOT` points at that workspace. No installer
+exports it for you, so run `export REPO_ROOT="$(pwd -P)"` from the workspace
+first — it does not survive a new shell.
+```
+
+---
+
+## Sizing and resource requirements
+
+The following resource requirements apply to a single optimization session.
+
+### Per-session sandbox
+
+A single Hyperloom optimization session is a long-running Python
+process that drives benchmarks; the heavy GPU work happens in the
+inference server it benchmarks (sglang or vllm) and in the Ray-scheduled
+GEAK workers. The Coordinator pod itself is small.
+
+| Component                          | CPU       | RAM       | GPU                                       | Disk                                                                                       |
+|------------------------------------|-----------|-----------|-------------------------------------------|--------------------------------------------------------------------------------------------|
+| Coordinator + Orchestration        | 4 cores   | 16 GiB    | none                                      | minimal                                                                                    |
+| Critic (subprocess)                | 1 core    | 2 GiB     | none                                      | <100 MB (knowledge base (KB) drafts)                                                       |
+| GEAK + Ray head (kernel optimization) | 4 cores   | 16 GiB    | none for head; workers below              | varies                                                                                     |
+| Ray worker (GEAK attempt)          | 8 cores   | 32 GiB    | 1 × MI300X, MI325X, or MI355X             | ~10 GB per attempt for build artifacts                                                     |
+| Inference server (sglang or vllm)  | 16 cores  | 128 GiB   | 1–8 × MI300X, MI325X, or MI355X (matches TP)| weights + KV cache; depends on model                                                      |
+| GEAK retrieval-augmented generation (RAG) index (first build) | 4 cores   | 16 GiB    | 1 × any GPU (CPU is hours-slow)           | ~1.3 GB BGE embedding model + index in `~/.cache/amd-ai-devtool/semantic-index/`           |
+
+Minimum viable node: one AMD GPU (MI300X, MI325X, or MI355X) with
+≥ 256 GiB system RAM, 32 cores, and 500 GB local fast disk for the
+session dir + GEAK build artifacts.
+
+### Storage for `USER_DATA_PATH`
+
+By default, each optimization session lives under a per-model timestamped
+directory:
+
+```text
+$USER_DATA_PATH/<model_basename>/<YYYYMMDDTHHMMSSZ>/
+```
+
+Commands below use `$SESSION_DIR` for that concrete session directory.
+
+| Workload                  | Typical session size              | Retention recommendation                |
+|---------------------------|-----------------------------------|-----------------------------------------|
+| 2-hour `--no-kernel` run  | 5–10 GB                           | 30 days (then archive `session_breakdown.json` only) |
+| 24-hour full run with kernel-opt | 50–100 GB                  | 14 days (then archive selectively)      |
+| Multi-day run             | 200 GB+                           | 7 days (move artifacts to cold storage) |
+
+The largest contributors are:
+
+* `$SESSION_DIR/runs/<action>/<task_id>/` Magpie outputs (per-benchmark trace
+  + result.json).
+* `$SESSION_DIR/kernel-agent/runs/<session_id>/` kernel optimization and
+  TraceLens artifacts (especially GEAK reports, prompts, traces, and patches).
+* `$SESSION_DIR/kernel-agent/runs/<session_id>/tracelens/` per-session traces
+  (compressed but still GB-scale).
+
+If you only need long-term observability, the only file you must
+preserve is `session_breakdown.json` (1–10 MB; see
+[`session_breakdown.json` integration in Hyperloom](session-breakdown.md)).
+
+When `USER_DATA_PATH` must stay on a cluster-wide shared mount, keep session
+directories there but, for Codex SDK turns, set `HYPERLOOM_RUNTIME_DIR` to a
+private node-local directory outside source checkouts (installers often default
+it to `$USER_DATA_PATH/runtime`, which follows the shared mount). See
+[Codex SDK turns stall](troubleshooting.md#codex-sdk-turns-stall-or-tracelens-roofline-times-out).
+
+---
+
+## Kubernetes layout
+
+```{seealso}
+To run the same workload under a batch scheduler instead of Kubernetes, see
+[Install for Slurm](../install/slurm.md).
+```
+
+Hyperloom does not ship its own Helm chart. Recommended layout for
+self-hosters:
+
+```
+namespace: hyperloom
+├── Job: hyperloom-session-<session_id>   # short-lived, one per optimization run
+│   ├── Pod: coordinator                  # Python CLI
+│   ├── (subprocess) critic-agent
+│   └── Ray head (launched by kernel request handlers; GEAK runs as Ray workers)
+├── PersistentVolumeClaim: user-data       # mounted at /workspace/hyperloom
+├── PersistentVolumeClaim: tracelens-extension  # optional read-only private extension mount
+├── Secret: hyperloom-creds                # OPENAI_API_KEY
+└── ConfigMap: hyperloom-env               # path env, KB env, observability env
+```
+
+Notes:
+
+* Ray is launched directly by the Coordinator's programmatic kernel request
+  handlers (`orchestrator/kernel/request_handlers.py`) when GEAK runs, not by a
+  separate kernel-agent process. Hyperloom does not require Ray's Kubernetes
+  operator. (Hosted Primus-Claw deployments do use RayJob for multi-node
+  scale-out; that is internal to the Primus-Claw control plane.)
+* Pin the pod to a single node with `nodeSelector` matching your AMD
+  GPU labels; Ray currently expects all GPUs visible to the head.
+* Mount `USER_DATA_PATH` on a fast local SSD or NVMe (RWO). Network
+  storage (NFS, WekaFS) works but adds latency to the per-tick state.json reads.
+  If session outputs must use shared storage and Codex SDK turns are enabled,
+  also provide node-local disk for `HYPERLOOM_RUNTIME_DIR` (see
+  [Storage for `USER_DATA_PATH`](#storage-for-user_data_path)).
+  (`RWO` = ReadWriteOnce, a persistent volume (PV) access mode.)
+* LLM calls go directly to the configured upstream gateway; no in-pod
+  auth-proxy Service or NetworkPolicy is required.
+
+### Lifecycle
+
+The following table describes the key lifecycle events for a Hyperloom session.
+
+| Phase           | Trigger                                            | Action                                                  |
+|-----------------|----------------------------------------------------|---------------------------------------------------------|
+| Session start   | API call / Job creation                            | Coordinator creates `$SESSION_DIR` and writes `manifest.json`, `state.json`. |
+| Heartbeat       | Every Coordinator tick (`--tick-interval-sec`, default `0` = no sleep) | Coordinator atomically rewrites `state.json` (temp `.state.json.*.tmp` + `os.replace`) inside `$SESSION_DIR`. |
+| Session end     | `target_reached` / `time_exhausted` / `global_converged` | Coordinator writes `session_breakdown.json`, exits 0. |
+| Crash recovery  | Pod OOM / preemption                               | Re-launch with `--resume-from "$SESSION_DIR"`; reads `manifest.json` + `state.json`. If the resume is refused because the lost pod's execution ownership cannot be established, confirm that pod is gone with `hyperloom recover --confirm-scope-gone` first ([Scenario A](#scenario-a-pod-was-oom-killed-mid-session)). |
+
+---
+
+## Backup and retention
+
+The following guidelines cover what to back up and for how long.
+
+### What to back up
+
+Back up the following artifacts from each session.
+
+| Artifact                                | Source path                                                       | Retention                                                                                                |
+|-----------------------------------------|-------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| Session manifest + state                | `$SESSION_DIR/manifest.json`,<br>`$SESSION_DIR/state.json`        | Until the session ends; not normally needed afterwards.                                                  |
+| `session_breakdown.json` (downstream contract) | `$SESSION_DIR/`<br>`session_breakdown.json`                | Permanent. This is the canonical record consumed by downstream dashboards and notebooks.                 |
+| Local knowledge root                    | `${KNOWLEDGE_LOCAL_ROOT:-$USER_DATA_PATH/knowledge}` (otherwise `~/.cache/hyperloom/knowledge`) | Permanent. Backup before cleanup of `USER_DATA_PATH`. |
+| Kernel-opt attempts                     | `$SESSION_DIR/kernel-agent/`<br>`runs/<session_id>/`<br>`optimization_attempts.jsonl` | 14 days unless an attempt was promoted; keep promoted attempts permanently.          |
+| Per-attempt artifacts (full)            | `$SESSION_DIR/kernel-agent/`<br>`runs/<session_id>/`<br>`{logs,results,verification}/` | 7–14 days. Cold-archive only if you need full reproducibility.                    |
+
+### Suggested cron
+
+Use the following cron jobs to automate session backup and cleanup.
+
+```bash
+# Daily: ship session_breakdown.json + KB to S3
+find "$USER_DATA_PATH" -name session_breakdown.json -mtime -1 \
+  -exec aws s3 cp {} s3://my-bucket/hyperloom/sessions/ \;
+KB_ROOT="${KNOWLEDGE_LOCAL_ROOT:-${USER_DATA_PATH:-$HOME/.cache/hyperloom}/knowledge}"
+aws s3 sync "$KB_ROOT" s3://my-bucket/hyperloom/knowledge/
+
+# Weekly: prune session dirs older than 14 days
+find "$USER_DATA_PATH" -mindepth 2 -maxdepth 2 -type d -name '20??????T??????Z' -mtime +14 -exec rm -rf {} \;
+```
+
+---
+
+## LLM gateway credential checks
+
+GEAK and forge workers call the configured upstream gateway
+directly using the aliases generated by preflight and the kernel-agent installer.
+
+Operational checks:
+
+```bash
+test -n "${OPENAI_API_KEY:-${ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}}"
+test -n "${OPENAI_BASE_URL:-${ANTHROPIC_BASE_URL:-}}"
+bash "$REPO_ROOT/hyperloom/inference_optimizer/assets/install.sh" --check-only
+```
+
+Child processes inherit the gateway settings prepared by preflight; keep
+operator-facing gateway configuration in `OPENAI_API_KEY` / `OPENAI_BASE_URL`
+or the split Anthropic/OpenAI credentials.
+
+---
+
+## Launcher contract
+
+Launchers can rely on these outputs of `hyperloom optimize`.
+
+**Exit codes**
+
+| Code | Meaning |
+|---|---|
+| 0 | The run finished with a completed outcome |
+| 1 | The run failed or was aborted, including by a signal |
+| 2 | Invalid arguments or a startup check failed (topology, resume, model gate, credentials) |
+| 3 | The session lock is held by another optimizer |
+| 4 | The `--quantize` prelude failed; the run refuses to optimize the unquantized model |
+
+`hyperloom recover` exits 0 on success (including a cleanup confirmation that found nothing to confirm), 1 when the breakdown
+rebuild fails, and 2 on invalid arguments or when a `--confirm-stopped` / `--confirm-scope-gone` confirmation is refused.
+
+**Launch line**
+
+Once the session directory exists, stdout carries one line
+
+```text
+HYPERLOOM_LAUNCH event=launch pid=... session_dir=... session_id=... run_log=... manifest=... gpu_type=... framework=... model=...
+```
+
+with shell-quoted values, and `--launch-info-file PATH` writes the same keys as JSON. A skipped quantization prelude prints a line starting
+with `QUANTIZATION_SKIPPED:`.
+
+---
+
+## Observability
+
+Hyperloom does not ship a metrics endpoint of its own; observability
+is JSONL-on-disk + (optional) downstream collectors.
+
+| Signal                         | File / location                                                                  | Format          |
+|--------------------------------|----------------------------------------------------------------------------------|-----------------|
+| Per-tick Coordinator state     | `$SESSION_DIR/state.json`                                                        | JSON, snapshot  |
+| Session breakdown (final)      | `$SESSION_DIR/session_breakdown.json`                                            | JSON, snapshot  |
+| Critic verdicts                | `$SESSION_DIR/critic-workdir/<turn>/emit.json` (memory in `$SESSION_DIR/critic-session-memory/`) | JSON per call   |
+| Kernel-opt attempts            | `$SESSION_DIR/kernel-agent/runs/<session_id>/optimization_attempts.jsonl`        | JSONL, append   |
+| Inference server logs          | `$SESSION_DIR/runs/<action>/<task>/server.log`                                  | text            |
+
+Recommended pipeline: `vector` / `fluentbit` tailing the JSONL files
+and forwarding to your observability stack of choice (Datadog, Loki,
+Elastic, …). `session_breakdown.json` is the highest-signal artefact —
+ingest it whole on session end.
+
+---
+
+## Disaster recovery
+
+### Scenario A: pod was OOM-killed mid-session
+
+1. Locate the affected session directory and verify the PV is intact:
+   `ls "$SESSION_DIR/state.json"`.
+2. Relaunch with `--resume-from`:
+   ```bash
+   python3 -m hyperloom optimize --resume-from "$SESSION_DIR"
+   ```
+3. Coordinator reads `manifest.json` + `state.json`, re-enters the
+   loop at the last completed action. The current in-flight action
+   (if any) is re-played from scratch.
+There is no automatic supervision or resume. Confirm the old Coordinator is gone
+and inspect the failure before relaunching. SIGHUP follows normal terminal drain;
+`--max-hours` is cooperative and cannot guarantee termination of a frozen
+Coordinator. Historical stop reasons remain readable but do not trigger a restart.
+
+**When the resume is refused.** A relaunch in a new pod (or a restarted
+container) is a different execution environment, so it cannot observe whether
+the tasks the lost pod was running have exited. The resume then exits 2 with
+`resume blocked: prior execution exit cannot be established in this
+environment`, lists the blocking tasks, and names the owner scopes recorded in
+the session on an `other owner scopes:` line. An owner scope identifies one
+execution environment: a boot, a PID namespace and a container start. Nothing is
+cleared, and the resume stays refused until the ownership is confirmed.
+
+Once you have verified that the environment named by an owner scope no longer
+exists (its pod, container or machine is gone, so nothing it started can still
+be running), record that once for the whole scope, then relaunch:
+
+```bash
+  python3 -m hyperloom recover --session-dir "$SESSION_DIR" \
+    --confirm-scope-gone "$OWNER_SCOPE" --confirmation-reason "pod OOM-killed; pod deleted"
+  python3 -m hyperloom optimize --resume-from "$SESSION_DIR"
+```
+
+Pass the scope exactly as printed, without the surrounding quotes. The
+confirmation cancels the unfinished tasks recorded under that scope, so the
+resumed run redoes them instead of counting their results; releases their
+execution and GPU ownership records; and appends the confirmation to
+`runtime/pod_history.jsonl` (if that append fails, the confirmation still stands
+and a warning is printed). It does not stop any process and does not resume
+the run. When nothing is recorded under the named scope it changes no task or
+lease record, reports `cancelled_tasks=0 released_leases=0` and exits 0; check
+those counts. It is refused, with exit code 2 and no task or lease record
+changed, when:
+
+* the named scope is the current environment's, or the current environment's
+  scope cannot be read;
+* an execution lease held by any other scope has not yet expired (another
+  environment may still be writing the session);
+* a task under the named scope also holds a lease recorded under a different
+  scope;
+* the scope is an older two-part one recorded for this same boot and PID
+  namespace and one of its recorded holder processes still runs here;
+* the session lock is held (an optimizer is still running on the session), or
+  POSIX session locking is unavailable;
+* the session's ownership database predates owner scopes; use `--confirm-stopped`;
+* `--confirmation-reason` is missing or empty, or the option is combined with
+  `--confirm-stopped` or `--force`.
+
+If the relaunch is still refused after the scope confirmation for tasks that
+name no owner scope, confirm each of them with `--confirm-stopped TASK_ID`, then
+relaunch. Such a task holds no ownership record under any owner scope, so
+`--confirm-scope-gone` releases nothing for it; a CLOSE-phase step, for example,
+runs without a lane and so is recorded without one. The refusal names owner
+scopes only on its `other owner scopes:` line, not per task, so let
+`--confirm-stopped` check: it refuses, with exit code 2 and nothing changed, a
+task recorded under a nonempty owner scope. It confirms one task at a time,
+after you have verified that task's whole process tree and any remote workers
+or Ray actors have stopped.
+
+To rebuild only the `session_breakdown` (and push it to Langfuse) for a run
+that exited abnormally — without re-running the optimization loop — use the
+dedicated subcommand instead of `--resume-from`:
+
+```bash
+  python3 -m hyperloom recover --session-dir "$SESSION_DIR" [--force]
+```
+
+`--force` re-runs even when the session already looks complete. To replay
+`reports/trace/llm_calls.jsonl` as Langfuse generations (only when the live
+emitter never ran), use `hyperloom session backfill --session-dir "$SESSION_DIR"`.
+`--resume-from` = keep optimizing; `recover` = rebuild the breakdown artifact,
+or, with `--confirm-scope-gone` / `--confirm-stopped`, record a cleanup
+confirmation that lets a refused resume proceed.
+
+### Scenario B: PV lost or corrupted
+
+1. The session is unrecoverable. Restart from scratch with a fresh
+   `--model …` invocation.
+2. KB is unaffected if `KNOWLEDGE_LOCAL_ROOT` lives on a different
+   volume (recommended). The next run gets the same local recipe store.
+
+### Scenario C: Gateway 401 after credential or config drift
+
+1. Confirm the pod has a current key and base URL (`OPENAI_API_KEY` /
+   `OPENAI_BASE_URL`, or split Anthropic/OpenAI credentials).
+2. Re-run `bash "$REPO_ROOT/hyperloom/inference_optimizer/assets/install.sh" --check-only`
+   and then without `--check-only` if it reports missing aliases.
+3. Inspect `~/.claude/config.json`; `customApiUrl` must point at the upstream
+   gateway.
+
+### Scenario D: Local KB store corrupted
+
+1. Move the selected local KB root aside before starting a new run:
+   ```bash
+   KB_ROOT="${KNOWLEDGE_LOCAL_ROOT:-${USER_DATA_PATH:-$HOME/.cache/hyperloom}/knowledge}"
+   mv "$KB_ROOT" "$KB_ROOT.corrupt.$(date -u +%Y%m%dT%H%M%SZ)"
+   ```
+2. Restart the optimizer with the same `KNOWLEDGE_LOCAL_ROOT` (or default). The
+   local store is recreated lazily on first write.
+
+### Scenario E: Ray won't start (`--num-gpus` rejected)
+
+Preflight refuses a Ray whose `ray start` does not parse the argv Hyperloom
+passes it, and reinstalls the pinned release:
+
+```bash
+pip install --quiet 'ray[default]==2.44.1'
+ray --version
+```
+
+Where 2.44.1 has no wheel (cp314 postdates it), install `'ray[default]>=2.44.1'`;
+where 2.44.1's CLI fails to import under the interpreter's `click` 8.3+
+(`is not a valid Sentinel`), Hyperloom holds `click<8.3` once and certifies the
+CLI again; for any other failure, or a Ray set through `RAY_VERSION`, set
+`RAY_VERSION` to a release built against your `click`, as Hyperloom changes no
+`click` there. See
+[Ray `--num-gpus` rejected](troubleshooting.md#ray---num-gpus-rejected).
+
+---
+
+## Upgrading
+
+See [Upgrade Hyperloom version](upgrade.md) for per-version migration steps.
+The summary policy: `USER_DATA_PATH` is forward-compatible across
+patch releases; minor releases might add new fields to
+`session_breakdown.json` (backwards-compatible) without bumping
+`schema_version`.
+
+---
+
+## Capacity planning checklist
+
+Before going to production with self-hosted Hyperloom, ensure:
+
+- AMD GPU pool sized to your concurrent-session count (1 session
+  = 1–8 GPUs depending on workload TP).
+- `USER_DATA_PATH` PV ≥ 200 GB per active session, ideally local
+  NVMe.
+- `KNOWLEDGE_LOCAL_ROOT` (or the default `$USER_DATA_PATH/knowledge`) on persistent
+  storage with daily backup.
+- `OPENAI_API_KEY` rotation runbook (key is long-lived; rotation
+  requires only re-export + `install.sh` re-run).
+- LLM gateway credential and endpoint check in the session startup probe.
+- Daily ship of `session_breakdown.json` to long-term storage.
+- Weekly prune of `USER_DATA_PATH` for completed sessions
+  > 14 days old.
+- Pager rotation for "Coordinator process exit code ≠ 0".

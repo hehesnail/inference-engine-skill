@@ -1,0 +1,593 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Author-time recording of the SBD v6 ``close`` section.
+
+The CLOSE sequencer states what it did as it does it. The verdict cannot be
+derived at export time, because ``session_breakdown`` is itself a step in the
+middle of the sequence, so the sequencer's own last act is the only thing that
+knows the sequence finished. Until it writes, the section stands at
+``running``, leaving three states distinguishable on the wire: no ``close``
+fragment (the close-out was never reached), ``running`` (the mid-sequence
+snapshot, or a process that died), and any other status (the verdict).
+
+Recording is best-effort: spool failures are parked by :class:`Recorder`
+and must not propagate into the wind-down they describe.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+from hyperloom_common.coerce import to_float, to_int
+from hyperloom_common.fs_utils import relative_posix
+from hyperloom.common.gain_math import gain_pct_or_zero
+from hyperloom_common.timeutil import now_iso
+
+from ..workflow_contract import workflow_contract
+from .recorder import recorder_for
+from .recorder_warnings import RECORDING_ERRORS, note_failure
+from .trace import trace_skip
+
+SECTION = "close"
+STEP_SECTION = "close_step"
+WRITE_BACK_SECTION = "close_write_back"
+WRITE_BACK_ATTEMPT_SECTION = "close_write_back_attempt"
+PRODUCER = "coordinator"
+_SEQUENCE_SCHEMA_VERSION = workflow_contract()["close_sequence"]["sequence_schema_version"]
+
+#: Stable ``result_type`` codes for the Recipe KB publication, set by the
+#: publisher at each exit so no reader substring-matches a free-text reason.
+RESULT_WRITTEN = "written"
+RESULT_KB_DISABLED = "kb_disabled"
+RESULT_AGENTX_BLOCKED = "agentx_blocked"
+RESULT_INVALID_SCOPE = "invalid_scope"
+RESULT_CONFIGURATION_FAILED = "configuration_failed"
+RESULT_TRANSPORT_FAILED = "transport_failed"
+RESULT_NO_NEW_KEEP = "no_new_keep_or_pure_warm_replay"
+RESULT_INVALID_THROUGHPUT = "invalid_throughput"
+RESULT_MISSING_THROUGHPUT = "missing_throughput"
+RESULT_UNVALIDATED_RECIPE = "unvalidated_recipe"
+RESULT_INVALID_SELECTION_PROFILE = "invalid_selection_profile"
+RESULT_EMPTY_REPLAY_MATERIAL = "empty_replay_material"
+RESULT_NOT_BETTER = "not_better_than_champion"
+RESULT_CHAMPION_NOT_PROMOTED = "champion_not_promoted"
+RESULT_BUNDLE_BUILD_FAILED = "bundle_build_failed"
+RESULT_SKIPPED_OTHER = "skipped_other"
+
+#: An attempt opened and never settled. Not coerced to a failure: the KB never
+#: refused anything, the process died before it could answer.
+STATUS_PENDING = "pending"
+
+#: Named rather than probed: the file is being written as this is assembled.
+SESSION_BREAKDOWN_PATH = "session_breakdown.json"
+
+#: The share of the theoretical ceiling the session aims at, a roofline
+#: ceiling not being reachable in practice.
+ROOFLINE_TARGET_RATIO = 0.70
+
+#: A genuine failure, as against a step with no terminal row, which was
+#: merely interrupted.
+_FAILED = "failed"
+
+
+def _stamp(ts: str) -> str:
+    """``ts`` if the caller supplied one, else now, at microsecond precision:
+    consecutive steps routinely settle inside the same second."""
+    return str(ts).strip() or now_iso()
+
+
+def _write(session_dir: Path | str | None, payload: Mapping[str, Any]) -> None:
+    """Deep-merge ``payload`` into the ``close`` singleton."""
+    if not session_dir:
+        trace_skip(reason="no session_dir", section=SECTION)
+        return
+    if not payload:
+        trace_skip(reason="empty payload", section=SECTION)
+        return
+    recorder_for(session_dir, producer=PRODUCER).record_upsert_singleton(SECTION, dict(payload))
+
+
+def record_close_opened(session_dir: Path | str | None, *, ts: str = "") -> None:
+    """Open the section as the sequencer is entered.
+
+    Writes ``status: "running"``, which stands until :func:`record_close_settled`
+    replaces it, so a session that dies mid-close reports that state rather
+    than having it mistaken for a verdict.
+    """
+    _write(
+        session_dir,
+        {
+            "sequence_schema_version": _SEQUENCE_SCHEMA_VERSION,
+            "source": "normal_close",
+            "status": "running",
+            "start_time": _stamp(ts),
+            "close_sequence_done": False,
+            "artifacts": {"session_breakdown_path": SESSION_BREAKDOWN_PATH},
+        },
+    )
+
+
+def record_close_safety_net(session_dir: Path | str | None) -> None:
+    """Mark a terminal write that never entered the CLOSE sequencer."""
+    if not session_dir:
+        return
+    from .assembler import assemble_parts
+
+    try:
+        if assemble_parts(Path(session_dir), only_sections=(SECTION,)).get(SECTION):
+            return
+    except RECORDING_ERRORS as exc:
+        note_failure(section=SECTION, error=exc, detail="safety-net source readback failed")
+        return
+    _write(session_dir, {"source": "safety_net", "sequence_schema_version": _SEQUENCE_SCHEMA_VERSION})
+
+
+@dataclass(frozen=True)
+class CloseStep:
+    """One settled close step. ``detail`` is free text for a human."""
+
+    step: str
+    status: str
+    ts: str = ""
+    task_id: str = ""
+    detail: str = ""
+    optional: bool | None = None
+    artifact_path: str = ""
+    artifact_digest: str = ""
+    error: str = ""
+
+    def row(self) -> dict[str, Any]:
+        """The step row this record persists as."""
+        row: dict[str, Any] = {
+            "step": str(self.step or ""),
+            "status": str(self.status or "").strip().lower(),
+            "ts": _stamp(self.ts),
+        }
+        if self.task_id:
+            row["task_id"] = str(self.task_id)
+        if self.detail:
+            row["detail"] = str(self.detail)
+        if self.optional is not None:
+            row["optional"] = self.optional
+        if self.artifact_path:
+            row["artifact_path"] = self.artifact_path
+        if self.artifact_digest:
+            row["artifact_digest"] = self.artifact_digest
+        if self.error:
+            row["error"] = self.error
+        return row
+
+
+def record_close_step(session_dir: Path | str | None, step: CloseStep) -> None:
+    """Append one settled close step.
+
+    Rows are append-only rather than keyed by step name: a resumed session
+    runs the sequence again, and its rows describe a second close-out attempt
+    instead of correcting the first.
+    """
+    if not session_dir:
+        trace_skip(reason="no session_dir", section=STEP_SECTION)
+        return
+    recorder_for(session_dir, producer=PRODUCER).record_item(STEP_SECTION, step.row())
+
+
+def record_close_artifacts(
+    session_dir: Path | str | None,
+    *,
+    final_json_path: Path | str | None = None,
+    final_md_path: Path | str | None = None,
+    artifact_package_path: Path | str | None = None,
+) -> None:
+    """Name the artifacts the close-out produced, at the step that produced them.
+
+    Only the arguments supplied are written: the singleton merges leaf-by-leaf
+    with no notion of an empty value, so a path this caller does not know would
+    overwrite one an earlier caller did.
+    """
+    if not session_dir:
+        trace_skip(reason="no session_dir", section=SECTION)
+        return
+    artifacts: dict[str, Any] = {}
+    root = Path(session_dir)
+    for key, value in (
+        ("final_json_path", final_json_path),
+        ("final_md_path", final_md_path),
+        ("artifact_package_path", artifact_package_path),
+    ):
+        if value is not None:
+            artifacts[key] = relative_posix(Path(value), root)
+    if not artifacts:
+        trace_skip(reason="empty payload", section=SECTION)
+        return
+    _write(session_dir, {"artifacts": artifacts})
+
+
+def record_baseline_progress(
+    session_dir: Path | str | None,
+    *,
+    failure_streak: Any = None,
+    total_failures: Any = None,
+    arg_error_streak: Any = None,
+) -> None:
+    """Record the session's final tally of baseline failures.
+
+    No baseline event can hold these: an event closes when its measurement
+    ends, but the counters are advanced afterwards by the write-back.
+    ``arg_error_streak`` is apart because a rejected server arg is a
+    configuration error the session can correct.
+    """
+    _write(
+        session_dir,
+        {
+            "baseline_progress": {
+                "failure_streak": to_int(failure_streak) or 0,
+                "total_failures": to_int(total_failures) or 0,
+                "arg_error_streak": to_int(arg_error_streak) or 0,
+            }
+        },
+    )
+
+
+@dataclass(frozen=True)
+class FinalRecipe:
+    """The configuration the session ended on.
+
+    ``action_path`` is the surviving layers in promotion order, each
+    ``action`` or ``action:variant``.
+    """
+
+    throughput: Any = None
+    ttft_mean_ms: Any = None
+    e2el_mean_ms: Any = None
+    action_path: Any = None
+    extra_server_args: str = ""
+    extra_envs: Mapping[str, Any] | None = None
+
+    def block(self) -> dict[str, Any]:
+        """The ``final_recipe`` block this record persists as."""
+        return {
+            "throughput": to_float(self.throughput),
+            "ttft_mean_ms": to_float(self.ttft_mean_ms),
+            "e2el_mean_ms": to_float(self.e2el_mean_ms),
+            "action_path": [str(step) for step in (self.action_path or []) if str(step)],
+            "extra_server_args": str(self.extra_server_args or ""),
+            "extra_envs": {str(key): str(value) for key, value in dict(self.extra_envs or {}).items()},
+        }
+
+
+def record_final_recipe(session_dir: Path | str | None, recipe: FinalRecipe) -> None:
+    """Record the configuration the session ended on.
+
+    No event holds the terminal recipe: a revert takes a layer off the stack
+    without retracting the ledger row that adopted it.
+    """
+    _write(session_dir, {"final_recipe": recipe.block()})
+
+
+def record_geak_candidate(session_dir: Path | str | None, pending: Mapping[str, Any] | None) -> None:
+    """Record the GEAK candidate still unsettled when the session wind-down starts.
+
+    A settled candidate clears its slot, so a non-empty ``pending`` is one
+    awaiting a rebench or dropped without one. An empty slot is written as
+    ``None``, which replaces what an earlier close of a resumed session left.
+    """
+    slot = dict(pending or {})
+    if not slot:
+        _write(session_dir, {"geak_candidate": None})
+        return
+    status = str(slot.get("status") or "")
+    _write(
+        session_dir,
+        {
+            "geak_candidate": {
+                "revalidation_pending": status == "awaiting_rebench",
+                "status": status,
+                "revalidation_error": slot.get("revalidation_error") or None,
+                "revalidation_error_class": slot.get("revalidation_error_class") or None,
+                "self_reported_gain_pct": to_float(slot.get("self_reported_gain_pct")),
+                "self_reported_tput": to_float(slot.get("self_reported_tput")),
+                "self_reported_basis": slot.get("self_reported_basis"),
+            }
+        },
+    )
+
+
+@dataclass(frozen=True)
+class RooflineProgress:
+    """The session's trajectory and the roofline ceiling it is measured against.
+
+    ``latest_snapshot`` supplies the ceiling and is absent when no analysis
+    completed, which is why the ceiling fields are nullable rather than zero.
+    """
+
+    baseline_tput: Any = None
+    baseline_ts: str = ""
+    optimization_stack: Any = None
+    latest_snapshot: Mapping[str, Any] | None = None
+    current_best_tput: Any = None
+    cumulative_gain_pct: Any = None
+    failure_streak: Any = None
+
+
+def record_roofline_progress(session_dir: Path | str | None, progress: RooflineProgress) -> None:
+    """Record how far the session got against its roofline ceiling.
+
+    The close-out is the first moment the ceiling, the trajectory and the
+    streak are all final.
+    """
+    baseline = to_float(progress.baseline_tput) or 0.0
+    trajectory = _trajectory(baseline, progress.baseline_ts, progress.optimization_stack)
+    snapshot = dict(progress.latest_snapshot or {})
+
+    ceiling = to_float(snapshot.get("theoretical_peak_tok_per_sec"))
+    ceiling_available = ceiling is not None and ceiling > 0
+    target = round(ceiling * ROOFLINE_TARGET_RATIO, 4) if ceiling_available else None
+    best = trajectory[-1]["tput"] if trajectory else 0.0
+
+    payload: dict[str, Any] = {
+        "ceiling_tok_per_sec": ceiling,
+        "target_tok_per_sec": target,
+        "ceiling_ratio_target": ROOFLINE_TARGET_RATIO,
+        "ceiling_available": ceiling_available,
+        "trajectory": trajectory,
+        "baseline_tput": baseline,
+        "current_best_tput": best,
+        "cumulative_gain_pct": round(to_float(progress.cumulative_gain_pct) or 0.0, 4),
+        "current_best_pct_of_ceiling": (round(best / ceiling * 100.0, 4) if ceiling_available and best > 0 else None),
+        "current_best_pct_of_target": (round(best / target * 100.0, 4) if target and best > 0 else None),
+        "roofline_failure_streak": to_int(progress.failure_streak, 0),
+        "latest_snapshot_id": to_int(snapshot.get("snapshot_id")) or None,
+    }
+
+    # A tail disagreeing with the session's own best means a promotion never
+    # made it onto the stack, as when a resume interrupted a mid-promote.
+    declared = to_float(progress.current_best_tput, 0.0)
+    if declared > 0 and best > 0 and abs(declared - best) / max(declared, 1.0) > 0.001:
+        payload["trajectory_incomplete"] = True
+        payload["current_best_tput_declared"] = declared
+    else:
+        payload["trajectory_incomplete"] = False
+
+    _write(session_dir, {"roofline_progress": payload})
+
+
+def _trajectory(baseline: float, baseline_ts: str, stack: Any) -> list[dict[str, Any]]:
+    """Build the throughput curve, oldest first; a non-positive ``baseline``
+    yields no baseline point, a curve having to start somewhere real."""
+    points: list[dict[str, Any]] = []
+    if baseline > 0:
+        points.append(
+            {
+                "ts": str(baseline_ts or ""),
+                "tput": baseline,
+                "label": "baseline",
+                "action": "baseline",
+                "gain_pct": 0.0,
+                "flags": "",
+                "extra_envs": {},
+            }
+        )
+    entries = stack if isinstance(stack, list) else []
+    # Sorted by timestamp rather than trusted in list order: a legacy prepend
+    # puts the newest first and would silently invert the curve.
+    for entry in sorted((e for e in entries if isinstance(e, Mapping)), key=lambda e: str(e.get("ts") or "")):
+        tput = to_float(entry.get("tput"))
+        if tput is None or tput <= 0:
+            continue
+        points.append(
+            {
+                "ts": str(entry.get("ts") or ""),
+                "tput": tput,
+                "label": str(entry.get("variant_name") or entry.get("action") or ""),
+                "action": str(entry.get("action") or ""),
+                "gain_pct": round(gain_pct_or_zero(tput, baseline), 4),
+                "flags": str(entry.get("candidate_extra_server_args") or ""),
+                "extra_envs": dict(entry.get("extra_envs") or {}),
+            }
+        )
+    return points
+
+
+def record_close_settled(
+    session_dir: Path | str | None,
+    *,
+    ts: str = "",
+) -> None:
+    """Record the sequencer's verdict as its last act.
+
+    ``degraded`` when any recorded step reported ``failed``, ``succeeded``
+    otherwise: reaching this function is itself the evidence that the sequence
+    ran to the end, so an un-settled step does not count against the verdict.
+    An unreadable spool is also ``degraded``: the sequence finished, but the
+    step rows cannot be used to prove it was clean.
+    """
+    if not session_dir:
+        trace_skip(reason="no session_dir", section=SECTION)
+        return
+    step_failed = _any_step_failed(session_dir)
+    _write(
+        session_dir,
+        {
+            "status": "succeeded" if step_failed is False else "degraded",
+            "end_time": _stamp(ts),
+            "close_sequence_done": True,
+        },
+    )
+
+
+def record_write_back_opened(
+    session_dir: Path | str | None,
+    *,
+    attempt: int,
+    source: str,
+    ts: str = "",
+) -> None:
+    """Open one Recipe KB publication attempt, before the write is tried.
+
+    Opening before the write is what makes a mid-publish death visible: the row
+    stands at ``pending`` until :func:`record_write_back_settled` replaces it,
+    so a session killed here reports an unsettled attempt rather than a refusal
+    the KB never issued. ``attempt`` is 1-based and keys the row.
+    """
+    _write_attempt(
+        session_dir,
+        attempt=attempt,
+        row={
+            "attempt": int(attempt),
+            "source": str(source or ""),
+            "status": STATUS_PENDING,
+            "opened_at": _stamp(ts),
+        },
+    )
+
+
+@dataclass(frozen=True)
+class WriteBackSettlement:
+    """How one Recipe KB publication attempt settled.
+
+    ``result_type`` is one of this module's ``RESULT_*`` codes, stated by the
+    publisher so no reader has to read it out of ``raw_reason``, which is kept
+    verbatim. ``error_class`` is separate because the publisher reports
+    transport failures as the bare exception class name.
+    """
+
+    attempt: int
+    source: str
+    status: str
+    result_type: str = ""
+    raw_reason: str = ""
+    error_class: str = ""
+    backend: str = ""
+    canonical_id: str = ""
+    session_id: str = ""
+    scope: Mapping[str, Any] | None = None
+    optimized_throughput: float | None = None
+    validated_gain_pct: float | None = None
+    ts: str = ""
+
+
+def record_write_back_settled(session_dir: Path | str | None, settlement: WriteBackSettlement) -> None:
+    """Settle one publication attempt and the arc it belongs to."""
+    if not session_dir:
+        trace_skip(reason="no session_dir", section=WRITE_BACK_SECTION)
+        return
+    settled = _stamp(settlement.ts)
+    verdict = str(settlement.status or "").strip().lower()
+    code = str(settlement.result_type or "").strip()
+    reason = str(settlement.raw_reason or "").strip()
+    error = str(settlement.error_class or "").strip()
+
+    attempt_row: dict[str, Any] = {
+        "attempt": int(settlement.attempt),
+        "source": str(settlement.source or ""),
+        "status": verdict,
+        "settled_at": settled,
+    }
+    if code:
+        attempt_row["result_type"] = code
+    if reason:
+        attempt_row["raw_reason"] = reason
+    if error:
+        attempt_row["error_class"] = error
+    _write_attempt(session_dir, attempt=settlement.attempt, row=attempt_row)
+
+    arc: dict[str, Any] = {
+        "status": verdict,
+        "end_time": settled,
+    }
+    for key, value in (
+        ("result_type", code),
+        ("raw_reason", reason),
+        ("backend", str(settlement.backend or "").strip()),
+        ("canonical_id", str(settlement.canonical_id or "").strip()),
+        ("session_id", str(settlement.session_id or "").strip()),
+    ):
+        # Only what this exit knows: the singleton merges leaf-by-leaf, so a
+        # blank would erase an earlier attempt's answer.
+        if value:
+            arc[key] = value
+    if settlement.scope:
+        arc["scope"] = dict(settlement.scope)
+    if settlement.optimized_throughput is not None:
+        arc["optimized_throughput"] = float(settlement.optimized_throughput)
+    if settlement.validated_gain_pct is not None:
+        arc["validated_gain_pct"] = float(settlement.validated_gain_pct)
+    if error:
+        arc["failure"] = {"error_class": error, "error": reason or error}
+    _write_arc(session_dir, arc)
+
+
+def _write_arc(session_dir: Path | str, payload: Mapping[str, Any]) -> None:
+    """Deep-merge ``payload`` into the write-back singleton."""
+    recorder_for(session_dir, producer=PRODUCER).record_upsert_singleton(
+        WRITE_BACK_SECTION,
+        dict(payload),
+    )
+
+
+def _write_attempt(session_dir: Path | str | None, *, attempt: int, row: Mapping[str, Any]) -> None:
+    """Upsert one attempt row, keyed by its number."""
+    if not session_dir:
+        trace_skip(reason="no session_dir", section=WRITE_BACK_ATTEMPT_SECTION)
+        return
+    recorder_for(session_dir, producer=PRODUCER).record_upsert_item(
+        WRITE_BACK_ATTEMPT_SECTION,
+        dict(row),
+        key=str(int(attempt)),
+    )
+
+
+def _any_step_failed(session_dir: Path | str) -> bool | None:
+    """Whether any close step this session recorded reported a failure.
+
+    ``None`` when the spool cannot be read, so the verdict cannot treat
+    silence as a clean close.
+    """
+    try:
+        # Deferred: the assembler imports this package's recorder module.
+        from .assembler import close_steps
+
+        return any(str(row.get("status") or "") == _FAILED for row in close_steps(session_dir))
+    except RECORDING_ERRORS as exc:
+        note_failure(section="close", error=exc, detail="close verdict: step readback failed")
+        return None
+
+
+__all__ = [
+    "CloseStep",
+    "FinalRecipe",
+    "RooflineProgress",
+    "WriteBackSettlement",
+    "RESULT_AGENTX_BLOCKED",
+    "RESULT_BUNDLE_BUILD_FAILED",
+    "RESULT_CHAMPION_NOT_PROMOTED",
+    "RESULT_CONFIGURATION_FAILED",
+    "RESULT_EMPTY_REPLAY_MATERIAL",
+    "RESULT_INVALID_SELECTION_PROFILE",
+    "RESULT_INVALID_SCOPE",
+    "RESULT_INVALID_THROUGHPUT",
+    "RESULT_KB_DISABLED",
+    "RESULT_MISSING_THROUGHPUT",
+    "RESULT_NOT_BETTER",
+    "RESULT_NO_NEW_KEEP",
+    "RESULT_SKIPPED_OTHER",
+    "RESULT_TRANSPORT_FAILED",
+    "RESULT_UNVALIDATED_RECIPE",
+    "RESULT_WRITTEN",
+    "ROOFLINE_TARGET_RATIO",
+    "SESSION_BREAKDOWN_PATH",
+    "STATUS_PENDING",
+    "record_baseline_progress",
+    "record_close_artifacts",
+    "record_close_opened",
+    "record_close_safety_net",
+    "record_close_settled",
+    "record_close_step",
+    "record_geak_candidate",
+    "record_roofline_progress",
+    "record_write_back_opened",
+    "record_write_back_settled",
+]

@@ -1,0 +1,17 @@
+{
+  "_comment": "The Claude Code plugin starts only the bundled profile_and_optimize server. Configure optional third-party MCP servers in the user's client settings.",
+  "mcpServers": {
+    "profile_and_optimize": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/server/.venv/bin/python",
+      "args": [
+        "-m",
+        "profile_and_optimize_mcp",
+        "serve"
+      ],
+      "env": {
+        "PROFILE_AND_OPTIMIZE_REPO_ROOT": "${CLAUDE_PLUGIN_ROOT}/server"
+      }
+    }
+  }
+}

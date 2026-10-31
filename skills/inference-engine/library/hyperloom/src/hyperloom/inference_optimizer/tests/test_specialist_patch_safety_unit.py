@@ -1,0 +1,605 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the universal patch-safety contract (diff structural checks, git grounding, missing-target detection,
+and quantitative-claim guards).
+"""
+
+from __future__ import annotations
+
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hyperloom.orchestrator.specialists import patch_safety as ps
+from hyperloom.orchestrator.specialists import runner
+
+
+_DIFF = "diff --git a/foo.py b/foo.py\nindex 111..222 100644\n--- a/foo.py\n+++ b/foo.py\n@@ -1,2 +1,2 @@\n-old\n+new\n"
+
+
+# ---- path helpers ---------------------------------------------------------
+def test_patch_file_targets():
+    pairs = ps.patch_file_targets(_DIFF)
+    assert pairs == [("a/foo.py", "b/foo.py")]
+    assert ps.patch_file_targets("") == []
+    # trailing timestamp on the header is stripped
+    txt = "--- a/x.py\t2026-01-01\n+++ b/x.py\t2026-01-01\n"
+    assert ps.patch_file_targets(txt) == [("a/x.py", "b/x.py")]
+
+
+def test_parse_patch_targets_classifies_modify_create_and_delete():
+    patch = (
+        _DIFF + "diff --git a/new.py b/new.py\n"
+        "--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n+new\n" + "diff --git a/old.py b/old.py\n"
+        "--- a/old.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+    )
+
+    parsed = ps.parse_patch_targets(patch)
+
+    assert parsed.existing == ("foo.py", "old.py")
+    assert parsed.created == ("new.py",)
+    assert parsed.all == ("foo.py", "old.py", "new.py")
+
+
+def test_parse_patch_targets_falls_back_for_mode_only_and_rename():
+    mode_only = "diff --git a/script.py b/script.py\nold mode 100644\nnew mode 100755\n"
+    rename = "diff --git a/old.py b/new.py\nsimilarity index 100%\nrename from old.py\nrename to new.py\n"
+
+    assert ps.parse_patch_targets(mode_only).existing == ("script.py",)
+    parsed_rename = ps.parse_patch_targets(rename)
+    assert parsed_rename.existing == ("old.py",)
+    assert parsed_rename.created == ("new.py",)
+
+
+def test_parse_patch_targets_rejects_a_diff_whose_both_sides_are_dev_null():
+    with pytest.raises(ValueError, match="no safe target files"):
+        ps.parse_patch_targets("--- /dev/null\n+++ /dev/null\n@@ -0,0 +1 @@\n+x\n")
+
+
+def test_parse_patch_targets_rejects_root_escape():
+    try:
+        ps.parse_patch_targets("diff --git a/good.py b/../../escape.py\n--- a/good.py\n+++ b/../../escape.py\n")
+    except ValueError as exc:
+        assert "unsafe patch target path" in str(exc)
+    else:
+        raise AssertionError("root-escaping patch target was accepted")
+
+
+def test_patch_targets_missing(tmp_path):
+    (tmp_path / "foo.py").write_text("x", encoding="utf-8")
+    # foo.py exists at strip level 1 -> not missing
+    assert ps.patch_targets_missing(_DIFF, tmp_path) == []
+    miss_diff = _DIFF.replace("foo.py", "ghost.py")
+    assert ps.patch_targets_missing(miss_diff, tmp_path) == ["a/ghost.py"]
+
+
+def test_patch_targets_missing_dev_null_exempt(tmp_path):
+    create = "--- /dev/null\n+++ b/newfile.py\n@@ -0,0 +1 @@\n+content\n"
+    assert ps.patch_targets_missing(create, tmp_path) == []
+
+
+# ---- regex helpers --------------------------------------------------------
+def test_numeric_claims():
+    text = "this gives 12% and 3.5x speedup of 4, 100ms latency"
+    hits = ps.numeric_claims(text)
+    assert any("%" in h for h in hits)
+    assert any("x" in h.lower() for h in hits)
+    assert ps.numeric_claims("") == []
+
+
+def test_is_unified_diff():
+    assert ps.is_unified_diff(_DIFF) is True
+    assert ps.is_unified_diff("just text") is False
+
+
+def test_patch_escapes_tree():
+    assert ps.patch_escapes_tree(_DIFF) is None
+    # target after the b/ prefix begins with "/" -> absolute escape
+    abs_diff = "--- a/foo.py\n+++ b//etc/passwd\n"
+    assert ps.patch_escapes_tree(abs_diff) == "/etc/passwd"
+    dotdot = "--- a/../../escape.py\n+++ b/ok.py\n"
+    assert ps.patch_escapes_tree(dotdot) == "../../escape.py"
+
+
+# ---- cross-domain rule descriptors ----------------------------------------
+def test_cross_domain_rule_descriptors():
+    desc = ps.cross_domain_rule_descriptors()
+    assert len(desc) == len(ps.CROSS_DOMAIN_RULES)
+    assert {"rule_id", "description", "failure_verdict", "failure_reason_code"} <= set(desc[0])
+
+
+# ---- vet_patches grounding verdicts ---------------------------------------
+def _ground(tmp_path: Path, text: str, base_checkout: Path | None) -> str:
+    patch = tmp_path / "p.patch"
+    patch.write_text(text, encoding="utf-8")
+    _kept, _ungrounded, grounding, _spans = ps.vet_patches([str(patch)], base_checkout=base_checkout)
+    return grounding[str(patch)]
+
+
+def test_ground_not_diff(tmp_path):
+    assert _ground(tmp_path, "no hunks", None) == ps.GROUND_NOT_DIFF
+
+
+def test_ground_path_escape(tmp_path):
+    escape_diff = "--- a/foo.py\n+++ b/../../escape.py\n@@ -1 +1 @@\n-old\n+new\n"
+    assert _ground(tmp_path, escape_diff, None) == ps.GROUND_PATH_ESCAPE
+
+
+def test_ground_unchecked_no_base(tmp_path):
+    assert _ground(tmp_path, _DIFF, None) == ps.GROUND_UNCHECKED
+
+
+def test_ground_missing_target(tmp_path):
+    assert _ground(tmp_path, _DIFF, tmp_path) == ps.GROUND_MISSING_TARGET
+
+
+def test_ground_applies(tmp_path, monkeypatch):
+    (tmp_path / "foo.py").write_text("old\n", encoding="utf-8")
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(ps.subprocess, "run", lambda *a, **k: _Proc())
+    assert _ground(tmp_path, _DIFF, tmp_path) == ps.GROUND_APPLIES
+
+
+def test_ground_stale(tmp_path, monkeypatch):
+    (tmp_path / "foo.py").write_text("old\n", encoding="utf-8")
+
+    class _Proc:
+        returncode = 1
+        stderr = "patch does not apply"
+
+    monkeypatch.setattr(ps.subprocess, "run", lambda *a, **k: _Proc())
+    assert _ground(tmp_path, _DIFF, tmp_path) == ps.GROUND_STALE
+
+
+def test_ground_git_unavailable(tmp_path, monkeypatch):
+    (tmp_path / "foo.py").write_text("old\n", encoding="utf-8")
+
+    def _raise(*a, **k):
+        raise FileNotFoundError("no git")
+
+    monkeypatch.setattr(ps.subprocess, "run", _raise)
+    assert _ground(tmp_path, _DIFF, tmp_path) == ps.GROUND_UNCHECKED
+
+
+# ---- PatchSafetyReport.notes ----------------------------------------------
+def test_patch_safety_report_notes():
+    rep = ps.PatchSafetyReport(
+        ungrounded=[
+            {"path": "p1", "verdict": ps.GROUND_NOT_DIFF, "detail": "d"},
+            {"path": "p2", "verdict": ps.GROUND_MISSING_TARGET, "detail": "miss"},
+        ],
+        grounding={"p3": ps.GROUND_STALE},
+        numeric_warnings=["12%"],
+        forbidden_fields=["confidence"],
+    )
+    notes = rep.notes()
+    joined = "\n".join(notes)
+    assert "patch_safety_ungrounded" in joined
+    assert "patch_safety_missing_target" in joined
+    assert "patch_safety_stale" in joined
+    assert "patch_safety_numeric" in joined
+    assert "patch_safety_forbidden_fields" in joined
+
+
+def test_patch_safety_report_notes_empty():
+    assert ps.PatchSafetyReport().notes() == []
+
+
+# ---- proposals whose env files are not on disk -------------------------------
+def test_a_proposal_pointing_an_env_at_an_unwritten_file_is_dropped_at_admission(tmp_path):
+    """Qwen3-14B-FP8 session 20261014T024938Z: two-step proposals ("author the CSV, then point the env at it") whose
+    first step nothing ran; benched as config arms, their servers died at config load."""
+    written = tmp_path / "tuned.csv"
+    written.write_text("gfx,M,N,K\n", encoding="utf-8")
+    missing = str(tmp_path / "aiter_configs" / "never_written.csv")
+    payload = {
+        "proposal_set": [
+            {"name": "tuned-gemm", "extra_envs": {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": missing}},
+            {"name": "written", "extra_envs": {"AITER_CONFIG_GEMM_BF16": str(written)}},
+            {"name": "flag-only", "extra_args": "--max-num-seqs 64", "extra_envs": {"VLLM_USE_V1": "1"}},
+        ]
+    }
+    dropped = ps.drop_env_ungrounded_proposals(payload)
+    assert [p["name"] for p in payload["proposal_set"]] == ["written", "flag-only"]
+    assert len(dropped) == 1 and dropped[0].startswith("proposal 'tuned-gemm': ")
+    assert missing in dropped[0] and "gemm_tuning" in dropped[0]
+    assert ps.drop_env_ungrounded_proposals({"proposal_set": "not a list"}) == []
+
+
+def test_admit_payload_books_the_gate_and_reports_the_env_drops(tmp_path):
+    missing = str(tmp_path / "never_written.csv")
+    payload = {
+        "summary": "s",
+        "expected_gain_pct": 12,
+        "proposal_set": [{"name": "tuned-gemm", "extra_envs": {"AITER_CONFIG_GEMM_BF16": missing}}],
+    }
+    vetted = (
+        ["a.patch"],
+        [{"path": "b.patch", "verdict": ps.GROUND_MISSING_TARGET, "detail": "missing_target: b"}],
+        {"a.patch": ps.GROUND_APPLIES},
+        False,
+    )
+    report = ps.admit_payload(payload, vetted, {"a.patch": "/src/vllm", "b.patch": "/src/vllm"})
+    assert payload["proposal_set"] == [] and "expected_gain_pct" not in payload
+    assert payload["patches_written"] == ["a.patch"] and payload["patch_roots"] == {"a.patch": "/src/vllm"}
+    assert payload["patches_ungrounded"] == ["missing_target: b"]
+    assert len(payload["proposals_env_ungrounded"]) == 1 and "patches_span_multiple_roots" not in payload
+    assert any("expected_gain_pct" in f for f in report.forbidden_fields)
+    assert report.env_ungrounded == payload["proposals_env_ungrounded"]
+    assert any(n.startswith("proposal_env_file_missing:") for n in report.notes())
+
+
+# ---- scan_numeric_claims ---------------------------------------------------
+def test_scan_numeric_claims():
+    payload = {
+        "summary": "gives 20% boost",
+        "proposal_set": [
+            {"expected_qualitative_argument": "3x faster"},
+            "not-a-dict",
+        ],
+    }
+    warnings = ps.scan_numeric_claims(payload)
+    assert any("%" in w for w in warnings)
+    assert any("x" in w.lower() for w in warnings)
+
+
+def test_scan_numeric_claims_empty():
+    assert ps.scan_numeric_claims({}) == []
+
+
+def test_the_numeric_scan_answers_only_the_question_no_one_else_answers():
+    """It used to return the same ``keys & FORBIDDEN_*`` intersection ``strip_forbidden_proposal_fields`` computes, for a caller that discarded it: one question with two implementations, free to drift apart."""
+    payload = {
+        "expected_gain": 12.0,
+        "summary": "gives 20% boost",
+        "proposal_set": [{"score": 1, "confidence": 0.9}],
+    }
+
+    assert ps.scan_numeric_claims(payload) == ["20%"]
+
+
+# ---- strip_forbidden_proposal_fields --------------------------------------
+def test_round_level_confidence_is_not_a_per_proposal_gain_claim():
+    """The output schema asks for a round-level self-assessment and the round audit records it, so stripping it at the top level only made our own template a violation."""
+    payload = {"confidence": 0.6, "proposal_set": [{"confidence": 0.4}]}
+
+    assert ps.strip_forbidden_proposal_fields(payload) == ["confidence"]
+    assert payload["confidence"] == 0.6
+    assert payload["proposal_set"][0] == {}
+
+
+def test_forbidden_fields_are_stripped_so_the_critic_cannot_reject_on_format():
+    payload = {
+        "expected_gain": 9.0,
+        "confidence": 0.6,
+        "summary": "keep me",
+        "proposal_set": [
+            {"name": "v1", "confidence": 0.4, "score": 3, "reason": "keep me too"},
+            "not-a-dict",
+        ],
+    }
+
+    removed = ps.strip_forbidden_proposal_fields(payload)
+
+    assert set(removed) == {"expected_gain", "confidence", "score"}
+    assert "expected_gain" not in payload
+    assert payload["confidence"] == 0.6  # round-level self-assessment survives
+    assert payload["summary"] == "keep me"
+    assert payload["proposal_set"][0] == {"name": "v1", "reason": "keep me too"}
+    assert payload["proposal_set"][1] == "not-a-dict"
+
+
+def test_a_gain_claim_under_the_coordinators_own_field_name_is_stripped_too():
+    """``predicted_gain_pct`` is the Coordinator's estimate on a propose_action intent, which is exactly what made it a convenient place for a specialist to put a number the guard was meant to strip."""
+    payload = {"proposal_set": [{"name": "v1", "predicted_gain_pct": 12.0, "reason": "keep me"}]}
+
+    removed = ps.strip_forbidden_proposal_fields(payload)
+
+    assert removed == ["predicted_gain_pct"]
+    assert payload["proposal_set"][0] == {"name": "v1", "reason": "keep me"}
+
+
+def test_stripping_a_clean_payload_changes_nothing():
+    payload = {"proposal_set": [{"name": "v1", "reason": "why"}]}
+
+    assert ps.strip_forbidden_proposal_fields(payload) == []
+    assert payload == {"proposal_set": [{"name": "v1", "reason": "why"}]}
+
+
+@pytest.mark.parametrize("payload", [None, [], "", 0])
+def test_stripping_tolerates_a_payload_that_is_not_a_dict(payload):
+    assert ps.strip_forbidden_proposal_fields(payload) == []
+
+
+# ---- quantitative_claim_rule_descriptor ------------------------------------
+def test_the_rule_the_critic_gets_lists_exactly_what_the_runner_strips():
+    """A hand-copied field list in the prompt is how the Critic came to reject over a field the runner never enforced."""
+    rule = ps.quantitative_claim_rule_descriptor()
+
+    assert set(rule["forbidden_proposal_fields"]) == set(ps.FORBIDDEN_PROPOSAL_FIELDS)
+
+
+def test_a_format_slip_is_advisory_not_a_reject():
+    rule = ps.quantitative_claim_rule_descriptor()
+
+    assert rule["failure_verdict"] == "advise"
+    assert rule["failure_reason_code"] == ps.QUANTITATIVE_CLAIM_REASON_CODE
+
+
+# ---- advisory_only_reason_codes --------------------------------------------
+def test_every_rule_that_asked_for_advice_is_enforceable():
+    codes = ps.advisory_only_reason_codes()
+
+    assert ps.QUANTITATIVE_CLAIM_REASON_CODE in codes
+    for rule in ps.cross_domain_rule_descriptors():
+        if rule["failure_verdict"] == ps.ADVISE_VERDICT:
+            assert rule["failure_reason_code"] in codes
+
+
+def test_a_rule_asking_for_a_reject_is_left_alone(monkeypatch):
+    """The set is derived from the descriptors, so a rule keeping ``reject`` stays out of it."""
+    hard = ps.CrossDomainRule(
+        rule_id="hard_guard",
+        description="a violation here is grounds for refusal",
+        failure_verdict="reject",
+        failure_reason_code="cross_domain_hard_guard",
+    )
+    monkeypatch.setattr(ps, "CROSS_DOMAIN_RULES", ps.CROSS_DOMAIN_RULES + (hard,))
+
+    codes = ps.advisory_only_reason_codes()
+
+    assert "cross_domain_hard_guard" not in codes
+    assert ps.QUANTITATIVE_CLAIM_REASON_CODE in codes
+
+
+def test_the_codes_carry_no_blank_entry():
+    assert "" not in ps.advisory_only_reason_codes()
+
+
+# ---- advisory_rules_govern -------------------------------------------------
+@pytest.mark.parametrize("action_name", ["specialist", "explore"])
+def test_the_rules_govern_the_proposal_kinds_they_are_written_about(action_name):
+    """``proposal_set[*]`` reaches review as a specialist proposal or the explore grid it is materialised into; the framework candidate is the one the quantitative-claim rule names by exception."""
+    assert ps.advisory_rules_govern(action_name) is True
+
+
+@pytest.mark.parametrize("action_name", ["integrate_patch", "kernel_opt", "sweep", "baseline", "", None])
+def test_integrate_patch_is_never_governed_by_an_advisory_rule(action_name):
+    """None of these carries a specialist ``proposal_set``, and holding an ``integrate_patch`` reject to ``advise`` would land the refused patch."""
+    assert ps.advisory_rules_govern(action_name) is False
+
+
+# ---- vet_patches ----------------------------------------------------------
+def test_vet_patches(tmp_path, monkeypatch):
+    good = tmp_path / "good.patch"
+    (tmp_path / "foo.py").write_text("old\n", encoding="utf-8")
+    good.write_text(_DIFF, encoding="utf-8")
+    bad = tmp_path / "bad.patch"
+    bad.write_text("not a diff", encoding="utf-8")
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+    real_run = ps.subprocess.run
+
+    def _ground_only(cmd, *args, **kwargs):
+        if "--check" in cmd:
+            return _Proc()
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ps.subprocess, "run", _ground_only)
+    kept, ungrounded, grounding, spans_roots = ps.vet_patches([str(good), str(bad)], base_checkout=tmp_path)
+    assert str(good) in kept
+    assert str(bad) not in kept
+    assert any(d["verdict"] == ps.GROUND_NOT_DIFF for d in ungrounded)
+    assert not spans_roots
+
+
+def test_vet_patches_unreadable(tmp_path):
+    kept, ungrounded, grounding, spans_roots = ps.vet_patches([str(tmp_path / "missing.patch")], base_checkout=None)
+    assert kept == []
+    assert ungrounded[0]["verdict"] == "unreadable"
+    assert not spans_roots
+
+
+# ---- nested root collapse + GROUND_AMBIGUOUS_ROOT -------------------------
+def _make_git_repo(root: Path, files: dict[str, str]) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-qm", "base"],
+        check=True,
+    )
+    return root
+
+
+def test_vet_patches_drops_annotation_only_diff_that_applies(tmp_path: Path) -> None:
+    before = "# Runtime selection.\nBLOCK_SIZE = 64\n"
+    root = _make_git_repo(tmp_path / "repo", {"runtime.py": before})
+    (root / "runtime.py").write_text("# Runtime selection, unchanged.\nBLOCK_SIZE = 64\n", encoding="utf-8")
+    diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD"], check=True, capture_output=True, text=True).stdout
+    (root / "runtime.py").write_text(before, encoding="utf-8")
+    patch = tmp_path / "annotation.patch"
+    patch.write_text(diff, encoding="utf-8")
+    assert ps._git_apply_check(root, diff) is True
+
+    kept, dropped, _grounding, spans_roots = ps.vet_patches([str(patch)], base_checkout=root, explicit_root=root)
+
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0]["path"] == str(patch)
+    assert dropped[0]["verdict"] == "annotation_only"
+    assert not spans_roots
+    assert patch.read_text(encoding="utf-8") == diff
+    assert (root / "runtime.py").read_text(encoding="utf-8") == before
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"], check=True, capture_output=True, text=True
+    )
+    assert status.stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("target", "before", "after"),
+    [
+        ("configs/runtime.json", '{"block_size": 64}\n', '{"block_size": 128}\n'),
+        ("configs/runtime.yaml", "block_size: 64\n", "block_size: 128\n"),
+        ("runtime.py", 'PROMPT = """\n# Original instruction\n"""\n', 'PROMPT = """\n# Revised instruction\n"""\n'),
+        ("runtime.py", "#!/usr/bin/python\npass\n", "#!/usr/bin/python3\npass\n"),
+        pytest.param(
+            "runtime.py",
+            "#!/usr/bin/env python3\npass\n",
+            "# Runtime entrypoint.\n#!/usr/bin/env python3\npass\n",
+            id="shebang-first-line",
+        ),
+        ("runtime.py", "# cython: boundscheck=True\npass\n", "# cython: boundscheck=False\npass\n"),
+    ],
+)
+def test_vet_patches_keeps_runtime_data_changes(tmp_path: Path, target: str, before: str, after: str) -> None:
+    root = _make_git_repo(tmp_path / "repo", {target: before})
+    (root / target).write_text(after, encoding="utf-8")
+    diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD"], check=True, capture_output=True, text=True).stdout
+    (root / target).write_text(before, encoding="utf-8")
+    patch = tmp_path / "runtime.patch"
+    patch.write_text(diff, encoding="utf-8")
+
+    kept, dropped, grounding, spans_roots = ps.vet_patches([str(patch)], base_checkout=root, explicit_root=root)
+
+    assert kept == [str(patch)]
+    assert dropped == []
+    assert grounding == {str(patch): ps.GROUND_APPLIES}
+    assert not spans_roots
+
+
+def test_nested_root_collapse_picks_outer(tmp_path):
+    outer = _make_git_repo(tmp_path / "sglang", {"python/sglang/srt/foo.py": "old\n"})
+    inner = outer / "python"
+    inner.mkdir(exist_ok=True)
+    diff = "--- a/python/sglang/srt/foo.py\n+++ b/python/sglang/srt/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+    res = ps.resolve_patch_apply_root([diff], explicit_root=None, candidate_roots=[outer, inner])
+    assert res.root is not None
+    assert res.root.resolve() == outer.resolve()
+    assert res.reason == ""
+
+
+def test_disjoint_ambiguity_still_fails(tmp_path):
+    tree_a = _make_git_repo(tmp_path / "a", {"srt/foo.py": "old\n"})
+    tree_b = _make_git_repo(tmp_path / "b", {"srt/foo.py": "old\n"})
+    diff = "--- a/srt/foo.py\n+++ b/srt/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+    res = ps.resolve_patch_apply_root([diff], explicit_root=None, candidate_roots=[tree_a, tree_b])
+    assert res.root is None
+    assert res.reason == "ambiguous_root"
+
+
+def test_the_callers_own_tree_wins_a_tie(tmp_path):
+    tree_a = _make_git_repo(tmp_path / "a", {"srt/foo.py": "old\n"})
+    tree_b = _make_git_repo(tmp_path / "b", {"srt/foo.py": "old\n"})
+    diff = "--- a/srt/foo.py\n+++ b/srt/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+    res = ps.resolve_patch_apply_root([diff], explicit_root=None, candidate_roots=[tree_a, tree_b], default_root=tree_b)
+    assert res.root is not None
+    assert res.root.resolve() == tree_b.resolve()
+    assert res.reason == ""
+
+
+def test_vet_patches_ambiguous_root_not_labeled_missing_target(tmp_path):
+    tree_a = _make_git_repo(tmp_path / "a", {"foo.py": "old\n"})
+    tree_b = _make_git_repo(tmp_path / "b", {"foo.py": "old\n"})
+    diff_file = tmp_path / "p.patch"
+    diff_file.write_text("--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n", encoding="utf-8")
+    kept, ungrounded, grounding, _ = ps.vet_patches(
+        [str(diff_file)], base_checkout=None, candidate_roots=(tree_a, tree_b)
+    )
+    assert kept == [str(diff_file)]
+    assert len(ungrounded) == 1
+    assert ungrounded[0]["verdict"] == ps.GROUND_AMBIGUOUS_ROOT
+    assert grounding[str(diff_file)] == ps.GROUND_AMBIGUOUS_ROOT
+
+
+def test_vet_patches_grounds_on_the_worktree_base_when_a_copy_matches_too(tmp_path):
+    base = _make_git_repo(tmp_path / "venv-copy", {"foo.py": "old\n"})
+    installed = _make_git_repo(tmp_path / "dist-packages", {"foo.py": "old\n"})
+    diff_file = tmp_path / "p.patch"
+    diff_file.write_text("--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n", encoding="utf-8")
+    kept, ungrounded, grounding, spans_roots = ps.vet_patches(
+        [str(diff_file)], base_checkout=base, candidate_roots=(installed,)
+    )
+    assert kept == [str(diff_file)]
+    assert ungrounded == []
+    assert grounding[str(diff_file)] == ps.GROUND_APPLIES
+    assert not spans_roots
+
+
+# ---- grounding root selection ----------------------------------------------
+def test_grounding_root_uses_a_harvest_the_whole_set_agrees_on():
+    root = runner._grounding_explicit_root(
+        declared="",
+        patches=["/wt/patches/_worktree_diff.patch"],
+        patch_roots={"/wt/patches/_worktree_diff.patch": "/sgl-workspace/sglang"},
+    )
+    assert root == Path("/sgl-workspace/sglang")
+
+
+def test_grounding_root_declines_when_a_hand_authored_patch_rides_along():
+    """Its target tree is unknown; the harvest root would drop it as a mismatch."""
+    root = runner._grounding_explicit_root(
+        declared="",
+        patches=["/wt/patches/_worktree_diff.patch", "/wt/patches/manual.patch"],
+        patch_roots={"/wt/patches/_worktree_diff.patch": "/sgl-workspace/sglang"},
+    )
+    assert root is None
+
+
+def test_grounding_root_declines_when_harvests_disagree():
+    root = runner._grounding_explicit_root(
+        declared="",
+        patches=["/a.patch", "/b.patch"],
+        patch_roots={"/a.patch": "/tree/one", "/b.patch": "/tree/two"},
+    )
+    assert root is None
+
+
+def test_grounding_root_prefers_a_declared_source_root():
+    root = runner._grounding_explicit_root(
+        declared="/declared/tree",
+        patches=["/a.patch"],
+        patch_roots={"/a.patch": "/harvested/tree"},
+    )
+    assert root == Path("/declared/tree")
+
+
+def test_grounding_root_declines_for_an_empty_set():
+    assert runner._grounding_explicit_root(declared="", patches=[], patch_roots={}) is None
+
+
+def test_a_deleted_line_that_looks_like_a_header_is_not_a_path():
+    """A hunk body line is not a header, whatever it starts with."""
+    for body in ("-- /etc/hosts is read at startup", "-- ../legacy/foo is gone"):
+        diff = f"--- a/x.sql\n+++ b/x.sql\n@@ -1,2 +1,1 @@\n-{body}\n keep\n"
+        assert ps.patch_escapes_tree(diff) is None
+
+
+def test_the_escape_check_reads_the_paths_the_applier_resolves():
+    """Both sides of every header pair, normalised the way ``-p1`` strips them."""
+    assert ps.patch_escapes_tree("--- a/ok.py\n+++ b//etc/passwd\n") == "/etc/passwd"
+    assert ps.patch_escapes_tree("--- a/../../escape.py\n+++ b/ok.py\n") == "../../escape.py"
+    assert ps.patch_escapes_tree("--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n+x\n") is None
+
+
+def test_explicit_root_without_patch_texts_is_accepted(tmp_path):
+    root = _make_git_repo(tmp_path / "fw", {"a.py": "x\n"})
+    res = ps.resolve_patch_apply_root([], explicit_root=root, candidate_roots=[])
+    assert res.root is not None
+    assert res.root.resolve() == root.resolve()
+    assert res.reason == ""

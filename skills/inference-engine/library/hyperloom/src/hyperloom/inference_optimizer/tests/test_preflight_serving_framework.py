@@ -1,0 +1,944 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the preflight serving-framework importability gate."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+import pytest
+
+from hyperloom.common import provenance
+from hyperloom.common.provenance import (
+    RESOLVED_FRAMEWORK_ENV,
+    RESOLVED_FRAMEWORK_PYTHON_ENV,
+)
+from hyperloom.inference_optimizer.cli import framework_probe, preflight
+
+_SKIP_ENV = "HYPERLOOM_SKIP_FRAMEWORK_CHECK"
+
+
+@pytest.fixture(autouse=True)
+def _clear_env(monkeypatch):
+    for key in (
+        _SKIP_ENV,
+        "FRAMEWORK",
+        "BENCHMARK_BASE_URL",
+        "VLLM_VENV_ROOT",
+        "FRAMEWORK_ENV",
+        "PYTHON",
+        "VIRTUAL_ENV",
+        "HYPERLOOM_RUN_MODE",
+        "HYPERLOOM_MN_EXT_SERVICE_URL",
+        "INFERENCE_OPTIMIZER_NODES",
+        "KUBERNETES_SERVICE_HOST",
+        "HYPERLOOM_IMAGE",
+        # The check publishes these; without the reset they leak into every later test in the session and into
+        # provenance lookups.
+        RESOLVED_FRAMEWORK_PYTHON_ENV,
+        RESOLVED_FRAMEWORK_ENV,
+    ):
+        monkeypatch.delenv(key, raising=False)
+    yield
+    # ``delenv`` records no undo for a key that was absent, and the check writes these through ``os.environ`` rather
+    # than the fixture, so monkeypatch never sees them.
+    for key in (RESOLVED_FRAMEWORK_PYTHON_ENV, RESOLVED_FRAMEWORK_ENV):
+        os.environ.pop(key, None)
+
+
+def _args(framework: str | None = None) -> argparse.Namespace:
+    return argparse.Namespace(framework=framework)
+
+
+def _probe_result(monkeypatch, importable: bool, *, rocm: bool | None = True) -> list[list[str]]:
+    """Stub the interpreter probe; return the recorded argv list."""
+    calls: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0 if importable else 1
+        stdout = ""
+        stderr = ""
+
+    def _run(cmd, *_args, **_kwargs):
+        calls.append(list(cmd))
+        return _Proc()
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", _run)
+    monkeypatch.setattr(framework_probe, "_probe_rocm_build", lambda _fw, _py: framework_probe._Probe(rocm))
+    return calls
+
+
+def _probe_per_interpreter(monkeypatch, table, default=(False, None)) -> list[list[str]]:
+    """Stub importability and the ROCm verdict per interpreter path."""
+    calls: list[list[str]] = []
+
+    class _Proc:
+        def __init__(self, rc: int) -> None:
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = ""
+
+    def _run(cmd, *_args, **_kwargs):
+        calls.append(list(cmd))
+        return _Proc(0 if table.get(cmd[0], default)[0] else 1)
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", _run)
+    monkeypatch.setattr(
+        framework_probe, "_probe_rocm_build", lambda _fw, py: framework_probe._Probe(table.get(py, default)[1])
+    )
+    return calls
+
+
+def _refuse_probe(monkeypatch) -> None:
+    """Make any subprocess call an error, so an exemption can be proven."""
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("framework probe must not run here")
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", _boom)
+
+
+def test_missing_serving_framework_exits_with_guidance(monkeypatch, capsys):
+    """A host with no importable serving framework must fail at preflight."""
+    _probe_result(monkeypatch, importable=False)
+    monkeypatch.setattr(framework_probe, "_in_container", lambda: False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    # Names the framework and both remedies, and disambiguates the two run modes so nobody repeats the issue author's
+    # reading of Magpie's run_mode=local.
+    assert "vllm" in err
+    assert "--install-framework vllm" in err
+    assert "HYPERLOOM_RUN_MODE=docker" in err
+    assert _SKIP_ENV in err
+
+
+@pytest.mark.parametrize("in_container", [False, True])
+def test_guidance_carries_no_image_tags_or_doc_paths(monkeypatch, capsys, in_container):
+    """Error text must only name things that cannot go stale or go missing."""
+    _probe_result(monkeypatch, importable=False)
+    monkeypatch.setattr(framework_probe, "_in_container", lambda: in_container)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert not re.search(r"v\d+\.\d+|rocm\d|mi\d00x", err), f"stale-able version in: {err}"
+    assert not re.search(r"\bdocs/\S+\.md\b", err), f"repo doc path in: {err}"
+    # Still actionable: the command and the env var both exist in any install.
+    assert "--install-framework vllm" in err
+
+
+def test_importable_framework_proceeds(monkeypatch, capsys):
+    _probe_result(monkeypatch, importable=True)
+
+    preflight._check_serving_framework(_args("sglang"), "/usr/bin/python3")
+
+    assert "sglang" in capsys.readouterr().out
+
+
+def test_scriptable_framework_is_exempt(monkeypatch):
+    """xDiT/custom own their entrypoint; no serving package is required."""
+    _refuse_probe(monkeypatch)
+
+    preflight._check_serving_framework(_args("xdit"), "/usr/bin/python3")
+
+
+def test_remote_client_is_exempt(monkeypatch):
+    """With BENCHMARK_BASE_URL the server is remote, so nothing local is needed."""
+    monkeypatch.setenv("BENCHMARK_BASE_URL", "http://serving-host:8888")
+    _refuse_probe(monkeypatch)
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+
+def test_external_multi_node_is_exempt(monkeypatch):
+    """Mirrors the GPU-visibility skip: serving happens on remote pods."""
+    monkeypatch.setenv("HYPERLOOM_MN_EXT_SERVICE_URL", "http://claw-rayjob:8000")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_NODES", "2")
+    _refuse_probe(monkeypatch)
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+
+def test_escape_hatch_is_exempt(monkeypatch, capsys):
+    """Parity with install_baremetal.sh's --skip-base-check."""
+    monkeypatch.setenv(_SKIP_ENV, "1")
+    _refuse_probe(monkeypatch)
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert _SKIP_ENV in capsys.readouterr().out
+
+
+def test_isolated_vllm_venv_is_probed(isolated_vllm, monkeypatch):
+    """vLLM installs into $VLLM_VENV_ROOT, invisible to the benchmark python."""
+    calls = _probe_result(monkeypatch, importable=False)
+    monkeypatch.setattr(framework_probe, "_in_container", lambda: False)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert isolated_vllm in [c[0] for c in calls]
+
+
+def test_a_venv_root_without_a_python_is_not_probed(monkeypatch):
+    """The variable can outlive the venv, and a stale path is not a candidate."""
+    monkeypatch.setenv("VLLM_VENV_ROOT", "/opt/hyperloom/vllm-venv-that-is-gone")
+
+    probed = framework_probe._framework_probe_interpreters("vllm", "/usr/bin/python3")
+
+    assert not any("vllm-venv" in candidate for candidate in probed)
+
+
+def test_the_install_mode_flag_does_not_gate_the_probe(isolated_vllm, monkeypatch):
+    """The installer keeps that flag under a name nothing else reads."""
+    monkeypatch.delenv("FRAMEWORK_ENV", raising=False)
+    monkeypatch.delenv("HYPERLOOM_FRAMEWORK_ENV", raising=False)
+
+    probed = framework_probe._framework_probe_interpreters("vllm", "/usr/bin/python3")
+
+    assert probed[0] == isolated_vllm
+
+
+def test_no_other_framework_probes_the_vllm_venv(isolated_vllm):
+    """That venv holds vLLM only, so sglang has no business being looked for there."""
+    probed = framework_probe._framework_probe_interpreters("sglang", "/usr/bin/python3")
+
+    assert isolated_vllm not in probed
+
+
+def test_container_message_omits_the_container_remedy(monkeypatch, capsys):
+    """Inside a container, "go run in a container" is useless advice."""
+    _probe_result(monkeypatch, importable=False)
+    monkeypatch.setattr(framework_probe, "_in_container", lambda: True)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert "already runs in a container" in err
+    assert "HYPERLOOM_RUN_MODE=docker" not in err
+
+
+def test_framework_falls_back_to_env_then_default(monkeypatch):
+    """The framework resolves from args first, then $FRAMEWORK, then the default."""
+    monkeypatch.setenv("FRAMEWORK", "xdit")
+    _refuse_probe(monkeypatch)
+
+    preflight._check_serving_framework(_args(None), "/usr/bin/python3")
+
+
+def test_cuda_build_exits_even_though_importable(monkeypatch, capsys):
+    """``pip install vllm`` from PyPI yields an importable CUDA build."""
+    _probe_result(monkeypatch, importable=True, rocm=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "NOT a ROCm build" in err
+    assert "PyPI" in err
+    assert _SKIP_ENV in err
+
+
+def test_an_inconclusive_rocm_probe_blocks(monkeypatch, capsys):
+    """A probe that cannot answer classifies nothing: the stack serving imports stayed unverified."""
+    _probe_result(monkeypatch, importable=True, rocm=None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "reached no verdict" in err
+    assert _SKIP_ENV in err
+
+
+def test_rocm_build_proceeds_quietly(monkeypatch, capsys):
+    _probe_result(monkeypatch, importable=True, rocm=True)
+
+    preflight._check_serving_framework(_args("sglang"), "/usr/bin/python3")
+
+    out = capsys.readouterr().out
+    assert "ROCm" in out
+    assert "could not verify" not in out
+
+
+@pytest.fixture
+def isolated_vllm(monkeypatch, tmp_path):
+    """The shape install_baremetal.sh switches its own probe on, and returns its python."""
+    venv = tmp_path / "vllm-venv"
+    python = venv / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python.chmod(0o755)
+    monkeypatch.setenv("VLLM_VENV_ROOT", str(venv))
+
+    return str(python)
+
+
+def test_isolated_venv_rocm_build_beats_a_stray_cuda_wheel(isolated_vllm, monkeypatch, capsys):
+    """Stopping at the first importable candidate rejects a working host."""
+    _probe_per_interpreter(
+        monkeypatch,
+        {"/usr/bin/python3": (True, False), isolated_vllm: (True, True)},
+    )
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert isolated_vllm in capsys.readouterr().out
+
+
+def test_isolated_venv_is_probed_before_the_benchmark_interpreter(isolated_vllm, monkeypatch):
+    """Mirror install_baremetal.sh, which switches the probe to the venv."""
+    calls = _probe_per_interpreter(monkeypatch, {isolated_vllm: (True, True)})
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert calls[0][0] == isolated_vllm
+
+
+def test_every_importable_candidate_cuda_still_fails(isolated_vllm, monkeypatch, capsys):
+    """Scanning all candidates must not weaken the gate when all are wrong."""
+    _probe_per_interpreter(
+        monkeypatch,
+        {"/usr/bin/python3": (True, False), isolated_vllm: (True, False)},
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    assert "NOT a ROCm build" in capsys.readouterr().err
+
+
+def test_an_inconclusive_candidate_is_reported_before_a_refuted_one(isolated_vllm, monkeypatch, capsys):
+    """Both stop the run, but "NOT a ROCm build" is a verdict the unclear candidate never reached."""
+    _probe_per_interpreter(
+        monkeypatch,
+        {"/usr/bin/python3": (True, False), isolated_vllm: (True, None)},
+    )
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert "reached no verdict" in err
+    assert "NOT a ROCm build" not in err
+
+
+def test_probe_rocm_build_reports_tri_state(monkeypatch):
+    """The probe distinguishes verified / refuted / inconclusive."""
+
+    class _Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = ""
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", lambda *_a, **_k: _Proc(0))
+    assert framework_probe._probe_rocm_build("vllm", "/usr/bin/python3").verdict is True
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", lambda *_a, **_k: _Proc(1))
+    assert framework_probe._probe_rocm_build("vllm", "/usr/bin/python3").verdict is False
+
+    def _boom(*_a, **_k):
+        raise OSError("probe crashed")
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", _boom)
+    assert framework_probe._probe_rocm_build("vllm", "/usr/bin/python3").verdict is None
+
+    # Absent torch and a signal death are "cannot answer", not "wrong build": calling either a CUDA wheel would be a
+    # wrong diagnosis.
+    for rc in (3, -11):
+        monkeypatch.setattr(framework_probe.subprocess, "run", lambda *_a, _rc=rc, **_k: _Proc(_rc))
+        assert framework_probe._probe_rocm_build("vllm", "/usr/bin/python3").verdict is None
+
+
+def _host_rocm_verdict() -> bool | None:
+    """What this host says about its own torch, resolved out of process."""
+    script = (
+        "import json, sys\n"
+        "try:\n"
+        "    import torch\n"
+        "except BaseException:\n"
+        "    print('null'); sys.exit(0)\n"
+        "print(json.dumps(bool(getattr(torch.version, 'hip', None))))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+    answer = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not answer:
+        return None
+    return json.loads(answer)
+
+
+def test_the_real_probe_agrees_with_this_host():
+    """Runs the probe for real, and derives the expectation from the host."""
+    probe = framework_probe._probe_rocm_build("sglang", sys.executable)
+
+    assert probe.verdict is _host_rocm_verdict()
+
+
+# probe diagnostics
+def _dying_rocm_probe(monkeypatch, stderr: str, *, returncode: int = -11) -> None:
+    """Importable framework whose ROCm probe dies, leaving only stderr behind."""
+
+    class _Proc:
+        def __init__(self, rc: int, err: str = "") -> None:
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = err
+
+    def _run(cmd, *_args, **_kwargs):
+        return _Proc(0) if "find_spec" in cmd[-1] else _Proc(returncode, stderr)
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", _run)
+
+
+def test_the_block_surfaces_the_probe_stderr_tail(monkeypatch, capsys):
+    """A broken ROCm stack is diagnosable only from the stderr the probe drops."""
+    noise = [f"noise-{i}" for i in range(40)]
+    _dying_rocm_probe(monkeypatch, "\n".join([*noise, "ImportError: libamdhip64.so: cannot open"]))
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("sglang"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert "reached no verdict" in err
+    assert "libamdhip64.so" in err
+    assert "noise-0" not in err
+
+
+_DEVICE_INIT_TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "<string>", line 7, in verdict\n'
+    "    torch._C._cuda_init()\n"
+    "RuntimeError: No CUDA GPUs are available\n"
+)
+
+
+def test_a_probe_that_died_on_device_init_blocks_the_run(monkeypatch, capsys):
+    """An exception in the probe reaches no verdict, and the server imports the very same stack."""
+    _dying_rocm_probe(monkeypatch, _DEVICE_INIT_TRACEBACK, returncode=3)
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "reached no verdict" in err
+    # The traceback the baseline would otherwise only show as a dead server.
+    assert "No CUDA GPUs are available" in err
+    assert _SKIP_ENV in err
+
+
+def test_the_blocking_message_states_the_rocm_smi_split(monkeypatch, capsys):
+    """rocm-smi sees cards while the probe reached nothing: report the split, name no cause."""
+    _dying_rocm_probe(monkeypatch, _DEVICE_INIT_TRACEBACK, returncode=3)
+    monkeypatch.setattr(framework_probe, "_rocm_smi_visible_gpus", lambda: (8, None))
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0,1,2,3")
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert "rocm-smi reports 8 GPU(s)" in err
+    assert "ROCR_VISIBLE_DEVICES='0,1,2,3'" in err
+    assert "device-access" not in err
+
+
+def test_an_unreadable_rocm_smi_still_blocks(monkeypatch, capsys):
+    """The split is a diagnostic extra; a missing rocm-smi must not change the verdict."""
+    _dying_rocm_probe(monkeypatch, _DEVICE_INIT_TRACEBACK, returncode=3)
+    monkeypatch.setattr(framework_probe, "_rocm_smi_visible_gpus", lambda: (None, "rocm_smi_unavailable"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "rocm-smi could not be read" in err
+    assert "no visible-device mask set" in err
+
+
+def test_a_failure_with_no_device_marker_blocks_the_same_way(monkeypatch, capsys):
+    """Sorting unclear exits by what their stderr happens to say is the guess this check must not make."""
+    _dying_rocm_probe(monkeypatch, "ImportError: libamdhip64.so: cannot open shared object file")
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("sglang"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    assert "reached no verdict" in capsys.readouterr().err
+
+
+def test_the_escape_hatch_still_clears_an_unverified_build(monkeypatch):
+    """The block must stay skippable, like every other framework verdict."""
+    monkeypatch.setenv(_SKIP_ENV, "1")
+    _refuse_probe(monkeypatch)
+
+    result = preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert result["status"] == "skipped"
+
+
+@pytest.mark.parametrize("returncode", [3, -11])
+@pytest.mark.parametrize("stderr", [_DEVICE_INIT_TRACEBACK, "ImportError: no libhip"])
+def test_any_unclear_exit_reaches_no_verdict_whatever_it_printed(monkeypatch, returncode, stderr):
+    """A caught exception (rc 3) and a signal death both answer nothing; their stderr is evidence, not a class."""
+
+    class _Proc:
+        def __init__(self, rc, err):
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = err
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", lambda *_a, **_k: _Proc(returncode, stderr))
+
+    probe = framework_probe._probe_rocm_build("vllm", "/usr/bin/python3")
+
+    assert probe.verdict is None
+    assert stderr.splitlines()[-1] in probe.detail
+
+
+def test_the_first_unclear_candidate_is_the_one_reported(isolated_vllm, monkeypatch):
+    """Every unclear candidate blocks, so there is nothing to rank: the scan keeps the first."""
+    monkeypatch.setattr(framework_probe, "_framework_importable", lambda _fw, _py: framework_probe._Probe(True))
+    probes = {
+        "/usr/bin/python3": framework_probe._Probe(None, "unclear"),
+        isolated_vllm: framework_probe._Probe(None, _DEVICE_INIT_TRACEBACK),
+    }
+    monkeypatch.setattr(framework_probe, "_probe_rocm_build", lambda _fw, py: probes[py])
+
+    found, probe = framework_probe._resolve_framework_build("vllm", ["/usr/bin/python3", isolated_vllm])
+
+    assert found == "/usr/bin/python3"
+    assert probe.verdict is None
+
+
+def test_probe_stderr_tail_is_bounded():
+    """A ROCm import traceback can be enormous; the warning must stay readable."""
+    tail = framework_probe._probe_stderr_tail("\n".join(f"line-{i} " + "x" * 400 for i in range(500)))
+
+    assert 0 < len(tail) <= 1000
+    assert "line-499" in tail
+    assert "line-0 " not in tail
+
+
+def test_a_remote_server_is_pointed_at_benchmark_base_url(monkeypatch, capsys):
+    """A server that lives elsewhere is configured, not waved through."""
+    _probe_result(monkeypatch, importable=False)
+    monkeypatch.setattr(framework_probe, "_in_container", lambda: False)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert "BENCHMARK_BASE_URL" in err
+    assert err.index("BENCHMARK_BASE_URL") < err.index(_SKIP_ENV)
+    assert "last resort" in err
+
+
+@pytest.mark.parametrize(
+    ("framework", "evidence"),
+    [("vllm", "vllm platform"), ("sglang", "torch.version.hip")],
+)
+def test_the_rocm_verdict_names_its_evidence(monkeypatch, capsys, framework, evidence):
+    """Only vLLM reports its own platform; elsewhere torch's tag is all there is."""
+    _probe_result(monkeypatch, importable=True, rocm=True)
+
+    preflight._check_serving_framework(_args(framework), "/usr/bin/python3")
+
+    assert evidence in capsys.readouterr().out
+
+
+def test_a_refuted_non_vllm_build_blames_torch(monkeypatch, capsys):
+    """For sglang the refuted thing is torch, so the error must not overclaim."""
+    _probe_result(monkeypatch, importable=True, rocm=False)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("sglang"), "/usr/bin/python3")
+
+    err = capsys.readouterr().err
+    assert "NOT a ROCm build" in err
+    assert "torch.version.hip" in err
+
+
+def _timing_out_probe(monkeypatch, *, importable: bool) -> list[float]:
+    """Record every probe timeout; time out on the probe under test."""
+    budget: list[float] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _run(cmd, *_args, **kwargs):
+        timeout = kwargs.get("timeout") or 0
+        budget.append(timeout)
+        if importable and "find_spec" in cmd[-1]:
+            return _Proc()
+        raise framework_probe.subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", _run)
+    return budget
+
+
+@pytest.mark.parametrize("importable", [False, True])
+def test_a_probe_timeout_stops_the_interpreter_scan(monkeypatch, capsys, importable):
+    """Paying a timeout per candidate turned preflight into a 12-minute wait."""
+
+    budget = _timing_out_probe(monkeypatch, importable=importable)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert sum(budget) <= 150, f"worst-case probe budget too large: {budget}"
+    assert "timed out" in capsys.readouterr().err
+
+
+# _in_container signals
+_HOST_CGROUP_V2 = "0::/init.scope\n"
+_CONTAINER_CGROUP_V2 = "0::/\n"
+
+
+def _fake_container_fs(monkeypatch, *, present=(), cgroup=_HOST_CGROUP_V2):
+    """Fake every file _in_container reads; only ``present`` paths exist."""
+
+    class _Node:
+        def __init__(self, path):
+            self._path = str(path)
+
+        def exists(self):
+            return self._path in present
+
+        def read_text(self, **_kwargs):
+            if self._path == "/proc/1/cgroup" and cgroup is not None:
+                return cgroup
+            raise OSError(f"unreadable: {self._path}")
+
+    monkeypatch.setattr(framework_probe, "Path", _Node)
+    monkeypatch.setattr(provenance, "_PID1_CGROUP", _Node("/proc/1/cgroup"))
+    monkeypatch.setattr(provenance, "_read_first_line", lambda _p: "")
+
+
+def test_in_container_detects_a_cgroup_v2_namespace_root(monkeypatch):
+    """Under cgroup v2 the runtime name is gone: /proc/1/cgroup is just \"0::/\"."""
+    _fake_container_fs(monkeypatch, cgroup=_CONTAINER_CGROUP_V2)
+
+    assert framework_probe._in_container() is True
+
+
+def test_in_container_detects_podman(monkeypatch):
+    """podman writes /run/.containerenv, never /.dockerenv."""
+    _fake_container_fs(monkeypatch, present=("/run/.containerenv",), cgroup=_CONTAINER_CGROUP_V2)
+
+    assert framework_probe._in_container() is True
+
+
+def test_in_container_detects_a_kubernetes_pod(monkeypatch):
+    """Every pod gets the API service env injected, whatever the cgroup shape."""
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    _fake_container_fs(monkeypatch)
+
+    assert framework_probe._in_container() is True
+
+
+def test_in_container_trusts_an_on_disk_image_marker(monkeypatch):
+    """A projected/baked image marker file only exists inside the image."""
+    _fake_container_fs(monkeypatch)
+    monkeypatch.setattr(provenance, "_read_first_line", lambda p: "rocm-image" if "podinfo" in str(p) else "")
+
+    assert framework_probe._in_container() is True
+
+
+def test_host_image_env_is_not_container_proof(monkeypatch):
+    """The demo skills export HYPERLOOM_IMAGE on the *host* to pick an image."""
+    monkeypatch.setenv("HYPERLOOM_IMAGE", "rocm-image")
+    _fake_container_fs(monkeypatch)
+
+    assert framework_probe._in_container() is False
+
+
+def test_in_container_is_false_on_a_cgroup_v2_host(monkeypatch):
+    """Regression guard: the dev host is cgroup v2 and is not a container."""
+    _fake_container_fs(monkeypatch)
+
+    assert framework_probe._in_container() is False
+
+
+def test_in_container_prefers_container_when_no_signal_is_readable(monkeypatch):
+    """A false negative gives wrong advice; a false positive only less specific."""
+    _fake_container_fs(monkeypatch, cgroup=None)
+
+    assert framework_probe._in_container() is True
+
+
+_SETUP_INSTALLER = "inference_optimizer/assets/install_baremetal.sh"
+
+
+def test_atom_missing_build_is_blocked_with_the_setup_install_remedy(monkeypatch, capsys):
+    _probe_result(monkeypatch, importable=False)
+    monkeypatch.setattr(framework_probe.shutil, "which", lambda _name: sys.executable)
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), "/usr/bin/python3")
+
+    assert failure.value.code == 2
+    output = capsys.readouterr()
+    assert "atom" in output.err.lower()
+    assert framework_probe._setup_install_command("atom") in output.err
+
+
+@pytest.fixture
+def atom_runtime(monkeypatch, tmp_path):
+    """Run the real child probes against CPU-only fixture packages."""
+    root = tmp_path / "runtime modules"
+    atom = root / "atom"
+    atom.mkdir(parents=True)
+    (atom / "__init__.py").write_text("", encoding="utf-8")
+    (root / "torch.py").write_text(
+        "from types import SimpleNamespace\nversion = SimpleNamespace(hip='test-rocm')\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(root))
+    monkeypatch.setenv("PYTHON", sys.executable)
+    # python3 is a Windows Store shim on this host; substitute only OS lookup, not the probe or verdict.
+    monkeypatch.setattr(framework_probe.shutil, "which", lambda name: sys.executable if name == "python3" else None)
+    return root
+
+
+def test_atom_checks_the_actual_server_python_not_the_benchmark_python(atom_runtime):
+    result = preflight._check_serving_framework(_args("atom"), "/unrelated/benchmark-python")
+
+    assert result["status"] == "applied"
+    assert result["detail"]["probe_interpreter"] == sys.executable
+    assert os.environ[RESOLVED_FRAMEWORK_PYTHON_ENV] == sys.executable
+
+
+def test_atom_import_failure_cannot_pass_a_find_spec_check(atom_runtime, capsys):
+    (atom_runtime / "atom" / "__init__.py").write_text(
+        "raise ImportError('atom runtime dependency is broken')\n", encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), sys.executable)
+
+    assert failure.value.code == 2
+    assert "atom runtime dependency is broken" in capsys.readouterr().err
+
+
+def test_atom_cpu_torch_is_rejected_by_the_real_probe(atom_runtime, capsys):
+    (atom_runtime / "torch.py").write_text(
+        "from types import SimpleNamespace\nversion = SimpleNamespace(hip=None)\n", encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), sys.executable)
+
+    assert failure.value.code == 2
+    assert "torch.version.hip" in capsys.readouterr().err
+
+
+def test_atom_explicit_bad_python_pin_is_not_ignored(atom_runtime, monkeypatch, capsys):
+    monkeypatch.setenv("PYTHON", str(atom_runtime / "missing-python"))
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), sys.executable)
+
+    assert failure.value.code == 2
+    assert "PYTHON" in capsys.readouterr().err
+    assert os.environ["PYTHON"] == str(atom_runtime / "missing-python")
+
+
+def test_atom_rejects_a_different_python3_prefix(atom_runtime, monkeypatch, tmp_path, capsys):
+    import venv
+
+    environment = tmp_path / "other-python"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(environment)
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    monkeypatch.setenv("PYTHON", str(python))
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), sys.executable)
+
+    assert failure.value.code == 2
+    assert "prefix" in capsys.readouterr().err
+
+
+def test_atom_rejects_an_unrelated_virtual_env(atom_runtime, monkeypatch, capsys):
+    monkeypatch.setenv("VIRTUAL_ENV", str(atom_runtime / "unrelated-venv"))
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), sys.executable)
+
+    assert failure.value.code == 2
+    assert "VIRTUAL_ENV" in capsys.readouterr().err
+
+
+def test_atom_missing_python3_is_not_replaced_by_driver_python(atom_runtime, monkeypatch, capsys):
+    monkeypatch.setattr(framework_probe.shutil, "which", lambda _name: None)
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), sys.executable)
+
+    assert failure.value.code == 2
+    assert "python3" in capsys.readouterr().err
+
+
+def test_the_installable_set_matches_the_installer():
+    """Two lists that must agree, in different languages, with nothing else tying them together."""
+    from pathlib import Path
+
+    import hyperloom
+
+    source = (Path(hyperloom.__file__).parent / _SETUP_INSTALLER).read_text(encoding="utf-8")
+    accepted = re.search(r"^\s*(none\|[a-z|]+)\)\s*;;", source, re.MULTILINE)
+    assert accepted, "could not find the --install-framework case arm"
+    declared = {value for value in accepted.group(1).split("|") if value != "none"}
+
+    assert declared == set(framework_probe._SETUP_INSTALLABLE_FRAMEWORKS), (
+        f"installer accepts {declared}, preflight believes {set(framework_probe._SETUP_INSTALLABLE_FRAMEWORKS)}"
+    )
+
+
+def test_atom_cuda_build_is_blocked_without_an_install_remedy(monkeypatch, capsys):
+    _probe_result(monkeypatch, importable=True, rocm=False)
+    monkeypatch.setattr(framework_probe.shutil, "which", lambda _name: sys.executable)
+
+    with pytest.raises(SystemExit) as failure:
+        preflight._check_serving_framework(_args("atom"), "/usr/bin/python3")
+
+    assert failure.value.code == 2
+    combined = capsys.readouterr()
+    assert "--install-framework atom" not in combined.out + combined.err
+
+
+# Wiring: nothing above proves _preflight still calls the gate
+def test_preflight_still_invokes_the_gate():
+    """Every other test calls the gate directly, so deleting the one line that reaches it from _preflight would leave them all green."""
+    import ast
+    from pathlib import Path as _Path
+
+    source = _Path(preflight.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    target = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_preflight")
+    called = {
+        node.func.id for node in ast.walk(target) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert "_check_serving_framework" in called
+
+
+@pytest.mark.parametrize("framework", sorted(framework_probe._SETUP_INSTALLABLE_FRAMEWORKS))
+def test_the_remedy_matches_the_documented_setup_invocation(framework):
+    """Printing a command promises it runs."""
+    from pathlib import Path as _Path
+
+    import hyperloom
+
+    skill = (_Path(hyperloom.__file__).parent / "skills/hyperloom-setup/SKILL.md").read_text(encoding="utf-8")
+    documented = [
+        line.strip()
+        for line in skill.splitlines()
+        if "-m hyperloom setup" in line and f"--install-framework {framework}" in line
+    ]
+    assert documented, f"no documented setup line for {framework}"
+
+    assert framework_probe._setup_install_command(framework) in documented
+
+
+# --- the resolved-interpreter publish contract -----------------------------
+
+
+def test_a_resolved_interpreter_is_published_with_its_framework(monkeypatch):
+    """provenance reads the pair; an unlabelled interpreter is unusable."""
+    _probe_result(monkeypatch, importable=True)
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert os.environ[RESOLVED_FRAMEWORK_PYTHON_ENV] == "/usr/bin/python3"
+    assert os.environ[RESOLVED_FRAMEWORK_ENV] == "vllm"
+
+
+def test_a_refuted_build_is_not_published(monkeypatch):
+    """A candidate proven to be the wrong build must not become the answer."""
+    _probe_result(monkeypatch, importable=True, rocm=False)
+    monkeypatch.setattr(framework_probe, "_in_container", lambda: False)
+
+    with pytest.raises(SystemExit):
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert RESOLVED_FRAMEWORK_PYTHON_ENV not in os.environ
+    assert RESOLVED_FRAMEWORK_ENV not in os.environ
+
+
+def test_a_rocm_probe_timeout_publishes_nothing(monkeypatch):
+    """A probe that ran out of time verified nothing, so there is no resolved interpreter to hand on."""
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(framework_probe.subprocess, "run", lambda cmd, *a, **k: _Proc())
+    monkeypatch.setattr(
+        framework_probe,
+        "_probe_rocm_build",
+        lambda _fw, _py: framework_probe._Probe(None, timed_out=True),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert excinfo.value.code == 2
+    assert RESOLVED_FRAMEWORK_PYTHON_ENV not in os.environ
+    assert RESOLVED_FRAMEWORK_ENV not in os.environ
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        pytest.param(lambda mp: mp.setenv(_SKIP_ENV, "1"), id="skip_env"),
+        pytest.param(lambda mp: mp.setenv("BENCHMARK_BASE_URL", "http://serving-host:8888"), id="remote_url"),
+        pytest.param(
+            lambda mp: (
+                mp.setenv("HYPERLOOM_MN_EXT_SERVICE_URL", "http://claw-rayjob:8000"),
+                mp.setenv("INFERENCE_OPTIMIZER_NODES", "2"),
+            ),
+            id="external_multi_node",
+        ),
+    ],
+)
+def test_an_exempt_path_publishes_nothing(monkeypatch, setup):
+    """Serving is not local on these paths, so there is no resolution to publish."""
+    setup(monkeypatch)
+    _refuse_probe(monkeypatch)
+
+    preflight._check_serving_framework(_args("vllm"), "/usr/bin/python3")
+
+    assert RESOLVED_FRAMEWORK_PYTHON_ENV not in os.environ
+    assert RESOLVED_FRAMEWORK_ENV not in os.environ
+
+
+def test_a_non_venv_interpreter_does_not_force_unknown(monkeypatch, tmp_path):
+    """A system prefix keeps packages in ``dist-packages``, not ``site-packages``."""
+    (tmp_path / "lib" / "python3.12" / "dist-packages").mkdir(parents=True)
+    (tmp_path / "bin").mkdir()
+    interpreter = tmp_path / "bin" / "python3"
+    interpreter.touch()
+
+    _probe_result(monkeypatch, importable=True)
+    preflight._check_serving_framework(_args("vllm"), str(interpreter))
+
+    assert provenance._framework_site_packages(os.environ, "vllm") is None

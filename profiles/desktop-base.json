@@ -1,0 +1,22 @@
+{
+  "library/hyperloom/src/hyperloom/agents/critic/GUIDE.md": "6afefa559a32abe109623b8bf7d4a11bbf69f83e1b4f581cf50cb71ed86478c1",
+  "library/hyperloom/src/hyperloom/inference_optimizer/GUIDE.md": "0d70f284e5c2233813f9deaa8ff79ae99ecf61cc8814ea71f1e17b39de63e80a",
+  "library/kernelwiki/INSTALLATION.json": "8dec72f298a1a6eeacbc0c12b03cbf8c3d3a307a50dc77588a6e1b00904c9333",
+  "library/kernelwiki/index.md": "13472cee6beadc3bd483f63acf83ce574279391361b91621441330c39795ded4",
+  "library/kernelwiki/wiki/kernels/deepgemm.md": "ec3dcdc9cc6f3aca802d0316ab6d738751c596f470d7e604702e16859653ba4d",
+  "library/kernelwiki/wiki/kernels/flash-attention-4.md": "c8c60515a9b5029b00532371db16b8667b29627ab00f4a3c41b5c67a17d6597a",
+  "library/kernelwiki/wiki/kernels/flashmla.md": "48e0419e0cfc919c488c2af16433b4e4ea8a41883e6956035c2eb94416404774",
+  "library/kernelwiki/wiki/kernels/fused-moe.md": "0cfaba694bc223354fb23b72d3c38fb4e0cb386d71591f70385b6e1f0f58fece",
+  "library/kernelwiki/wiki/kernels/gated-delta-net.md": "41b0520744724d1bb0f2817182a598072f41d3f6a6f212f2fdd6dc16f1bdb335",
+  "library/kernelwiki/wiki/kernels/gated-dual-gemm.md": "7c58787609ba90d3e19d031195b1f8e1980383e60bfae2054516bc0c92c95086",
+  "library/kernelwiki/wiki/kernels/nvfp4-gemm.md": "19d088e1840f9d5cdab7a40fd428dff7d1f89cf616cfb399b91ac76d08a3e571",
+  "library/kernelwiki/wiki/kernels/nvfp4-gemv.md": "db7a0da9e177e5d954ce205f22338ecbdb44d23f676faeda4b85b4f7cec9111b",
+  "library/kernelwiki/wiki/languages/cuda-cpp.md": "8a8ee6fc42df555b90d95435a1b0fb17cd2b0853f846e553c5be9f7e30c72728",
+  "library/kernelwiki/wiki/languages/cute-dsl.md": "3898b3631ce2672142e523df17dc38c4ac0544328e8d9e71937d569920bfa209",
+  "library/kernelwiki/wiki/languages/triton-blackwell.md": "d0f0f2dd6ac0daef4b396ed102c9e95fb76751177a3de335a9ad065fee1c99c6",
+  "library/kernelwiki/wiki/techniques/epilogue-fusion.md": "a0c029c75e2ad665f2a910dbd006f267e8e0cbf6433e0d15e2cc89fdc2634b58",
+  "library/kernelwiki/wiki/techniques/persistent-kernels.md": "6ec7e0bc13e842547ab7fb80bf6ebae5fc59290629f6e2aa00b796169e045442",
+  "library/kernelwiki/wiki/techniques/ping-pong-scheduling.md": "83e5c48d2352d5d6caa6c7d163c2680c820087fe8104cc5b7031cda52d3c4f29",
+  "library/kernelwiki/wiki/techniques/warp-specialization.md": "ae13051a6ab252e3ca710332dd295495cadf97ccfcb8dce94e32857255d1f6d0",
+  "references/semantic-review-index.json": "11970f20b749cde31375ee74d0912623a32178737b431f090bb6fc84bd0b3e68"
+}

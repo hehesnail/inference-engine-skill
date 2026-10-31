@@ -1,0 +1,1145 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the shared aiter JIT lock-sweep helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from hyperloom.orchestrator.actions.executors import _aiter_jit as aj
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    """Keep the developer's own ``~/.aiter`` caches and ambient AITER install out of resolution."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    for var in ("AITER_ROOT_DIR", "AITER_JIT_DIR", "INFERENCE_OPTIMIZER_AITER_JIT_DIR", "VLLM_VENV_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(aj, "AITER_CPP_BUILD_PROBE_PATHS", ())
+    monkeypatch.setattr(aj, "AITER_JIT_PROBE_PATHS", ())
+    return home
+
+
+# probe_aiter_jit_cache
+
+
+def test_probe_measures_the_runtime_cache_not_the_package(tmp_path, monkeypatch, serving_package):
+    """``AITER_JIT_DIR`` relocates the cache the next start reads, so it decides cold vs warm."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    for index in range(aj.COLD_START_KERNEL_THRESHOLD):
+        (serving_package / "jit" / f"module_{index}.so").write_bytes(b"x")
+    monkeypatch.setenv("AITER_JIT_DIR", str(runtime))
+
+    assert aj.probe_aiter_jit_cache() == {
+        "path": str(runtime),
+        "kernel_count": 0,
+        "size_mb": 0,
+        "is_cold": True,
+        "probe_status": "found",
+    }
+
+
+def test_probe_counts_the_whole_readonly_package_home_cache(tmp_path, monkeypatch, serving_package):
+    """A read-only package serves out of ``~/.aiter/jit``; its top-level modules count too."""
+    cache = tmp_path / "home" / ".aiter" / "jit"
+    (cache / "build" / "module_a").mkdir(parents=True)
+    (cache / "module_gemm.so").write_bytes(b"x" * (3 * 1024 * 1024))
+    (cache / "build" / "module_a" / "module_a.so").write_bytes(b"y")
+    real_access = os.access
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: False if Path(path) == serving_package / "jit" else real_access(path, mode)
+    )
+
+    assert aj.probe_aiter_jit_cache() == {
+        "path": str(cache),
+        "kernel_count": 2,
+        "size_mb": 3,
+        "is_cold": True,
+        "probe_status": "found",
+    }
+
+
+def test_probe_keeps_an_unavailable_cache_out_of_the_cold_verdict(monkeypatch, serving_package):
+    """An empty ``AITER_JIT_DIR`` leaves no runtime cache at all, which is not a cold one."""
+    monkeypatch.setenv("AITER_JIT_DIR", "")
+
+    assert aj.probe_aiter_jit_cache() == {
+        "path": None,
+        "kernel_count": 0,
+        "size_mb": 0,
+        "is_cold": None,
+        "probe_status": "not_found",
+    }
+
+
+def test_probe_reports_an_unreadable_cache_as_an_error(monkeypatch, serving_package):
+    def _boom(*_args, **_kwargs):
+        raise OSError("cache unreadable")
+
+    monkeypatch.setattr(Path, "rglob", _boom)
+
+    probe = aj.probe_aiter_jit_cache()
+
+    assert probe["probe_status"] == "error"
+    assert probe["is_cold"] is None
+
+
+def test_probe_keeps_the_explicit_wrapper_override(tmp_path, monkeypatch, serving_package):
+    selected = tmp_path / "manual" / "jit"
+    selected.mkdir(parents=True)
+    (selected / "module_gemm.so").write_bytes(b"z")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", f"  {selected}  ")
+
+    probe = aj.probe_aiter_jit_cache()
+
+    assert probe["path"] == str(selected)
+    assert probe["kernel_count"] == 1
+    assert probe["is_cold"] is True
+
+
+# clean_stale_aiter_locks
+
+
+def test_clean_no_dir_returns_zero_stats():
+    stats = aj.clean_stale_aiter_locks(Path("/definitely/not/here/aiter"))
+    assert stats["scanned"] == 0
+    assert stats["deleted"] == 0
+
+
+def test_clean_unresolvable_dir_returns_empty_stats(monkeypatch):
+    # Force resolution to yield no trees so the empty-list early return is hit.
+    monkeypatch.setattr(aj, "_resolve_lock_sweep_dirs", lambda d, unreadable=None: [])
+    stats = aj.clean_stale_aiter_locks(None)
+    assert stats["dir"] is None
+    assert stats["scanned"] == 0
+
+
+def test_clean_deletes_stale_lock(tmp_path):
+    lock = tmp_path / "lock"
+    lock.write_text("", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=5)
+    assert stats["scanned"] == 1
+    assert stats["deleted"] == 1
+    assert not lock.exists()
+
+
+def test_clean_skips_fresh_lock(tmp_path):
+    lock = tmp_path / ".ninja_lock"
+    lock.write_text("", encoding="utf-8")
+
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=5)
+    assert stats["scanned"] == 1
+    assert stats["skipped_fresh"] == 1
+    assert lock.exists()
+
+
+def test_clean_matches_lock_prefix(tmp_path):
+    lock = tmp_path / "lock_moduleA"
+    lock.write_text("", encoding="utf-8")
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=0)
+    assert stats["deleted"] == 1
+
+
+def test_clean_ignores_non_lock_files(tmp_path):
+    (tmp_path / "kernel.so").write_text("", encoding="utf-8")
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=0)
+    assert stats["scanned"] == 0
+
+
+def test_clean_counts_unlink_error(tmp_path, monkeypatch):
+    lock = tmp_path / "lock"
+    lock.write_text("", encoding="utf-8")
+
+    def _boom(self, *a, **k):
+        raise OSError("cannot unlink")
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=0)
+    assert stats["errors"] == 1
+
+
+def test_clean_counts_stat_error(tmp_path, monkeypatch):
+    lock = tmp_path / "lock"
+    lock.write_text("", encoding="utf-8")
+
+    real_stat = Path.stat
+
+    def _stat(self, *a, **k):
+        if self.name == "lock":
+            raise OSError("stat failed")
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=0)
+    assert stats["errors"] == 1
+
+
+def test_clean_walk_oserror(tmp_path, monkeypatch):
+    def _boom(*a, **k):
+        raise OSError("walk failed")
+
+    monkeypatch.setattr(aj.os, "walk", _boom)
+    stats = aj.clean_stale_aiter_locks(tmp_path, stale_minutes=0)
+    assert stats["errors"] == 1
+
+
+def test_auto_resolution_sweeps_cpp_and_jit_build_trees(tmp_path, monkeypatch):
+    aiter_root = tmp_path / "cpp"
+    jit_root = tmp_path / "jit"
+    cpp_lock = aiter_root / "build" / "pa_ragged" / "lock"
+    jit_lock = jit_root / "build" / "lock_module"
+    cpp_lock.parent.mkdir(parents=True)
+    jit_lock.parent.mkdir(parents=True)
+    cpp_lock.write_text("", encoding="utf-8")
+    jit_lock.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AITER_ROOT_DIR", str(aiter_root))
+    monkeypatch.setenv("AITER_JIT_DIR", str(jit_root))
+    monkeypatch.setattr(aj, "AITER_CPP_BUILD_PROBE_PATHS", ())
+    monkeypatch.setattr(aj, "AITER_JIT_PROBE_PATHS", ())
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+
+    stats = aj.clean_stale_aiter_locks(stale_minutes=0)
+
+    assert stats["deleted"] == 2
+    assert str(aiter_root / "build") in stats["dirs"]
+    assert str(jit_root / "build") in stats["dirs"]
+    assert not cpp_lock.exists()
+    assert not jit_lock.exists()
+
+
+def test_home_build_tree_outranks_the_root_fallback(tmp_path, monkeypatch):
+    """``/root/.aiter/build`` must stay a last resort behind $HOME."""
+    home = tmp_path / "home"
+    (home / ".aiter" / "build").mkdir(parents=True)
+    monkeypatch.delenv("AITER_ROOT_DIR", raising=False)
+    monkeypatch.delenv("AITER_JIT_DIR", raising=False)
+    monkeypatch.delenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+
+    dirs = [str(d) for d in aj._resolve_lock_sweep_dirs(None)]
+
+    assert dirs.index(str(home / ".aiter" / "build")) == 0
+    assert aj.AITER_CPP_BUILD_PROBE_PATHS[-1] == "/root/.aiter/build"
+
+
+def test_lock_sweep_reaches_the_readonly_package_home_cache(tmp_path, monkeypatch, serving_package):
+    """A read-only package compiles into ``~/.aiter/jit``, so its baton locks are ours to sweep."""
+    lock = tmp_path / "home" / ".aiter" / "jit" / "build" / "module_a" / "lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    real_access = os.access
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: False if Path(path) == serving_package / "jit" else real_access(path, mode)
+    )
+
+    stats = aj.clean_stale_aiter_locks(stale_minutes=5)
+
+    assert stats["scanned"] == 1
+    assert stats["deleted"] == 1
+    assert not lock.exists()
+
+
+def test_lock_sweep_keeps_a_private_cache_without_an_importable_package(tmp_path, monkeypatch, isolated_home):
+    """``resolve_serving_context`` has no answer without a package; the sweep still must."""
+    from hyperloom_common.aiter_jit_cache import resolve_serving_context
+
+    lock = tmp_path / "private" / "build" / "module_a" / "lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("", encoding="utf-8")
+    os.utime(lock, (time.time() - 3600,) * 2)
+    monkeypatch.setenv("AITER_JIT_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+
+    assert resolve_serving_context(jit_probe_paths=aj.AITER_JIT_PROBE_PATHS) is None
+    stats = aj.clean_stale_aiter_locks(stale_minutes=5)
+
+    assert stats["deleted"] == 1
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize("override", ["~/private-cache", " private-cache"])
+def test_lock_sweep_reads_the_runtime_override_verbatim(tmp_path, monkeypatch, isolated_home, override):
+    """AITER reads ``AITER_JIT_DIR`` literally: no tilde expansion, no whitespace trimming."""
+    monkeypatch.chdir(tmp_path)
+    lock = Path(override) / "build" / "lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("", encoding="utf-8")
+    os.utime(lock, (time.time() - 3600,) * 2)
+    monkeypatch.setenv("AITER_JIT_DIR", override)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+
+    stats = aj.clean_stale_aiter_locks(stale_minutes=5)
+
+    assert stats["deleted"] == 1
+    assert not lock.exists()
+
+
+def test_unreadable_fallback_tree_does_not_raise(tmp_path, monkeypatch):
+    """The sweep documents \"never raises\", and resolution runs before it."""
+    denied = tmp_path / "locked" / "build"
+    real_is_dir = Path.is_dir
+
+    def _deny_one(self, *args, **kwargs):
+        if str(self) == str(denied):
+            raise PermissionError(13, "Permission denied")
+        return real_is_dir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", _deny_one)
+    monkeypatch.setattr(aj, "AITER_CPP_BUILD_PROBE_PATHS", (str(denied),))
+    for var in ("AITER_ROOT_DIR", "AITER_JIT_DIR", "INFERENCE_OPTIMIZER_AITER_JIT_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+
+    stats = aj.clean_stale_aiter_locks(stale_minutes=0)
+
+    assert stats["deleted"] == 0
+    # "errors counted" is the documented contract; an all-zero stats dict would read as a clean sweep of a tree that
+    # was never looked at.
+    assert stats["errors"] >= 1
+    assert any(str(denied) in entry for entry in stats["unreadable"])
+
+
+def test_find_aiter_baton_wait_returns_bounded_evidence(tmp_path):
+    server_log = tmp_path / "warmup" / "server.log"
+    server_log.parent.mkdir()
+    server_log.write_text(
+        "model loaded\n[aiter] waiting for baton release at /root/.aiter/build/pa_ragged/lock\n",
+        encoding="utf-8",
+    )
+
+    evidence = aj.find_aiter_baton_wait(tmp_path)
+
+    assert evidence is not None
+    assert evidence["log_path"] == str(server_log)
+    assert "waiting for baton release" in evidence["excerpt"]
+
+
+# _any_live_compiler
+
+
+class _FakeProc:
+    def __init__(self, info):
+        self.info = info
+
+
+def _install_fake_psutil(monkeypatch, procs, iter_raises=False):
+    import types
+
+    fake = types.ModuleType("psutil")
+
+    class Error(Exception):
+        pass
+
+    class NoSuchProcess(Error):
+        pass
+
+    class AccessDenied(Error):
+        pass
+
+    class ZombieProcess(NoSuchProcess):
+        pass
+
+    fake.Error = Error
+    fake.NoSuchProcess = NoSuchProcess
+    fake.AccessDenied = AccessDenied
+    fake.ZombieProcess = ZombieProcess
+    fake.STATUS_ZOMBIE = "zombie"
+
+    def _process_iter(fields):
+        if iter_raises:
+            raise Error("enum blew up")
+        return iter(procs)
+
+    fake.process_iter = _process_iter
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake)
+    return fake
+
+
+def test_any_live_compiler_psutil_missing(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert aj._any_live_compiler() is None
+
+
+def test_any_live_compiler_name_match(monkeypatch):
+    _install_fake_psutil(monkeypatch, [_FakeProc({"name": "ninja", "cmdline": []})])
+    assert aj._any_live_compiler() is True
+
+
+def test_any_live_compiler_cmdline_match(monkeypatch):
+    _install_fake_psutil(
+        monkeypatch,
+        [_FakeProc({"name": "sh", "cmdline": ["/usr/bin/hipcc", "-c", "x.cpp"]})],
+    )
+    assert aj._any_live_compiler() is True
+
+
+def test_live_compiler_filter_ignores_unrelated_build(monkeypatch, tmp_path):
+    _install_fake_psutil(
+        monkeypatch,
+        [
+            _FakeProc(
+                {
+                    "name": "hipcc",
+                    "cmdline": ["hipcc", "-c", "/dev/null", "-o", "/dev/null"],
+                    "cwd": "/tmp/unrelated",
+                }
+            )
+        ],
+    )
+
+    assert aj._any_live_compiler([tmp_path / "aiter" / "build"]) is False
+
+
+def test_live_compiler_filter_matches_build_output(monkeypatch, tmp_path):
+    build_dir = tmp_path / "aiter" / "build"
+    _install_fake_psutil(
+        monkeypatch,
+        [
+            _FakeProc(
+                {
+                    "name": "hipcc",
+                    "cmdline": [
+                        "hipcc",
+                        "-c",
+                        "/src/attention.cu",
+                        "-o",
+                        str(build_dir / "pa_ragged" / "attention.o"),
+                    ],
+                    "cwd": "/src",
+                }
+            )
+        ],
+    )
+
+    assert aj._any_live_compiler([build_dir]) is True
+
+
+def test_any_live_compiler_none_alive(monkeypatch):
+    _install_fake_psutil(
+        monkeypatch,
+        [_FakeProc({"name": "python", "cmdline": ["python", "run.py"]})],
+    )
+    assert aj._any_live_compiler() is False
+
+
+def test_any_live_compiler_enum_error(monkeypatch):
+    _install_fake_psutil(monkeypatch, [], iter_raises=True)
+    assert aj._any_live_compiler() is None
+
+
+class _RaisingProc:
+    """A proc whose ``.info`` access raises a per-process psutil error."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    @property
+    def info(self):
+        raise self._exc
+
+
+def test_any_live_compiler_skips_dead_process(monkeypatch):
+    fake = _install_fake_psutil(monkeypatch, [])
+    procs = [
+        _RaisingProc(fake.NoSuchProcess()),
+        _FakeProc({"name": "ninja", "cmdline": []}),
+    ]
+    # Raising proc first so the per-proc except runs before the real match.
+    import sys
+
+    def _iter(fields):
+        return iter(procs)
+
+    fake.process_iter = _iter
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+    assert aj._any_live_compiler() is True
+
+
+# sweep_stale_aiter_locks_if_dead
+
+
+def test_sweep_skips_when_compiler_alive(monkeypatch):
+    monkeypatch.setattr(aj, "_any_live_compiler", lambda *_args: True)
+    stats = aj.sweep_stale_aiter_locks_if_dead(Path("/whatever"))
+    assert stats["skipped_live"] is True
+    assert stats["compiler_alive"] is True
+
+
+def test_sweep_unknown_liveness_preserves_stale_lock(tmp_path, monkeypatch):
+    lock = tmp_path / "lock"
+    lock.write_text("", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(lock, (old, old))
+    monkeypatch.setattr(aj, "_any_live_compiler", lambda *_args: None)
+    stats = aj.sweep_stale_aiter_locks_if_dead(tmp_path)
+    assert stats["compiler_alive"] is None
+    assert stats["deleted"] == 0
+    assert stats["errors"] == 1
+    assert lock.exists()
+
+
+def test_any_live_compiler_access_denied_is_unknown(monkeypatch):
+    fake = _install_fake_psutil(monkeypatch, [])
+    fake.process_iter = lambda fields: iter([_RaisingProc(fake.AccessDenied())])
+    assert aj._any_live_compiler() is None
+
+
+def test_any_live_compiler_unreadable_identity_is_unknown(monkeypatch):
+    _install_fake_psutil(monkeypatch, [_FakeProc({"name": None, "cmdline": None, "cwd": None})])
+    assert aj._any_live_compiler() is None
+
+
+def test_live_compiler_unreadable_build_location_is_unknown(monkeypatch, tmp_path):
+    _install_fake_psutil(monkeypatch, [_FakeProc({"name": "hipcc", "cmdline": None, "cwd": None})])
+    assert aj._any_live_compiler([tmp_path]) is None
+
+
+def test_live_compiler_match_wins_over_access_denied(monkeypatch):
+    fake = _install_fake_psutil(monkeypatch, [])
+    fake.process_iter = lambda fields: iter(
+        [_RaisingProc(fake.AccessDenied()), _FakeProc({"name": "ninja", "cmdline": []})]
+    )
+    assert aj._any_live_compiler() is True
+
+
+def test_sweep_dead_compiler_keeps_fresh_ownerless_lock(tmp_path, monkeypatch):
+    lock = tmp_path / "lock"
+    lock.write_text("", encoding="utf-8")
+    monkeypatch.setattr(aj, "_any_live_compiler", lambda *_args: False)
+    stats = aj.sweep_stale_aiter_locks_if_dead(tmp_path)
+    assert stats["compiler_alive"] is False
+    assert stats["deleted"] == 0
+    assert stats["skipped_fresh"] == 1
+    assert lock.exists()
+
+
+def test_csv_jit_kernel_rows_skips_blank_kernel_names(tmp_path):
+    csv_path = tmp_path / "tuned.csv"
+    csv_path.write_text(
+        "M,N,K,kernelName,libtype\n16,512,7168,kernel_a,ck\n32,512,7168,,ck\n64,512,7168,kernel_b,ck\n",
+        encoding="utf-8",
+    )
+    names = {name for name, _ in aj.csv_jit_kernel_rows(csv_path)}
+    assert names == {"kernel_a", "kernel_b"}
+
+
+def test_serving_modules_cover_csv_when_names_are_in_so(tmp_path):
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    so_path = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    so_path.write_bytes(b"padding kernel_a more kernel_b padding")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text("kernelName\nkernel_a\nkernel_b\n", encoding="utf-8")
+    assert aj.serving_modules_cover_csv(
+        jit_dir,
+        ("module_gemm_a8w8_blockscale_bpreshuffle",),
+        csv_path,
+    )
+
+
+def test_serving_modules_cover_csv_false_when_name_missing(tmp_path):
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    so_path = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    so_path.write_bytes(b"only kernel_a")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text("kernelName\nkernel_a\nkernel_b\n", encoding="utf-8")
+    assert not aj.serving_modules_cover_csv(
+        jit_dir,
+        ("module_gemm_a8w8_blockscale_bpreshuffle",),
+        csv_path,
+    )
+
+
+def test_serving_modules_cover_csv_ignores_asm_kernel_names(tmp_path):
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    so_path = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    so_path.write_bytes(b"padding kernel_ck padding")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text(
+        "libtype,kernelName\nck,kernel_ck\nasm,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_64x128E\n",
+        encoding="utf-8",
+    )
+    assert aj.serving_modules_cover_csv(
+        jit_dir,
+        ("module_gemm_a8w8_blockscale_bpreshuffle",),
+        csv_path,
+    )
+
+
+def test_serving_modules_cover_csv_finds_cktile_in_bpreshuffle_cktile_so(tmp_path):
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    (jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so").write_bytes(b"a8w8_blockscale_bpreshuffle_ck")
+    (jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle_cktile.so").write_bytes(
+        b"a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1"
+    )
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text(
+        "libtype,kernelName\n"
+        "ck,a8w8_blockscale_bpreshuffle_ck\n"
+        "cktile,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1\n",
+        encoding="utf-8",
+    )
+    assert aj.serving_modules_cover_csv(
+        jit_dir,
+        aj.AITER_ENV_TO_SERVING_MODULES["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"],
+        csv_path,
+    )
+
+
+def test_serving_modules_cover_csv_false_when_cktile_only_in_tune_so(tmp_path):
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    (jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so").write_bytes(b"a8w8_blockscale_bpreshuffle_ck")
+    (jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle_cktile.so").write_bytes(b"other_cktile")
+    (jit_dir / "module_gemm_a8w8_blockscale_cktile_tune.so").write_bytes(
+        b"a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1"
+    )
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text(
+        "libtype,kernelName\n"
+        "ck,a8w8_blockscale_bpreshuffle_ck\n"
+        "cktile,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1\n",
+        encoding="utf-8",
+    )
+    assert not aj.serving_modules_cover_csv(
+        jit_dir,
+        aj.AITER_ENV_TO_SERVING_MODULES["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"],
+        csv_path,
+    )
+
+
+def test_serving_modules_cover_csv_when_so_absent(tmp_path):
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text("kernelName\nkernel_a\n", encoding="utf-8")
+    assert aj.serving_modules_cover_csv(
+        jit_dir,
+        ("module_gemm_a8w8_blockscale_bpreshuffle",),
+        csv_path,
+    )
+
+
+def test_prepare_serving_so_skips_when_only_asm_names_are_outside_so(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    so_path = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    so_path.write_bytes(b"kernel_ck")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text(
+        "libtype,kernelName\nck,kernel_ck\nasm,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_64x128E\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit_dir))
+    result = aj.prepare_serving_so_for_csvs(
+        {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": csv_path.name},
+        backup_dir=tmp_path / "backup",
+    )
+    assert result["action"] == "skip"
+    assert so_path.is_file()
+
+
+@pytest.mark.parametrize("override_leaf", ["jit", "jit/build"])
+def test_prepare_serving_so_skips_when_cktile_lives_in_bpreshuffle_cktile_so(tmp_path, monkeypatch, override_leaf):
+    monkeypatch.chdir(tmp_path)
+    ambient = tmp_path / "site" / "aiter"
+    (ambient / "configs").mkdir(parents=True)
+    (ambient / "__init__.py").write_text("raise AssertionError('AITER must not be imported')\n", encoding="utf-8")
+    (ambient / "configs" / "a8w8_blockscale_tuned_gemm.csv").write_text(
+        "libtype,kernelName\ncktile,a8w8_blockscale_cktile_ambient_only\n", encoding="utf-8"
+    )
+    monkeypatch.delitem(sys.modules, "aiter", raising=False)
+    monkeypatch.syspath_prepend(str(ambient.parent))
+    assert list(importlib.util.find_spec("aiter").submodule_search_locations) == [str(ambient)]
+    jit_dir = tmp_path / "jit"
+    (jit_dir / "build").mkdir(parents=True)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "a8w8_blockscale_tuned_gemm.csv").write_text(
+        "libtype,kernelName\ncktile,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1\n",
+        encoding="utf-8",
+    )
+    bp = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    cktile = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle_cktile.so"
+    bp.write_bytes(b"a8w8_blockscale_bpreshuffle_ck")
+    cktile.write_bytes(b"a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text(
+        "libtype,kernelName\n"
+        "ck,a8w8_blockscale_bpreshuffle_ck\n"
+        "cktile,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(tmp_path / override_leaf))
+    monkeypatch.setenv("AITER_JIT_DIR", str(ambient / "jit"))
+    result = aj.prepare_serving_so_for_csvs(
+        {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": csv_path.name},
+        backup_dir=tmp_path / "backup",
+    )
+    assert result["action"] == "skip"
+    assert bp.is_file()
+    assert cktile.is_file()
+    assert "aiter" not in sys.modules
+
+
+@pytest.mark.parametrize("leaf", ["jit", "jit/build"])
+def test_prepare_wrapper_uses_its_own_unset_csvs(tmp_path, monkeypatch, serving_package, leaf):
+    selected = tmp_path / "manual" / leaf
+    selected.mkdir(parents=True)
+    jit = tmp_path / "manual/jit"
+    so = jit / "module_gemm_a8w8.so"
+    so.write_bytes(b"kernel_old")
+    configs = jit.parent / "configs"
+    configs.mkdir()
+    (configs / "a8w8_tuned_gemm.csv").write_text("kernelName\nkernel_new\n", encoding="utf-8")
+    (serving_package / "configs").mkdir()
+    (serving_package / "configs/a8w8_tuned_gemm.csv").write_text("kernelName\nkernel_old\n", encoding="utf-8")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(selected))
+    monkeypatch.setenv("AITER_JIT_DIR", str(serving_package / "jit"))
+
+    result = aj.prepare_serving_so_for_csvs({}, backup_dir=tmp_path / "backup")
+
+    assert result["action"] == "invalidate"
+    assert result["removed"] == [str(so)]
+    assert result["jit_build"]["src"] == str(jit / "build")
+    assert not so.exists()
+    assert "aiter" not in sys.modules
+
+
+@pytest.mark.parametrize("runtime", ["env", "home"])
+def test_prepare_runtime_cache_loads_real_package_configs(tmp_path, monkeypatch, serving_package, runtime):
+    home = tmp_path / "home"
+    jit = tmp_path / "runtime" if runtime == "env" else home / ".aiter/jit"
+    jit.mkdir(parents=True)
+    so = jit / "module_gemm_a8w8.so"
+    so.write_bytes(b"kernel_old")
+    for package, kernel in ((serving_package, "kernel_new"), (jit.parent, "kernel_old")):
+        configs = package / "configs"
+        configs.mkdir()
+        (configs / "a8w8_tuned_gemm.csv").write_text(f"kernelName\n{kernel}\n", encoding="utf-8")
+    if runtime == "env":
+        monkeypatch.setenv("AITER_JIT_DIR", str(jit))
+    else:
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(os, "access", lambda *_: False)
+    find_spec = importlib.util.find_spec
+    discovered = []
+
+    def discover_once(name):
+        discovered.append(name)
+        return find_spec(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", discover_once)
+    result = aj.prepare_serving_so_for_csvs({}, backup_dir=tmp_path / "backup")
+
+    assert discovered == ["aiter"]
+    assert result["action"] == "invalidate"
+    assert result["removed"] == [str(so)]
+    assert result["jit_build"]["src"] == str(jit / "build")
+    assert not so.exists()
+
+
+def test_prepare_serving_so_skips_when_registry_covers_csv(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    jit_dir = tmp_path / "jit"
+    jit_dir.mkdir()
+    so_path = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    so_path.write_bytes(b"kernel_keep")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text("kernelName\nkernel_keep\n", encoding="utf-8")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit_dir))
+    result = aj.prepare_serving_so_for_csvs(
+        {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": csv_path.name},
+        backup_dir=tmp_path / "backup",
+    )
+    assert result["action"] == "skip"
+    assert so_path.is_file()
+
+
+def test_prepare_serving_so_drops_so_when_registry_is_narrow(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    jit_dir = tmp_path / "jit"
+    build_dir = jit_dir / "build"
+    build_dir.mkdir(parents=True)
+    (build_dir / "stamp").write_text("x", encoding="utf-8")
+    so_path = jit_dir / "module_gemm_a8w8_blockscale_bpreshuffle.so"
+    so_path.write_bytes(b"kernel_old")
+    unrelated = jit_dir / "module_attention.so"
+    unrelated.write_bytes(b"unrelated kernel")
+    csv_path = tmp_path / "merged.csv"
+    csv_path.write_text("kernelName\nkernel_old\nkernel_new\n", encoding="utf-8")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit_dir))
+    result = aj.prepare_serving_so_for_csvs(
+        {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": csv_path.name},
+        backup_dir=tmp_path / "backup",
+    )
+    assert result["action"] == "invalidate"
+    assert not so_path.exists()
+    assert not build_dir.exists()
+    assert unrelated.read_bytes() == b"unrelated kernel"
+    assert result["jit_dir"] == str(jit_dir)
+    assert result["removed"] == [str(so_path)]
+    record = result["jit_build"]
+    assert record["status"] == "ok"
+    assert record["module_names"] == [so_path.name]
+    assert record["module_scope"] == list(
+        aj.AITER_ENV_TO_SERVING_MODULES["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"]
+    )
+    assert (Path(record["modules_backup_path"]) / so_path.name).read_bytes() == b"kernel_old"
+    assert (Path(record["backup_path"]) / "stamp").read_text(encoding="utf-8") == "x"
+
+
+@pytest.mark.parametrize(
+    "envs",
+    [None, {}, {"AITER_CONFIG_GEMM_A8W8": "tuned.csv"}, {"AITER_CONFIG_FMOE": "fmoe.csv"}],
+    ids=["all-known", "empty-env", "selected-env", "no-matching-env"],
+)
+@pytest.mark.parametrize("build_exists", [False, True], ids=["modules-only", "with-build"])
+def test_drop_serving_so_preserves_modules_outside_the_requested_scope(tmp_path, monkeypatch, envs, build_exists):
+    jit = tmp_path / "jit"
+    jit.mkdir()
+    known = tuple(dict.fromkeys(module for modules in aj.AITER_ENV_TO_SERVING_MODULES.values() for module in modules))
+    for module in (*known, "module_attention"):
+        (jit / f"{module}.so").write_bytes(module.encode())
+    build = jit / "build"
+    if build_exists:
+        build.mkdir()
+        (build / "stamp").write_bytes(b"build cache")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit))
+
+    result = aj.drop_serving_so_for_envs(envs, backup_dir=tmp_path / "backup")
+
+    expected = known if not envs else ("module_gemm_a8w8",) if "AITER_CONFIG_GEMM_A8W8" in envs else ()
+    record = result["jit_build"]
+    assert result["action"] == "invalidate"
+    assert result["jit_dir"] == str(jit)
+    assert record["status"] == ("ok" if expected or build_exists else "clean")
+    assert record["src"] == str(build)
+    assert record["build_existed"] is build_exists
+    assert record["module_scope"] == list(expected)
+    assert sorted(record["module_names"]) == sorted(f"{module}.so" for module in expected)
+    assert sorted(result["removed"]) == sorted(str(jit / f"{module}.so") for module in expected)
+    assert not build.exists()
+    for module in (*known, "module_attention"):
+        module_path = jit / f"{module}.so"
+        if module in expected:
+            assert not module_path.exists()
+            assert (Path(record["modules_backup_path"]) / module_path.name).read_bytes() == module.encode()
+        else:
+            assert module_path.read_bytes() == module.encode()
+    if build_exists:
+        assert (Path(record["backup_path"]) / "stamp").read_bytes() == b"build cache"
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare_serving_so_for_csvs", "drop_serving_so_for_envs"])
+def test_serving_so_invalidation_failure_preserves_the_cache(tmp_path, monkeypatch, entrypoint):
+    monkeypatch.chdir(tmp_path)
+    jit = tmp_path / "jit"
+    build = jit / "build"
+    build.mkdir(parents=True)
+    (build / "stamp").write_bytes(b"build cache")
+    so = jit / "module_gemm_a8w8.so"
+    so.write_bytes(b"kernel_old")
+    unrelated = jit / "module_attention.so"
+    unrelated.write_bytes(b"unrelated")
+    Path("tuned.csv").write_text("kernelName\nkernel_new\n", encoding="utf-8")
+    backup = tmp_path / "backup"
+    backup.write_bytes(b"not a directory")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit))
+
+    with pytest.raises(OSError, match="JIT cache invalidation failed"):
+        getattr(aj, entrypoint)({"AITER_CONFIG_GEMM_A8W8": "tuned.csv"}, backup_dir=backup)
+
+    assert so.read_bytes() == b"kernel_old"
+    assert unrelated.read_bytes() == b"unrelated"
+    assert (build / "stamp").read_bytes() == b"build cache"
+
+
+@pytest.fixture
+def serving_package(tmp_path, monkeypatch, isolated_home):
+    package = tmp_path / "site" / "aiter"
+    (package / "jit").mkdir(parents=True)
+    (package / "__init__.py").write_text("raise AssertionError('AITER must not be imported')\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "aiter", raising=False)
+    monkeypatch.syspath_prepend(str(package.parent))
+    return package
+
+
+@pytest.mark.parametrize("override", ["runtime-cache", "~/runtime-cache", " runtime-cache ", ""])
+def test_serving_dir_uses_the_runtime_override_verbatim(tmp_path, monkeypatch, serving_package, override):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AITER_JIT_DIR", override)
+    result = aj.prepare_serving_so_for_csvs({})
+    assert result == (
+        {"action": "skip", "jit_dir": str(Path(override).absolute())}
+        if override
+        else {"action": "noop", "reason": "aiter jit dir not found"}
+    )
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare_serving_so_for_csvs", "drop_serving_so_for_envs"])
+def test_runtime_cache_named_build_does_not_invalidate_its_parent(tmp_path, monkeypatch, serving_package, entrypoint):
+    monkeypatch.chdir(tmp_path)
+    jit = tmp_path / "runtime" / "build"
+    build = jit / "build"
+    build.mkdir(parents=True)
+    (build / "stamp").write_bytes(b"runtime build")
+    name = "module_gemm_a8w8.so"
+    (jit / name).write_bytes(b"kernel_old")
+    (jit.parent / name).write_bytes(b"parent module")
+    Path("tuned.csv").write_text("kernelName\nkernel_new\n", encoding="utf-8")
+    monkeypatch.setenv("AITER_JIT_DIR", str(jit))
+
+    result = getattr(aj, entrypoint)({"AITER_CONFIG_GEMM_A8W8": "tuned.csv"}, backup_dir=tmp_path / "backup")
+
+    assert result["action"] == "invalidate"
+    assert result["jit_dir"] == str(jit)
+    assert result["removed"] == [str(jit / name)]
+    assert result["jit_build"]["src"] == str(build)
+    assert jit.is_dir()
+    assert not build.exists()
+    assert not (jit / name).exists()
+    assert (jit.parent / name).read_bytes() == b"parent module"
+    assert (Path(result["jit_build"]["modules_backup_path"]) / name).read_bytes() == b"kernel_old"
+
+
+def test_drop_keeps_the_explicit_build_directory_override(tmp_path, monkeypatch):
+    jit = tmp_path / "jit"
+    build = jit / "build"
+    build.mkdir(parents=True)
+    name = "module_gemm_a8w8.so"
+    (jit / name).write_bytes(b"kernel_old")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(build))
+
+    result = aj.drop_serving_so_for_envs({"AITER_CONFIG_GEMM_A8W8": "tuned.csv"}, backup_dir=tmp_path / "backup")
+
+    assert result["action"] == "invalidate"
+    assert result["jit_dir"] == str(jit)
+    assert result["jit_build"]["src"] == str(build)
+    assert result["removed"] == [str(jit / name)]
+    assert not build.exists()
+    assert not (jit / name).exists()
+
+
+@pytest.mark.parametrize("leaf", ["jit", "jit/build"])
+def test_serving_dir_keeps_the_explicit_wrapper_override(tmp_path, monkeypatch, serving_package, leaf):
+    selected = tmp_path / "manual" / leaf
+    selected.mkdir(parents=True)
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", f"  {selected}  ")
+    monkeypatch.setenv("AITER_JIT_DIR", str(tmp_path / "other"))
+    assert aj.prepare_serving_so_for_csvs({}) == {"action": "skip", "jit_dir": str(tmp_path / "manual/jit")}
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_serving_dir_uses_only_the_initialized_home_cache(tmp_path, monkeypatch, serving_package, initialized):
+    home = tmp_path / "home"
+    fallback = home / ".aiter" / "jit"
+    if initialized:
+        fallback.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    real_access = os.access
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: False if Path(path) == serving_package / "jit" else real_access(path, mode)
+    )
+    assert aj.prepare_serving_so_for_csvs({}) == (
+        {"action": "skip", "jit_dir": str(fallback)}
+        if initialized
+        else {"action": "noop", "reason": "aiter jit dir not found"}
+    )
+
+
+@pytest.mark.parametrize("use_probe", [False, True])
+def test_serving_dir_retains_package_and_probe_discovery(monkeypatch, serving_package, use_probe):
+    if use_probe:
+        monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
+        monkeypatch.setattr(aj, "AITER_JIT_PROBE_PATHS", (str(serving_package / "jit"),))
+    assert aj.prepare_serving_so_for_csvs({}) == {"action": "skip", "jit_dir": str(serving_package / "jit")}
+
+
+def test_serving_dir_ignores_a_missing_wrapper_override(monkeypatch, serving_package):
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(serving_package / "missing"))
+    assert aj.prepare_serving_so_for_csvs({}) == {"action": "skip", "jit_dir": str(serving_package / "jit")}
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare_serving_so_for_csvs", "drop_serving_so_for_envs"])
+def test_serving_dir_unavailable_without_a_package_or_override(monkeypatch, entrypoint):
+    monkeypatch.delenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", raising=False)
+    monkeypatch.delenv("AITER_JIT_DIR", raising=False)
+    monkeypatch.delenv("VLLM_VENV_ROOT", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
+    monkeypatch.setattr(aj, "AITER_JIT_PROBE_PATHS", ())
+    assert getattr(aj, entrypoint)({}) == {"action": "noop", "reason": "aiter jit dir not found"}
+
+
+def test_is_aiter_jit_registry_mismatch_inside_cuda_graph_blob():
+    blob = (
+        "Exception: Capture cuda graph failed: "
+        "gemm_a8w8_blockscale_bpreshuffle kernel 'k' is not present in the compiled registry."
+    )
+    assert aj.is_aiter_jit_registry_mismatch(blob)
+    assert not aj.is_aiter_jit_registry_mismatch("Capture cuda graph failed: HIP error")
+
+
+_BP_VAR = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
+_BP_CK = "module_gemm_a8w8_blockscale_bpreshuffle"
+_BP_CKTILE = "module_gemm_a8w8_blockscale_bpreshuffle_cktile"
+_BP_MODULES = aj.AITER_ENV_TO_SERVING_MODULES[_BP_VAR]
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_prewarm_manifest(jit: Path, configs: Path, modules: tuple[str, ...]) -> None:
+    """The manifest hyperloom's prewarm writes (schema ``hyperloom.aiter_prewarm/1``), restated from its format."""
+    files = sorted((p.relative_to(configs).as_posix(), p) for p in configs.rglob("*") if p.is_file())
+    tables = _sha256("".join(f"{rel}\t{_sha256(p.read_bytes())}\n" for rel, p in files).encode())
+    entries = [{"name": m, "sha256": _sha256((jit / f"{m}.so").read_bytes()), "tables_sha256": tables} for m in modules]
+    (jit / "hyperloom-prewarm.json").write_text(
+        json.dumps({"schema": "hyperloom.aiter_prewarm/1", "modules": entries}), encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def prewarmed(tmp_path, monkeypatch):
+    """A package whose bpreshuffle modules the prewarm built, from a table they do not cover byte-for-byte."""
+    monkeypatch.chdir(tmp_path)
+    jit = tmp_path / "aiter" / "jit"
+    (jit / "build").mkdir(parents=True)
+    configs = jit.parent / "configs"
+    configs.mkdir()
+    (configs / "a8w8_blockscale_bpreshuffle_tuned_gemm.csv").write_text(
+        "libtype,kernelName\nck,a8w8_blockscale_bpreshuffle_k_new\n", encoding="utf-8"
+    )
+    for module in _BP_MODULES:
+        (jit / f"{module}.so").write_bytes(b"\x7fELF prewarm " + module.encode())
+    _write_prewarm_manifest(jit, configs, _BP_MODULES)
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit))
+    return jit
+
+
+def test_image_own_modules_are_the_manifest_s_unchanged_modules_of_unset_variables(prewarmed):
+    configs = prewarmed.parent / "configs"
+    assert aj.image_own_modules(prewarmed, configs, {}) == set(_BP_MODULES)
+    assert aj.image_own_modules(prewarmed, configs, {_BP_VAR: " "}) == set(_BP_MODULES)
+    # A round that sets the variable reads another table: none of its modules is the image's own.
+    assert aj.image_own_modules(prewarmed, configs, {_BP_VAR: "/x.csv"}) == frozenset()
+    (prewarmed / f"{_BP_CK}.so").write_bytes(b"\x7fELF session build")
+    assert aj.image_own_modules(prewarmed, configs, {}) == set(_BP_MODULES) - {_BP_CK}
+    (configs / "model_configs").mkdir()
+    (configs / "model_configs" / "a8w8_blockscale_bpreshuffle_tuned_gemm_glm.csv").write_text("x\n", encoding="utf-8")
+    assert aj.image_own_modules(prewarmed, configs, {}) == frozenset()
+
+
+@pytest.mark.parametrize("manifest", ["missing", "not-json", "other-schema"])
+def test_image_own_modules_without_a_readable_manifest_is_empty(prewarmed, manifest):
+    path = prewarmed / "hyperloom-prewarm.json"
+    if manifest == "missing":
+        path.unlink()
+    elif manifest == "not-json":
+        path.write_text("{not json", encoding="utf-8")
+    else:
+        path.write_text(json.dumps({**json.loads(path.read_text()), "schema": "other/1"}), encoding="utf-8")
+    assert aj.image_own_modules(prewarmed, prewarmed.parent / "configs", {}) == frozenset()
+
+
+def test_prepare_keeps_the_prewarm_s_modules_and_moves_a_session_build_aside(prewarmed, tmp_path):
+    result = aj.prepare_serving_so_for_csvs({}, backup_dir=tmp_path / "backup0")
+    assert result == {"action": "skip", "jit_dir": str(prewarmed), "kept_image_own": sorted(_BP_MODULES)}
+    assert all((prewarmed / f"{m}.so").is_file() for m in _BP_MODULES)
+
+    (prewarmed / f"{_BP_CK}.so").write_bytes(b"\x7fELF session build")
+    result = aj.prepare_serving_so_for_csvs({}, backup_dir=tmp_path / "backup1")
+    assert result["action"] == "invalidate"
+    assert result["removed"] == [str(prewarmed / f"{_BP_CK}.so")]
+    assert (prewarmed / f"{_BP_CKTILE}.so").is_file()
+
+
+def test_prepare_without_a_manifest_moves_the_same_modules_aside(prewarmed, tmp_path):
+    (prewarmed / "hyperloom-prewarm.json").unlink()
+    result = aj.prepare_serving_so_for_csvs({}, backup_dir=tmp_path / "backup")
+    assert result["action"] == "invalidate"
+    assert sorted(result["removed"]) == sorted(str(prewarmed / f"{m}.so") for m in _BP_MODULES)
+
+
+def test_drop_keeps_the_prewarm_s_modules_unless_a_registry_mismatch_names_them(prewarmed, tmp_path):
+    aj.drop_serving_so_for_envs(None, backup_dir=tmp_path / "backup0")
+    assert all((prewarmed / f"{m}.so").is_file() for m in _BP_MODULES)
+
+    result = aj.drop_serving_so_for_envs(None, backup_dir=tmp_path / "backup1", also_modules=(_BP_CK,))
+    assert result["removed"] == [str(prewarmed / f"{_BP_CK}.so")]
+    assert (prewarmed / f"{_BP_CKTILE}.so").is_file()
+
+
+#: A row of aiter's own bpreshuffle table: ``model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv``,
+#: sha256 8ec8ffce..., the same file the image ships.
+_DSV3_BPRESHUFFLE_CKTILE_ROW = (
+    "gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio\n"
+    "gfx950,256,8192,7168,4608,cktile,27,0,299.1261,"
+    "a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_2,1809.16,0.62923,0.0\n"
+)
+_DSV3_CKTILE_KERNEL = b"a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_2"
+
+
+def test_a_bpreshuffle_table_s_cktile_row_maps_to_the_bpreshuffle_cktile_module(tmp_path):
+    csv_path = tmp_path / "a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv"
+    csv_path.write_text(_DSV3_BPRESHUFFLE_CKTILE_ROW, encoding="utf-8")
+    [(name, libtype)] = aj.csv_jit_kernel_rows(csv_path)
+    assert aj.serving_module_for_kernel(name, libtype, _BP_MODULES) == _BP_CKTILE
+    plain = aj.AITER_ENV_TO_SERVING_MODULES["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"]
+    assert aj.serving_module_for_kernel(name, libtype, plain) == "module_gemm_a8w8_blockscale_cktile"
+
+
+@pytest.mark.parametrize("built_into", [_BP_CKTILE, "module_gemm_a8w8_blockscale_cktile"])
+def test_prepare_reads_a_bpreshuffle_cktile_row_from_the_bpreshuffle_cktile_module(tmp_path, monkeypatch, built_into):
+    """The bpreshuffle build carrying the row is kept; one lacking it is moved aside, whatever the other module holds."""
+    monkeypatch.chdir(tmp_path)
+    jit = tmp_path / "aiter" / "jit"
+    (jit / "build").mkdir(parents=True)
+    (jit.parent / "configs").mkdir()
+    (jit.parent / "configs" / "a8w8_blockscale_bpreshuffle_tuned_gemm.csv").write_text(
+        _DSV3_BPRESHUFFLE_CKTILE_ROW, encoding="utf-8"
+    )
+    for module in (_BP_CKTILE, "module_gemm_a8w8_blockscale_cktile"):
+        (jit / f"{module}.so").write_bytes(_DSV3_CKTILE_KERNEL if module == built_into else b"other_cktile")
+    monkeypatch.setenv("INFERENCE_OPTIMIZER_AITER_JIT_DIR", str(jit))
+
+    result = aj.prepare_serving_so_for_csvs({}, backup_dir=tmp_path / "backup")
+
+    assert (jit / "module_gemm_a8w8_blockscale_cktile.so").is_file()
+    if built_into == _BP_CKTILE:
+        assert result["action"] == "skip"
+        assert (jit / f"{_BP_CKTILE}.so").is_file()
+    else:
+        assert result["action"] == "invalidate"
+        assert result["removed"] == [str(jit / f"{_BP_CKTILE}.so")]
+
+
+def test_a_shared_cktile_name_in_a_registry_mismatch_names_both_blockscale_cktile_modules():
+    observed = f"gemm_a8w8_blockscale_cktile kernel '{_DSV3_CKTILE_KERNEL.decode()}' is not present"
+    assert set(aj.registry_mismatch_modules(observed)) == {"module_gemm_a8w8_blockscale_cktile", _BP_CKTILE}
