@@ -153,7 +153,7 @@ def git(args, cwd=None, input_text=None):
         prefix += ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
     env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1", GIT_TERMINAL_PROMPT="0")
     try:
-        return subprocess.run(prefix + args, cwd=cwd, input=input_text, text=True,
+        return subprocess.run(prefix + args, cwd=cwd, input=input_text, text=True, encoding="utf-8",
                               check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as error:
         print(error.stderr.strip(), file=sys.stderr)

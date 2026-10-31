@@ -25,7 +25,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_HOME: ${{ runner.temp }}/bootstrap-codex
-        run: gh api -H 'Accept: application/vnd.github.raw+json' repos/hehesnail/inference-engine-skill/contents/install.py | python - --update
+        run: |
+          gh api -H 'Accept: application/vnd.github.raw+json' repos/hehesnail/inference-engine-skill/contents/install.py | python - --update
       - name: Verify downloaded installation and portable tool entrypoint
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
