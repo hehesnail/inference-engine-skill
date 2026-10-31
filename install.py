@@ -152,8 +152,12 @@ def git(args, cwd=None, input_text=None):
     if shutil.which("gh"):
         prefix += ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
     env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1", GIT_TERMINAL_PROMPT="0")
-    return subprocess.run(prefix + args, cwd=cwd, input=input_text, text=True,
-                          check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        return subprocess.run(prefix + args, cwd=cwd, input=input_text, text=True,
+                              check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as error:
+        print(error.stderr.strip(), file=sys.stderr)
+        raise
 
 
 def sparse_pattern(path):
@@ -167,9 +171,12 @@ def checkout(repository, ref, edition):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", ref) or ".." in ref or "//" in ref:
         raise ValueError("Invalid --ref; use a branch or tag name")
     with tempfile.TemporaryDirectory(prefix="inference-engine-download-") as temp:
-        root = native_path(temp) / "repo"
+        # Git for Windows requires an ordinary drive/UNC path as its CLI argument.
+        # Python uses the extended path only for filesystem operations below.
+        clone_dir = Path(temp) / "repo"
+        root = native_path(clone_dir)
         git(["clone", "--filter=blob:none", "--no-checkout", "--depth=1",
-             "--single-branch", "--branch", ref, "--no-tags", repository, str(root)])
+             "--single-branch", "--branch", ref, "--no-tags", repository, str(clone_dir)])
         git(["sparse-checkout", "init", "--no-cone"], cwd=root)
         git(["sparse-checkout", "set", "--no-cone", "--stdin"], cwd=root,
             input_text="/distribution.json\n")
