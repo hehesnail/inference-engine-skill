@@ -34,6 +34,10 @@ graph-off/eager trace 可以帮助定位调用点，graph-on 且充分预热的 
 
 token 容量除以每请求驻留 token 数只是理想化存储上界；还受 scheduler 请求上限、输出增长、碎片、prefix 共享、临时 workspace 和各 rank 最紧约束影响。它不是满足延迟 SLO 的服务并发。
 
+长文 OOM 先区分配置／容量校验拒绝、权重加载、KV 预留、profile、prefill、decode 和重复运行阶段。历史其他版本的 OOM 不自动归属于当前实现。chunked prefill 主要约束每步处理量，不能保证完整 KV、循环／辅助状态池、全长临时张量或密集 mask 的容量足够；根据失败分配的来源处理，不只缩小 chunk。
+
+设备已用显存、allocator allocated/reserved、预分配 KV／状态池与请求实际活跃状态是不同量。固定比例预留的池会使短请求也显示很高占用，不等于该请求实际需要全部显存。稳定性在同一引擎、请求结束且无在途工作的可比点观察，区分初次编译／缓存扩容后平台与持续增长；短时平台只证明已测范围，没有证据时不宣称长期无泄漏。
+
 ## 可复用上游解析器
 
 BBuf 的 trace、容量、逐层分析和图表辅助脚本已连同 import 依赖、参考表和配置一起装入本包。通过[稳定工具入口](tools.md)在选定环境运行；[完整 profiler 指南](../library/bbuf/skills/llm-torch-profiler-analysis/GUIDE.md)与[容量指南](../library/bbuf/skills/llm-serving-capacity-planner/GUIDE.md)提供参数、示例及边界条件。

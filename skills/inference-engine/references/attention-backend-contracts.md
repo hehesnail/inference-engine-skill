@@ -38,6 +38,12 @@ Orchestra 的示例在 CPU buffer 上调用 type_as，会把新建的 CUDA posit
 
 ALiBi 是 attention bias，不替代 causal mask。causal 情况下可用 key_position-query_position 的有符号距离；其他 mask 语义不能直接套这个公式。ALiBi 不意味着无限可用上下文。显式构造 `S×S` bias 的教学代码可能抵消后端节省的内存。
 
+## YaRN 等缩放：配置接上还要核对实际计算
+
+沿 checkpoint 配置 → 配置解析／覆盖 → rotary 实例 → 频率与 ramp → 幅度缩放 → cos/sin → Q/K 旋转 → attention scale 核对实际生效值。architecture 标签、提高 max_model_len 或扩大频率表，都不能单独证明启用了正确的 YaRN；也要排除幅度因子在旋转与 attention 中重复应用。
+
+与指定参考对齐时，分别检查频率、角度、cos/sin、幅度乘法和最终 cast 的精度及先后。不能用“最终都输出 BF16”替代中间舍入核对；同前缀应包含实际绝对位置。训练／参考物理形状与调度窗口的区别及单算子证据见[数值漂移排查](numerical-drift-debugging.md)。长文 OOM 与 chunked prefill 的边界见[显存容量](profiling-memory.md)。
+
 ## 证明后端真实生效
 
 PyTorch SDPA、flash-attn 2、Hopper 的 FlashAttention 3 与 CuTeDSL/其他实现是不同接口/构建目标。安装 flash-attn 后把输入 cast 成 FP8，不证明已运行 FA3。FP8 scale/descale、tensor layout 与支持的 GPU 以该实现为准；Turing 支持也不能由 FA1、第三方移植推广为 FA2 主实现支持。

@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 3516,
-      "packaged_sha256": "9ce1c0b50abd5aeba60ae199ff9b3fca3d5877743bdacad82e899e86d15818c8",
+      "bytes": 3624,
+      "packaged_sha256": "41c7642e8c66025e04115e9827e3d334ecceff1a648167a0cbfd1623b355001b",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93161,8 +93161,8 @@
     },
     {
       "path": "references/attention-backend-contracts.md",
-      "bytes": 4783,
-      "packaged_sha256": "d85740a5a559b04696c53332f52b74081a66c9c41be2762e01bef4aec9b20c0f",
+      "bytes": 5616,
+      "packaged_sha256": "b81e7b72bdd4fb9e9845a2b7616db42dafac13fe2d91b498cc1d1c187285ee32",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93181,8 +93181,8 @@
     },
     {
       "path": "references/benchmarking.md",
-      "bytes": 5566,
-      "packaged_sha256": "41d121e063a7c3917e515bff9b7ec97efb228858ed922c772a6156bc05a9591a",
+      "bytes": 7018,
+      "packaged_sha256": "3ddbf70f37ad25ce13c996dcca56989db0df6221f70618f51c674d16c456ef33",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93221,8 +93221,8 @@
     },
     {
       "path": "references/debugging-review.md",
-      "bytes": 4297,
-      "packaged_sha256": "f33cfd76f54309ab3c3c31b8bdbb6ca870e32f02c4af796d139d9c05480dd7b7",
+      "bytes": 5242,
+      "packaged_sha256": "0d11546c4f9f8769f61ebc60e15dd25a394ff98b2f16ee7a6b2cc16d3a02a196",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93340,9 +93340,19 @@
       "installed": true
     },
     {
+      "path": "references/numerical-drift-debugging.md",
+      "placement": "desktop-and-server",
+      "repository": "local",
+      "source_path": null,
+      "adapted": false,
+      "bytes": 10354,
+      "packaged_sha256": "efcd68a2bd67a52c3b70b46f36f89be954d3734b4a01340a88a8d8d6afd1fe38",
+      "installed": true
+    },
+    {
       "path": "references/numerical-validation.md",
-      "bytes": 3637,
-      "packaged_sha256": "3388e31bf112a59151a0bc38a69a107a14e7da7bd6825c9b5f3ab0ca0f68be18",
+      "bytes": 3920,
+      "packaged_sha256": "b9f1b225504b46885fe593bac721420223dc2e293701dd6c0c6a1581747ca40a",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93381,8 +93391,8 @@
     },
     {
       "path": "references/profiling-memory.md",
-      "bytes": 6114,
-      "packaged_sha256": "9767fa212af93e760f93a18a78939ff2440797f0d9c2baa0971b25816fbd6fb6",
+      "bytes": 6952,
+      "packaged_sha256": "2c82b4ef68106b5553beae3a9e343842dd3b10b5785af132ae65c1ac81596970",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93651,8 +93661,8 @@
     },
     {
       "path": "references/sources.md",
-      "bytes": 2888,
-      "packaged_sha256": "c73cca185d717d8136156ce1b7e4734b939ed75731062e64e2a9ab0acec3fa35",
+      "bytes": 3316,
+      "packaged_sha256": "85969921a83fc51d9e60493ec2b14f1782970db35b395e3b42e57bdb9166ef39",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93671,8 +93681,8 @@
     },
     {
       "path": "references/stateful-inference.md",
-      "bytes": 7310,
-      "packaged_sha256": "0c426fbbb067b437e2ada3dccc0b1c6807ebb41f10ae7e41b00d1dec273a2d82",
+      "bytes": 8816,
+      "packaged_sha256": "211757cf80ed5c0f3347e568a3c60679aaa38e08c83cab1c2e8c691ff83b02fd",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
