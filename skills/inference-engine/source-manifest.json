@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 3624,
-      "packaged_sha256": "41c7642e8c66025e04115e9827e3d334ecceff1a648167a0cbfd1623b355001b",
+      "bytes": 3619,
+      "packaged_sha256": "718dc239994409acdaa8732e7d858901ce877153666fd6f00652c2f8ae96b034",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93181,8 +93181,8 @@
     },
     {
       "path": "references/benchmarking.md",
-      "bytes": 7018,
-      "packaged_sha256": "3ddbf70f37ad25ce13c996dcca56989db0df6221f70618f51c674d16c456ef33",
+      "bytes": 7012,
+      "packaged_sha256": "9e46a6b38bda1c6736b98b35ceb80c7d047b8ddc328fd9ae41674d3bbea2777f",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93221,8 +93221,8 @@
     },
     {
       "path": "references/debugging-review.md",
-      "bytes": 5242,
-      "packaged_sha256": "0d11546c4f9f8769f61ebc60e15dd25a394ff98b2f16ee7a6b2cc16d3a02a196",
+      "bytes": 5166,
+      "packaged_sha256": "37fdcd4d4a136fcd4603b5bce426125342aaa7eaef5aa8228882bcaffc0899b6",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93345,14 +93345,14 @@
       "repository": "local",
       "source_path": null,
       "adapted": false,
-      "bytes": 10354,
-      "packaged_sha256": "efcd68a2bd67a52c3b70b46f36f89be954d3734b4a01340a88a8d8d6afd1fe38",
+      "bytes": 8348,
+      "packaged_sha256": "9cae306bb9521c7a210423f1d689a7f1ad8a11b805bc5120f78dbc63af0e74d8",
       "installed": true
     },
     {
       "path": "references/numerical-validation.md",
-      "bytes": 3920,
-      "packaged_sha256": "b9f1b225504b46885fe593bac721420223dc2e293701dd6c0c6a1581747ca40a",
+      "bytes": 3890,
+      "packaged_sha256": "a6039f8d744c022fc925c4ffe4c2ecdfbea1b66df5257fae7eca0a9d3c841c27",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93661,8 +93661,8 @@
     },
     {
       "path": "references/sources.md",
-      "bytes": 3316,
-      "packaged_sha256": "85969921a83fc51d9e60493ec2b14f1782970db35b395e3b42e57bdb9166ef39",
+      "bytes": 3391,
+      "packaged_sha256": "4c78ff8b0325d0eaea82ee03c62066813f724571bd5bb8026dd3f867b01d40b6",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93681,8 +93681,8 @@
     },
     {
       "path": "references/stateful-inference.md",
-      "bytes": 8816,
-      "packaged_sha256": "211757cf80ed5c0f3347e568a3c60679aaa38e08c83cab1c2e8c691ff83b02fd",
+      "bytes": 8972,
+      "packaged_sha256": "8a6fc1dd45a112f95621e5ce422007a1ccfd649a80ae9626914b6d97718279ba",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,

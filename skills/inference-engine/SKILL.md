@@ -17,7 +17,7 @@ description: Develop, debug, deploy, profile, and optimize LLM inference runtime
 | SGLang 源码、模型或服务行为 | [SGLang](references/sglang.md) |
 | 吞吐、延迟、prefix cache、配置对照 | [Benchmark](references/benchmarking.md)；[离线生成与评分](references/offline-evaluation.md) |
 | 模型接入、KV/循环状态、rollout 权重更新 | [模型与状态](references/model-integration.md) |
-| 精度、量化、优化开关与验收 | [数值验证](references/numerical-validation.md)；参考前向、NORM 舍入与形状差异查[数值漂移排查](references/numerical-drift-debugging.md) |
+| 精度、量化、优化开关与验收 | [数值验证](references/numerical-validation.md)；参考实现、舍入与执行差异查[数值漂移排查](references/numerical-drift-debugging.md) |
 | Torch/Nsys/NCU、Host/GPU 归因、显存 | [Profiler 与容量](references/profiling-memory.md) |
 | kernel、fusion、dispatch、Graph/同步 | [引擎接线](references/kernel-engine-integration.md)；[Graph](references/cuda-graphs-and-sync.md) |
 | 多轮候选与 agent 优化机制 | [候选与对照](references/optimization-workflow.md)；[Agent 工程](references/agentic-kernel-workflows.md) |
