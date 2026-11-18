@@ -1,6 +1,6 @@
 # CUDA Graph、host 同步与状态生命周期
 
-用于 graph/eager 差异、decode launch 开销、compile/fusion 未生效或异步状态错误。先用 [Host/GPU 时间线](host-device-analysis.md) 判断暴露开销，再选择下列具体改动。不要为追求 graph coverage 改坏调度和状态语义。
+若 eager 正确、图在换输入后仍产生旧结果，用同一 capture key 连续重放两个可区分的输入，分别与 eager 对照。检查第二次重放前输入与 metadata 的内容和地址，并在下一次重放前保存输出，区分读旧输入和输出被覆盖。若问题是 decode launch 开销、compile/fusion 收益或跨流等待，用 [Host/GPU 时间线](host-device-analysis.md)定位暴露在关键路径上的开销。
 
 ## Graph 接线检查
 

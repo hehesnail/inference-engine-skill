@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 3791,
-      "packaged_sha256": "29a2bfc0ae8ac019dd410b651e7a28963a72893cec8727c11824d8b370364499",
+      "bytes": 5777,
+      "packaged_sha256": "82773e0052af45123642bba251f7d155175dae909cc4586a011ec97d9d653607",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93211,8 +93211,8 @@
     },
     {
       "path": "references/cuda-graphs-and-sync.md",
-      "bytes": 5043,
-      "packaged_sha256": "367b401cbf7ff6a3d10afd3e0c456a2811cabfd54f050713ca15837c3e463173",
+      "bytes": 5231,
+      "packaged_sha256": "bab1226192496f641b67023b7bde7a3d28100d23131de8f2957991ea56b928d2",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93271,8 +93271,8 @@
     },
     {
       "path": "references/kernel-engine-integration.md",
-      "bytes": 7823,
-      "packaged_sha256": "5aaa3c8b63b1e1ad0dbf14605bae292a6764334a0821104aa11c8e6a42e087b6",
+      "bytes": 8175,
+      "packaged_sha256": "3957769c11a225d4842420f6facb808a47d65ebb0e18092acdbbe3bc26e1369c",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93281,8 +93281,8 @@
     },
     {
       "path": "references/kernel-knowledge.md",
-      "bytes": 4773,
-      "packaged_sha256": "c8ecea759317316dcbe159eafc72690999c7a9656fe23cb3768cc488bd350340",
+      "bytes": 5370,
+      "packaged_sha256": "0c6d48a09ea2a35ad8c1e313f5fc5ffa4929d2a94bebeb61d9b10ca0ba59dd64",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93331,8 +93331,8 @@
     },
     {
       "path": "references/nsight-compute.md",
-      "bytes": 6331,
-      "packaged_sha256": "bddf74926f276386797c3c3be43b933b09841fc3ef0a7f00120a2e80bca406d0",
+      "bytes": 6800,
+      "packaged_sha256": "d05de54ebb4b819a0575a6a5e90ffa9485da06a381976af8fb7aa987026139d2",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93371,8 +93371,8 @@
     },
     {
       "path": "references/optimization-workflow.md",
-      "bytes": 4950,
-      "packaged_sha256": "d95f7e4625510405f077f2a307fb4589806bec8c68b3c09db62a03535f757579",
+      "bytes": 5576,
+      "packaged_sha256": "278f0d2651c9ec971266d6178dab998c7a72fa3f0a155e7c1bae644e52409ab3",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,

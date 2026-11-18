@@ -55,7 +55,9 @@ vLLM、SGLang、HF Kernel Hub 各有自己的构建和注册契约。优先遵�
 
 Hopper 的 TMA/WGMMA、Blackwell 的 TMEM/`tcgen05`、ROCm 的 wave/LDS/MFMA 和 XPU 的 SYCL/Level Zero 都是可用的专业知识，按目标架构选择。先查真实瓶颈再调 tile、stage、warp、split 或 fusion；寄存器/共享内存、尾部负载与额外归并成本一起评估。硬件细节及跨后端排障见 [platforms-and-transport.md](platforms-and-transport.md)。
 
-KDA、CUDA-Agent、KernelAgent、Hyperloom与Atrex的具体数据/状态/验证链见[agent工程](agentic-kernel-workflows.md)；技术页与PR/代码检索见[KernelWiki](kernel-knowledge.md)；后端与NVSHMEM见[后端专项](backend-kernel-development.md)。
+候选已命中预期 dispatch 但耗时回退时，把新增的代码路径与基线 diff 对上。spill、等待或额外访存可按架构查 [KDA / KernelWiki](kernel-knowledge.md)选取假设，再用[候选与对照](optimization-workflow.md)拆开同时改变的因素。单算子已变快而整层未达目标时，核对调用次数、转换及与相邻工作的重叠，最后在用户指定的计时边界复测。
+
+需要复用某个优化 agent 的候选管理或导出流程时查[工程实现](agentic-kernel-workflows.md)。后端与 NVSHMEM 细节见[后端专项](backend-kernel-development.md)。
 
 ## 独立测试 CustomOp 的配置上下文
 

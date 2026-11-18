@@ -43,6 +43,8 @@ ncu --target-processes all --kernel-name-base demangled \
 | FP64 或非预期指令路径 | 精度提升、类型/常量或 fallback | 对照源码和 SASS；改变数学函数或累加精度需回到数值验收 |
 | occupancy 低 | 小 grid、资源上限、短任务或尾部等 | 同看理论 occupancy、寄存器/共享内存和实际时长；提高 occupancy 不是独立目标 |
 
+若任务要求解释一次代码回退，先定位变化的 launch 和 PC，结合编译器报告或 SASS 区分寄存器溢出与显式局部数组访问。按已观察到的[寄存器压力、流水线或访存症状](kernel-knowledge.md)寻找适用的机制，再用[单项源码对照](optimization-workflow.md)检验。最终把该改动和同条件下的耗时变化对应起来。仅解读现有报告时，列出它支持的判断和仍待区分的原因。
+
 Roofline 以目标 dtype、实际执行的计算和存储路径为准；区分 requested bytes 与 DRAM bytes、dense 与 sparse 峰值、L2 与 HBM 带宽。PC sampling 的 stall 份额不是墙钟延迟占比，源码行被多个 inline frame 共享时不能机械累加。NCU 的 estimated speedup 是分析线索，不是可相加的收益承诺。
 
 H100/H200 属于 Hopper 路径，Blackwell 专有 TMEM/`tcgen05` 示例不直接用于它们。即使算力架构相同，SKU 的 SM 数、缓存、带宽、功耗和有效 shape 也须实测/查询；不把 H100 的可达值套给 H200。

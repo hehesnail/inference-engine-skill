@@ -4,12 +4,15 @@
 
 全量知识库与两个KDA子模块保存在服务器完整包；桌面保留技术页、数据schema、查询脚本和入口。完整PR与代码语料按工作区存储策略保留服务器；缺语料时工具会报“未安装完整语料”，不会返回一个伪装成全库查询的空结果。
 
+桌面版可直接读[寄存器压力与 spill](../library/kernelwiki/wiki/patterns/register-pressure.md)、[流水线等待](../library/kernelwiki/wiki/patterns/pipeline-stalls.md)、[访存受限](../library/kernelwiki/wiki/patterns/memory-bound.md)或 [FlashMLA](../library/kernelwiki/wiki/kernels/flashmla.md)。页首的适用条件、硬件代际与勘误优先核对。需要历史 PR、补丁或源码时在[服务器完整库](server-data.md)查询。
+
 ## 实际调用
 
 在配置允许的计算环境运行。SKILL_ROOT 是当前 skill 路径；LIBRARY 是包含完整 kernelwiki 的 library 目录，可用 INFERENCE_SKILL_LIBRARY 设定。
 
 ```bash
 python "$SKILL_ROOT/scripts/research_tools.py" --library-root "$LIBRARY" wiki-query -- "UMMA" --architecture B200 --limit 5 --compact
+python "$SKILL_ROOT/scripts/research_tools.py" --library-root "$LIBRARY" wiki-query -- --symptom register-pressure --limit 5 --compact
 python "$SKILL_ROOT/scripts/research_tools.py" --library-root "$LIBRARY" wiki-query -- --symptom pipeline-stalls --compact
 python "$SKILL_ROOT/scripts/research_tools.py" --library-root "$LIBRARY" wiki-page -- kernel-flash-attention-4 --follow-sources
 python "$SKILL_ROOT/scripts/research_tools.py" --library-root "$LIBRARY" wiki-page -- pr-cutlass-2472 --include-code
