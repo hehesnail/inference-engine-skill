@@ -32,6 +32,14 @@
 
 在目标环境查 `vllm serve --help` 和 `vllm bench serve --help`。若帮助被分组，再查该版本提供的完整帮助（例如 `--help=all`）。据此生成命令，不依赖 skill 中的参数表。端口、模型名、网络绑定与设备沿用本任务配置。
 
+<a id="native-evidence"></a>
+
+## 固定输入验生成、读启动容量
+
+跨引擎对照先固定同一 checkpoint、输入 token IDs、停止条件和输出长度。离线走 `LLM.generate`，传入含 `prompt_token_ids` 的请求。用 `SamplingParams(temperature=0, max_tokens=N, ignore_eos=True)` 检查固定步数。保存返回的 `prompt_token_ids`、`outputs[0].token_ids` 和 `outputs[0].finish_reason`。检验自然 EOS 时使用模型实际的停止配置。在目标 checkout 可搜 `examples/basic/offline_inference/generate.py`。在线压测先核对该环境的 `vllm bench serve --help`。
+
+估 KV 容量看 EngineCore 的 `Available KV cache memory`、`GPU KV cache size` 和 `Maximum concurrency for … tokens per request`。前两项分别是 GiB 和 token 数，最后一项受指定请求长度影响。实测请求吞吐另走[服务压测](benchmarking.md#serving-selection)。只有 token 数的日志可以核对容量，缺少的显存分项在[解析结果](profiling-memory.md)中保留为未知。
+
 ## API 与模型修改
 
 接入新模型或自定义状态时先用 [model-integration.md](model-integration.md) 沿完整执行链核对；数值与候选开关的证据口径见 [numerical-validation.md](numerical-validation.md)。只选本次实际影响的路径，不将清单变成全量测试要求。

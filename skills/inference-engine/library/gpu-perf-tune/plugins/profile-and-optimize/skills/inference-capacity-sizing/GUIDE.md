@@ -61,6 +61,7 @@ python3 ${PROFILE_AND_OPTIMIZE_REPO_ROOT}/tools/capacity_sizing.py \
    It emits the SLA -> c* -> per-pod tok/s -> pods -> GPUs -> $/month table
    (CAPACITY-SIZING.md + capacity_sizing.json). It fails loud on missing/degenerate inputs
    (no anchors, non-monotonic curve, tpm<=0).
+   When the per-user target exceeds the fastest measured anchor, the row has regime `latency-tier-infeasible`. Sizing and cost fields are null in JSON. Supply a measured point that reaches the target before quoting a replica count.
 3. Read the table SLA-first. The pod count is flat for any SLA at or below the throughput
    knee, then rises steeply as the SLA tightens. Lead with "the GPU count is the SLA you
    commit to".

@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -49,13 +50,6 @@ def _p50_or_mean_tpot_ms(row: dict[str, Any]) -> float:
     return _float(row, "metrics.mean_tpot_ms", 1e30)
 
 
-def _p50_or_mean_value(row: dict[str, Any], metric: str) -> Any:
-    p50_value = _get(row, f"metrics.p50_{metric}_ms")
-    if p50_value is not None:
-        return p50_value
-    return _get(row, f"metrics.mean_{metric}_ms")
-
-
 def _rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         _get(row, "status") == "ok",
@@ -79,10 +73,31 @@ def _finite_metric(row: dict[str, Any], path: str) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _sla_limits(row: dict[str, Any]) -> dict[str, float | None]:
+    sla = _get(row, "sla")
+    if not isinstance(sla, dict):
+        return {}
+    return {key: _finite_metric(row, "sla." + key)
+            for key, value in sla.items() if key.startswith(("min_", "max_")) and value is not None}
+
+
 def _validation_issues(row: dict[str, Any]) -> list[str]:
     issues = []
     if _get(row, "status") != "ok" or not _bool(row, "sla.passed"):
         issues.append("run status or declared SLA did not pass")
+    for path in ("framework", "model", "hardware.gpu_model"):
+        value = _get(row, path)
+        if not isinstance(value, str) or value.strip().lower() in {"", "unknown", "n/a"}:
+            issues.append(path + " is missing")
+    gpu_count = _finite_metric(row, "hardware.gpu_count")
+    if gpu_count is None or gpu_count <= 0 or not gpu_count.is_integer():
+        issues.append("hardware.gpu_count is missing or invalid")
+    workload = row.get("workload")
+    labels = {"scenario", "scenario_name", "dataset_scenario"}
+    if not isinstance(workload, dict) or not any(
+        value is not None and value != "" for key, value in workload.items() if key not in labels
+    ):
+        issues.append("workload identity or load parameters are missing")
     rate = _finite_metric(row, "metrics.success_rate")
     minimum = _finite_metric(row, "sla.min_success_rate")
     if rate is None or not 0 <= rate <= 1:
@@ -103,13 +118,16 @@ def _validation_issues(row: dict[str, Any]) -> list[str]:
         value = _finite_metric(row, "metrics." + metric)
         if value is None or value < 0:
             issues.append(metric + " is missing, negative, or non-finite")
-    for metric in ("ttft", "tpot"):
-        limit_path = "sla.max_p50_" + metric + "_ms"
-        if _get(row, limit_path) is not None:
-            limit = _finite_metric(row, limit_path)
-            value = _finite_metric(row, "metrics.p50_" + metric + "_ms")
-            if limit is None or limit < 0 or value is None or value < 0 or value > limit:
-                issues.append("observed p50 " + metric + " does not establish its SLA")
+    for key, limit in _sla_limits(row).items():
+        if key == "min_success_rate":
+            continue
+        if not re.fullmatch(r"max_p(?:100|[1-9]?[0-9])_(?:ttft|tpot|e2e)_ms", key):
+            issues.append("cannot verify SLA criterion " + key)
+            continue
+        metric = key.removeprefix("max_")
+        value = _finite_metric(row, "metrics." + metric)
+        if limit is None or limit < 0 or value is None or value < 0 or value > limit:
+            issues.append("observed " + metric + " does not establish its SLA")
     normalization = _get(row, "normalization", {})
     if isinstance(normalization, dict) and any(value is False for value in normalization.values()):
         issues.append("normalization reports a comparison mismatch")
@@ -131,11 +149,19 @@ def _incomparable_scenarios(rows: list[dict[str, Any]]) -> set[str]:
             "tokenizer_revision": row.get("tokenizer_revision"),
             "workload": row.get("workload"),
             "gpu_model": _get(row, "hardware.gpu_model"),
-            "gpu_count": _get(row, "hardware.gpu_count"),
+            "gpu_count": _finite_metric(row, "hardware.gpu_count"),
+            "sla_limits": _sla_limits(row),
         }
         signature = json.dumps(contract, sort_keys=True, ensure_ascii=False)
         cohorts.setdefault(_scenario(row), set()).add(signature)
     return {scenario for scenario, signatures in cohorts.items() if len(signatures) > 1}
+
+
+def _ranking_issues(row: dict[str, Any], incomparable: set[str]) -> list[str]:
+    issues = _validation_issues(row)
+    if _scenario(row) in incomparable:
+        issues.append("comparison metadata differs within scenario")
+    return issues
 
 
 def _fmt(value: Any, digits: int = 2) -> str:
@@ -222,12 +248,15 @@ def best_by_framework_and_scenario(rows: list[dict[str, Any]]) -> list[dict[str,
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    incomparable = _incomparable_scenarios(rows)
     fields = [
         "framework",
         "scenario",
         "candidate_id",
         "status",
         "sla_passed",
+        "ranking_eligible",
+        "ranking_evidence",
         "request_throughput",
         "output_token_throughput",
         "p50_ttft_ms",
@@ -247,6 +276,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
+            issues = _ranking_issues(row, incomparable)
             writer.writerow(
                 {
                     "framework": _get(row, "framework", ""),
@@ -254,6 +284,8 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                     "candidate_id": _get(row, "candidate_id", ""),
                     "status": _get(row, "status", ""),
                     "sla_passed": _bool(row, "sla.passed"),
+                    "ranking_eligible": not issues,
+                    "ranking_evidence": "; ".join(issues),
                     "request_throughput": _get(row, "metrics.request_throughput", ""),
                     "output_token_throughput": _get(
                         row, "metrics.output_token_throughput", ""
@@ -313,8 +345,8 @@ def _append_best_commands_by_framework(
                     rps=_cell(_get(row, "metrics.request_throughput")),
                     otps=_cell(_get(row, "metrics.output_token_throughput")),
                     ttps=_cell(_get(row, "metrics.total_token_throughput")),
-                    ttft=_cell(_p50_or_mean_value(row, "ttft")),
-                    tpot=_cell(_p50_or_mean_value(row, "tpot")),
+                    ttft=_cell(_get(row, "metrics.p50_ttft_ms")),
+                    tpot=_cell(_get(row, "metrics.p50_tpot_ms")),
                     success=_cell(_get(row, "metrics.success_rate")),
                     accept=_cell(
                         _optional_metric(
@@ -369,8 +401,8 @@ def _append_cross_framework_table(
                     sla=_cell(_bool(row, "sla.passed")),
                     rps=_cell(_get(row, "metrics.request_throughput")),
                     otps=_cell(_get(row, "metrics.output_token_throughput")),
-                    ttft=_cell(_p50_or_mean_value(row, "ttft")),
-                    tpot=_cell(_p50_or_mean_value(row, "tpot")),
+                    ttft=_cell(_get(row, "metrics.p50_ttft_ms")),
+                    tpot=_cell(_get(row, "metrics.p50_tpot_ms")),
                     accept=_cell(
                         _optional_metric(
                             row,
@@ -414,7 +446,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         "",
     ])
     if incomparable:
-        lines.extend(["Automatic ranking withheld for mismatched workload/model/hardware scenarios: "
+        lines.extend(["Automatic ranking withheld for mismatched workload/model/hardware/SLA scenarios: "
                       + ", ".join(sorted(incomparable)), ""])
     _append_best_commands_by_framework(lines, scenario_winners)
     _append_cross_framework_table(lines, scenario_winners)
@@ -422,9 +454,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                   "| Framework | Scenario | Candidate | Success rate | Failed requests | Ranking evidence |",
                   "| --- | --- | --- | ---: | ---: | --- |"])
     for row in rows:
-        issues = _validation_issues(row)
-        if _scenario(row) in incomparable:
-            issues.append("comparison metadata differs within scenario")
+        issues = _ranking_issues(row, incomparable)
         lines.append("| " + " | ".join(_cell(value) for value in [
             _get(row, "framework"), _scenario(row), _get(row, "candidate_id"),
             _get(row, "metrics.success_rate"),

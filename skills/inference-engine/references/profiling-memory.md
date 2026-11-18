@@ -44,7 +44,7 @@ token 容量除以每请求驻留 token 数只是理想化存储上界；还受 
 
 BBuf 的 trace、容量、逐层分析和图表辅助脚本已连同 import 依赖、参考表和配置一起装入本包。通过[稳定工具入口](tools.md)在选定环境运行；[完整 profiler 指南](../library/bbuf/skills/llm-torch-profiler-analysis/GUIDE.md)与[容量指南](../library/bbuf/skills/llm-serving-capacity-planner/GUIDE.md)提供参数、示例及边界条件。
 
-`offline_tools.py` 只暴露离线模式，拒绝 URL 采集参数并关闭子进程的 GPU 可见性。原生在线采集脚本仍作为完整参考保留，实际调用时沿用工作区已获准的服务、设备与本次资源限制。旧日志匹配不到的字段保留未知，不填入历史默认值。
+`offline_tools.py` 只暴露离线模式，拒绝 URL 采集参数并关闭子进程的 GPU 可见性。原生在线采集脚本仍作为完整参考保留，实际调用时沿用工作区已获准的服务、设备与本次资源限制。`capacity --log-file FILE --format json` 读取 vLLM 或 SGLang 的 worker 启动日志。匹配到容量记录时只发布可观测的显存分项，缺项为 `null`，日志记录为零时保留其精度。读 `gpu_hbm_source` 区分 worker 实报、设备快照与型号规格。用规格容量减启动时空闲量得到的开销属于估算。只有框架名称、启动参数或 GPU 型号时，工具返回退出码 2 与 `insufficient_evidence`。此时补取对应 worker 日志。多引擎日志按运行实例拆开，SGLang 分项按目标 TP rank 查。用 `--request-tokens` 传入单请求需要驻留的总 token 数。超过日志记录的有效上下文上限时，返回零并标记 `exceeds_context_length`。上限以内的并发数是由 KV 池和已知调度上限推算的容量上界。
 
 ## 深入具体瓶颈
 

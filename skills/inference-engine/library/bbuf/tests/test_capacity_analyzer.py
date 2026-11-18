@@ -693,3 +693,65 @@ def test_post_capture_target_va_bound_preserves_independent_draft_pool():
 [TP0] Post-capture KV sizing: KV cache allocated. dtype: torch.bfloat16, #tokens: 9000, KV size: 28.00 GB, avail mem=42.00 GB
 ''')
     assert decompose_memory(parsed, 80).kv_pool_gib == 30
+
+
+def test_cli_distinguishes_missing_capacity_from_zero(tmp_path):
+    import subprocess
+
+    for i, (source, framework, expected) in enumerate((
+        ("", "unknown", None),
+        ("Attempting to import optional vllm plugin", "vllm", None),
+        ("/env/bin/lmdeploy serve api_server /models/m", "lmdeploy", None),
+        ("SGLang KV Cache is allocated. Format changed.", "sglang", None),
+        ("vLLM Engine CPU KV cache size: 400 tokens", "vllm", None),
+        ("SGLang optional plugin\nGPU KV cache size: 65,536 tokens", "vllm", 65536),
+        ("[TP0] Load weight end. mem usage=0.00 GB", "sglang", 0),
+    )):
+        logfile = tmp_path / str(i)
+        logfile.write_text(source)
+        result = subprocess.run([sys.executable, str(SCRIPT_DIR / "capacity_analyzer.py"),
+                                 "--log-file", str(logfile), "--gpu", "h200", "--format", "json"],
+                                capture_output=True, text=True)
+        report = json.loads(result.stdout)
+        assert report["framework"] == framework
+        if expected is None:
+            assert result.returncode == 2 and report["status"] == "insufficient_evidence"
+            assert "memory_breakdown" not in report
+        else:
+            assert result.returncode == 0
+            assert report["gpu_hbm_source"] == "gpu_spec"
+            assert report["memory_breakdown"]["total_used_gib"] is None
+            if framework == "vllm":
+                assert report["vllm"]["gpu_kv_cache_tokens"] == expected
+                assert report["memory_breakdown"]["kv_pool_gib"] is None
+            else:
+                assert report["memory_breakdown"]["model_weights_gib"] == expected
+
+
+def test_partial_log_does_not_borrow_another_sglang_rank():
+    from capacity_analyzer import reported_breakdown
+
+    parsed = parse_log("[TP1] Load weight begin. avail mem=100.0 GB\n"
+                       "[TP1] Load weight end. mem usage=1.50 GB")
+    report = reported_breakdown(decompose_memory(parsed, 140, target_rank=0))
+    assert report["framework_overhead_gib"] is None and report["model_weights_gib"] is None
+
+def test_rank_selection_applies_to_capacity_and_scheduler_caps():
+    def capacity(rank, tokens, limit):
+        return (f"[TP{rank}] max_total_num_tokens={tokens}, chunked_prefill_size=32, "
+                f"max_prefill_tokens=64, max_running_requests={limit}, context_len=128, "
+                "available_gpu_mem=1.00 GB")
+
+    text = capacity(0, 64, 2) + "\n" + capacity(1, 128, 4)
+    assert parse_log(text, target_rank=0).final_info.max_total_num_tokens == 64
+    assert parse_log(text, target_rank=1).final_info.max_running_requests == 4
+    assert not parse_log(text, target_rank=2).has_capacity_evidence
+    untagged = capacity(0, 64, 2).removeprefix("[TP0] ")
+    assert not parse_log(untagged, target_rank=1).has_capacity_evidence
+
+
+def test_request_length_at_and_above_runtime_context():
+    fi = FinalInfo(max_total_num_tokens=262144, max_running_requests=2, context_len=96)
+    estimates = estimate_concurrency(fi, 0.12, 0.0, "bf16", [95, 96, 97, 4096])
+    assert [row.max_concurrent for row in estimates] == [2, 2, 0, 0]
+    assert [row.exceeds_context_length for row in estimates] == [False, False, True, True]

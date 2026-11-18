@@ -52,11 +52,11 @@ class Anchor:
 @dataclasses.dataclass
 class SizingRow:
     sla_toks_per_user: float
-    concurrency: float  # c* (the max concurrency meeting the SLA)
-    per_replica_tps: float
-    replicas: int
-    gpus: int
-    usd_per_month: float
+    concurrency: float | None
+    per_replica_tps: float | None
+    replicas: int | None
+    gpus: int | None
+    usd_per_month: float | None
     regime: str  # measured-anchor | interp | below-knee-plateau | latency-tier-infeasible
 
 
@@ -102,13 +102,8 @@ def parse_anchors(spec: str) -> list[Anchor]:
 
 def _interp_concurrency_for_sla(anchors: list[Anchor], sla: float) -> tuple[float, float, str]:
     """Return (c*, per_replica_tps, regime) for a target SLA via log-c piecewise interpolation."""
-    hi_tpu = anchors[0].toks_per_user  # largest tok/s/user (lowest concurrency)
     lo_tpu = anchors[-1].toks_per_user  # smallest tok/s/user (highest concurrency = knee)
 
-    if sla > hi_tpu + 1e-9:
-        # tighter than the c=1 (lowest-concurrency) anchor can deliver: latency tier, clamp to that anchor
-        a = anchors[0]
-        return a.concurrency, a.per_replica_tps, "latency-tier-infeasible"
     if sla <= lo_tpu + 1e-9:
         # at or below the knee: per-replica throughput plateaus, pod count is flat
         a = anchors[-1]
@@ -154,6 +149,9 @@ def resolve(
     for sla in sorted(sla_list):
         if sla <= 0:
             raise ValueError(f"SLA {sla} must be > 0")
+        if sla > anchors[0].toks_per_user + 1e-9:
+            rows.append(SizingRow(sla, None, None, None, None, None, "latency-tier-infeasible"))
+            continue
         c, per_replica, regime = _interp_concurrency_for_sla(anchors, sla)
         if per_replica <= 0:
             raise ValueError(f"degenerate per-replica throughput at SLA {sla}")
@@ -175,8 +173,8 @@ def resolve(
         )
     if any(r.regime == "latency-tier-infeasible" for r in rows):
         notes.append(
-            "an SLA above the c=1 anchor is a latency-tier point; serving a large TPM there needs "
-            "an impractical pod count."
+            "The per-user target exceeds every measured anchor. A replica count requires "
+            "a measured configuration that achieves this per-user rate."
         )
     return SizingResult(model, tpm, tok_per_s, gpus_per_pod, util, gpu_hourly_usd, anchors, rows, notes)
 
@@ -191,6 +189,9 @@ def render_md(r: SizingResult) -> str:
     lines.append("| SLA tok/s/user | c* | per-pod tok/s | pods | GPUs | $/month | regime |")
     lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for row in r.rows:
+        if row.replicas is None:
+            lines.append(f"| {row.sla_toks_per_user:g} | — | — | — | — | — | {row.regime} |")
+            continue
         lines.append(
             f"| {row.sla_toks_per_user:g} | {row.concurrency:g} | {row.per_replica_tps:,.0f} | "
             f"{row.replicas} | {row.gpus} | ${row.usd_per_month:,.0f} | {row.regime} |"

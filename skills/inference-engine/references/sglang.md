@@ -27,6 +27,14 @@
 
 配置问题先区分用户原始输入、解析后的有效值、进程/runner 局部状态及一次 forward 的状态。调研时主线已采用 RuntimeContext 与 namespace config bags；旧分支可能不同。先核对发布、读取和 override 的实际实现，避免修改了原始 ServerArgs 却没改到消费方，或把父进程的变化误当作已同步到子进程。
 
+<a id="native-evidence"></a>
+
+## 固定输入验生成、读各 rank 的容量
+
+验证 scheduler 到 detokenizer 的生成路径时，可向本地原生 `/generate` 提交 `input_ids`，并在 `sampling_params` 中给出 `temperature=0`、`max_new_tokens=N`。如需对照固定的 N 步，再设 `ignore_eos=true`。保存响应里的 `output_ids`、`meta_info.finish_reason` 和 `meta_info.completion_tokens`。当前版本缺少其中一项时，标出可观察的字段。涉及聊天模板时另验客户端的文本入口。离线 Python 入口可查 `sgl.Engine.generate(input_ids=...)` 及目标 checkout 的 `test/registered/core/test_srt_engine.py`。0.5.22 的服务压测入口可通过 `python -m sglang.benchmark.serving --help` 核对。
+
+显存归因按同一运行实例和 TP rank 对齐 `Load weight end`、`KV Cache is allocated`、图捕获与 `max_total_num_tokens`。记录 token 容量和调度请求上限各自的单位。把 worker 启动日志传给[容量解析器](profiling-memory.md)，比较多个 rank 时逐个指定 `--target-rank`。需要线上延迟或吞吐时，另用相同请求集做[服务压测](benchmarking.md#serving-selection)。
+
 ## 模型与 kernel 改动
 
 新模型先列与最接近实现的差异：权重映射、attention/recurrent state、KV 布局、量化、并行分片和协议输出。多模块支持才需要分阶段计划；一个局部修复不必建立完整 Day-0 发布流程。

@@ -5,7 +5,7 @@ description: Profile, validate, and optimize LLM inference and GPU kernels acros
 
 # 推理引擎工作台
 
-LMDeploy、vLLM 和 SGLang 都可以用下表做性能对照、数值排查、状态验证以及 GPU kernel 归因。把当前框架的真实输入、计时边界、有效配置和证据带进对照。例如，LMDeploy 先从响应确认前缀命中多少 token，再用同一组输入比较冷、热路径首次不同的 logits。
+LMDeploy、vLLM 和 SGLang 都可以用下表做性能对照、数值排查、状态验证以及 GPU kernel 归因。把当前框架的真实输入、计时边界、有效配置和证据带进对照。对齐输入或解释容量时，从当前引擎拿原生证据。vLLM 查 [生成结果与 EngineCore 日志](references/vllm.md#native-evidence)，SGLang 查 [原生生成与 TP worker 日志](references/sglang.md#native-evidence)。LMDeploy 的请求、响应与引擎实现分别见 `lmdeploy-pipeline` 和 `pytorch-refactor`。
 
 ## 按问题取用
 
@@ -21,7 +21,7 @@ LMDeploy、vLLM 和 SGLang 都可以用下表做性能对照、数值排查、�
 | 解读单次 launch 的寄存器、访存或 stall 指标 | [NCU 报告](references/nsight-compute.md)先核对计数器能区分哪些机制 |
 | 从零设计 CUDA 算子，或为已有算子尝试多种实现并选出可交付版本 | 用 [Kernel Design Agents（KDA）完整流程](library/kda/docs/agent-flow.md)组织迭代。从[任务模板](library/kda/prompts/basic-flow.md)确定输入、正确性参考和目标。逐个实现、验证和计时，记录每版改了什么、为什么保留或淘汰 |
 | 手上有 PyTorch 参考和待验的 CUDA 扩展，或要把一段模型拆成多个算子再拼回 | 单个候选走 [CUDA-Agent 编译与验算](references/agentic-kernel-workflows.md#cuda-agent-evaluate)。多段融合走 [KernelAgent 拆分与整图验证](references/agentic-kernel-workflows.md#kernelagent-compose) |
-| 已有 GPU 算子要达到延迟、吞吐目标，或要解释相对基线的回退 | 用[候选与对照](references/optimization-workflow.md)固定基线、正确性参考与计时边界。遇到 spill、流水线等待或访存异常，按硬件和症状查 KDA 的 [KernelWiki](references/kernel-knowledge.md)，选能区分源码改动的对照 |
+| 已有 GPU 算子要达到延迟、吞吐目标，或要解释相对基线的回退 | 用[候选与对照](references/optimization-workflow.md)固定基线、正确性参考与计时边界。需要改写实现并比较多个候选时，沿 [KDA 设计流程](library/kda/docs/agent-flow.md)逐版验算、计时。遇到 spill、流水线等待或访存异常，按硬件和症状查 KDA 的 [KernelWiki](references/kernel-knowledge.md)，选能区分源码改动的对照 |
 | 新算子已写好，要查接入后为什么没变快、图回放出错，或交付安装包 | 性能问题沿[实际引擎接线](references/kernel-engine-integration.md)确认 dispatch、fallback 和整层开销。图回放错误查[图捕获与同步](references/cuda-graphs-and-sync.md)。要把已验证的实现交付为可安装包，查 [kernel 构建与加载](references/backend-kernel-development.md#hugging-face-kernel-builder) |
 | 加草稿模型后接受率提高却更慢，或部分拒绝后输出错误 | [推测解码的成本、已提交 token 和状态回滚](references/speculative-decoding-contracts.md) |
 | 相同文本进引擎后 token 不同、约束输出不合法，或流式与最终文本不一致 | [输入输出契约](references/tokenizer-and-structured-output.md) |

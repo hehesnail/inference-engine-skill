@@ -34,9 +34,10 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "framework": "sglang",
                 "candidate_id": "sglang-fast-fail",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": False},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": False, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 99,
                     "output_token_throughput": 990,
                     "mean_ttft_ms": 1,
@@ -44,7 +45,8 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 1,
                     "p99_tpot_ms": 1,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
             {
                 "framework": "sglang",
@@ -52,17 +54,19 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "status": "failed",
                 "failure_reason": "server did not become ready",
                 "workload": {"scenario": "startup"},
-                "sla": {"passed": False},
+                "sla": {"passed": False, "min_success_rate": 1.0},
                 "metrics": {},
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
             {
                 "framework": "sglang",
                 "candidate_id": "sglang-steady",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 10,
                     "output_token_throughput": 100,
                     "mean_ttft_ms": 50,
@@ -70,15 +74,17 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 50,
                     "p99_tpot_ms": 5,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
             {
                 "framework": "vllm",
                 "candidate_id": "vllm-best",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 12,
                     "output_token_throughput": 90,
                     "mean_ttft_ms": 60,
@@ -86,7 +92,8 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 60,
                     "p99_tpot_ms": 6,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
         ]
 
@@ -103,8 +110,42 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("Cross-Framework Best Comparison", summary)
         self.assertNotIn("Overall Winner", summary)
         self.assertNotIn("Best Per Framework", summary)
-        self.assertNotIn("| startup |", summary)
-        self.assertIn("records tried configs that were not selected", summary)
+        self.assertNotIn("| startup |", summary.split("## All Recorded Candidates")[0])
+        self.assertIn("Candidates With Failed Or Incomplete Evidence", summary)
+
+    def test_comparison_requires_identity_and_observed_sla(self):
+        import csv
+        from copy import deepcopy
+
+        row = {"framework": "vllm", "model": "m", "candidate_id": "a", "status": "ok",
+               "workload": {"scenario": "chat", "num_prompts": 16},
+               "hardware": {"gpu_model": "H200", "gpu_count": 1},
+               "sla": {"passed": True, "min_success_rate": 1, "max_p99_ttft_ms": 300},
+               "metrics": {"request_throughput": 2, "output_token_throughput": 10,
+                           "success_rate": 1, "p99_ttft_ms": 300, "mean_ttft_ms": 49}}
+        other = deepcopy(row)
+        other.update(framework="sglang", candidate_id="b")
+        other["sla"]["max_p99_ttft_ms"] = "300"
+        best = self.mod.best_by_framework_and_scenario
+        self.assertEqual(len(best([row, other])), 2)
+        self.assertNotIn("| 49 |", self.mod.render_markdown([row]))
+        other["metrics"]["p99_ttft_ms"] = 301
+        self.assertEqual(best([row, other]), [row])
+        del other["metrics"]["p99_ttft_ms"]
+        self.assertEqual(best([row, other]), [row])
+        other["sla"]["max_p99_ttft_ms"] = 400
+        self.assertEqual(best([row, other]), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.csv"
+            self.mod.write_csv(path, [row, other])
+            with path.open() as handle:
+                exported = list(csv.DictReader(handle))
+        self.assertEqual([r["ranking_eligible"] for r in exported], ["False", "False"])
+        self.assertIn("comparison metadata differs", exported[0]["ranking_evidence"])
+        for key in ("model", "hardware", "workload"):
+            partial = {k: v for k, v in row.items() if k != key}
+            self.assertEqual(best([partial, partial]), [])
+            self.assertIn("All Recorded Candidates", self.mod.render_markdown([partial]))
 
     def test_load_rows_rejects_non_object_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,9 +162,10 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "candidate_id": "trt-c1",
                 "status": "failed",
                 "failure_reason": "server exited",
-                "sla": {"passed": False},
+                "sla": {"passed": False, "min_success_rate": 1.0},
                 "metrics": {},
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             }
         ]
 
@@ -146,9 +188,10 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "candidate_id": "trt|bad",
                 "status": "failed|startup",
                 "failure_reason": "server | exited",
-                "sla": {"passed": False},
+                "sla": {"passed": False, "min_success_rate": 1.0},
                 "metrics": {},
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             }
         ]
 
@@ -165,8 +208,8 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "framework": "sglang",
                 "candidate_id": "sglang-c1",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
                     "request_throughput": 10,
                     "output_token_throughput": 100,
@@ -176,16 +219,18 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_tpot_ms": 6,
                     "success_rate": 1.0,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
                 "server_command": "python -m sglang.launch_server --model-path m",
             },
             {
                 "framework": "vllm",
                 "candidate_id": "vllm-c1",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 12,
                     "output_token_throughput": 90,
                     "mean_ttft_ms": 85,
@@ -193,16 +238,18 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 85,
                     "p99_tpot_ms": 7,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
                 "server_command": "vllm serve m",
             },
             {
                 "framework": "sglang",
                 "candidate_id": "sglang-c2",
                 "status": "ok",
-                "workload": {"scenario": "summarization"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "summarization", "dataset_name": "fixed-summary"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 8,
                     "output_token_throughput": 140,
                     "mean_ttft_ms": 120,
@@ -210,7 +257,8 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 120,
                     "p99_tpot_ms": 8,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
                 "server_command": "python -m sglang.launch_server --model-path m --long",
             },
         ]
@@ -246,9 +294,10 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "framework": "sglang",
                 "candidate_id": "sglang-lower-mean",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 10,
                     "output_token_throughput": 100,
                     "mean_ttft_ms": 40,
@@ -256,15 +305,17 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 200,
                     "p99_tpot_ms": 5,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
             {
                 "framework": "sglang",
                 "candidate_id": "sglang-lower-p99",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 10,
                     "output_token_throughput": 100,
                     "mean_ttft_ms": 50,
@@ -272,7 +323,8 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 100,
                     "p99_tpot_ms": 5,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
         ]
 
@@ -285,9 +337,10 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "framework": "sglang",
                 "candidate_id": "sglang-lower-mean-tpot",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 10,
                     "output_token_throughput": 100,
                     "mean_ttft_ms": 40,
@@ -295,15 +348,17 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 100,
                     "p99_tpot_ms": 20,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
             {
                 "framework": "sglang",
                 "candidate_id": "sglang-lower-p99-tpot",
                 "status": "ok",
-                "workload": {"scenario": "chat"},
-                "sla": {"passed": True},
+                "workload": {"scenario": "chat", "dataset_name": "fixed-chat"},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 10,
                     "output_token_throughput": 100,
                     "mean_ttft_ms": 40,
@@ -311,7 +366,8 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                     "p99_ttft_ms": 100,
                     "p99_tpot_ms": 10,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             },
         ]
 
@@ -330,14 +386,16 @@ class CompareBenchmarkResultsTest(unittest.TestCase):
                 "framework": "sglang",
                 "candidate_id": "candidate-1",
                 "status": "ok",
-                "sla": {"passed": True},
+                "sla": {"passed": True, "min_success_rate": 1.0},
                 "metrics": {
+                    "success_rate": 1.0,
                     "request_throughput": 1.5,
                     "output_token_throughput": 8.0,
                     "mean_ttft_ms": 10.0,
                     "mean_tpot_ms": 2.0,
                 },
-                "hardware": {"gpu_count": 1},
+                "hardware": {"gpu_count": 1, "gpu_model": "H200"},
+                "model": "fixture-model",
             }
             input_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 

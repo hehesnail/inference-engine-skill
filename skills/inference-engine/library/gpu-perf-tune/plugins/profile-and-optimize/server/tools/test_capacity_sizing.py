@@ -67,12 +67,12 @@ def test_minimax_below_knee_plateau_is_flat():
 
 
 def test_sla_above_c1_is_latency_tier_infeasible():
-    # An SLA tighter than the c=1 anchor (300 > 215.5): latency tier, clamps to c=1, huge pod count.
     r = resolve(tpm=TPM_3M, sla_list=[300.0], anchors=MINIMAX, gpus_per_pod=4, util=0.70, model="MiniMax-M2.7")
     row = r.rows[0]
     assert row.regime == "latency-tier-infeasible"
-    assert row.concurrency == 1
-    assert row.replicas == 332
+    assert row.concurrency is None and row.per_replica_tps is None
+    assert row.replicas is None and row.gpus is None and row.usd_per_month is None
+    assert "| 300 | — | — | — | — | — |" in render_md(r)
 
 
 def test_gpu_count_swings_with_sla():

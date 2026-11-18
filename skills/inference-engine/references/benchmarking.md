@@ -65,7 +65,7 @@ kernel 微基准先核对数值、shape 和真实调用路径，再计时。编�
 ## 从压测结果选配置或估算副本数
 
 - 已有匹配负载的结果，按 [BBuf 结果格式](../library/bbuf/skills/llm-serving-auto-benchmark/references/result-schema.md)保留失败请求、成功率、延迟分位数、GPU 和实际负载，运行 `python "$SKILL_ROOT/scripts/offline_tools.py" compare --input runs.jsonl --output comparison.md`。用户有 p99 门槛时另从原始数据验 p99。缺失的身份和质量字段要回原记录补。
-- 已有同一模型和配置的并发–单用户 tok/s 实测曲线，且目标给出总输出 TPM 与单用户 tok/s，使用 [cfregly 副本容量估算](../library/gpu-perf-tune/plugins/profile-and-optimize/skills/inference-capacity-sizing/GUIDE.md)。将实测曲线、每副本卡数和目标利用率传给[随包脚本](../library/gpu-perf-tune/plugins/profile-and-optimize/server/tools/capacity_sizing.py)，参数为 `--tpm`、`--sla`、`--anchors`、`--gpus-per-pod` 和 `--util`。区分实测点、插值和 `latency-tier-infeasible`。单用户目标高于所有实测点时，脚本仍可能打印副本数，此行不能证明目标可达。KV 内存能放多少请求是另一项计算，见[显存与 KV 容量](profiling-memory.md#显存与-kv-容量)。
+- 已有同一模型和配置的并发–单用户 tok/s 实测曲线，且目标给出总输出 TPM 与单用户 tok/s，使用 [cfregly 副本容量估算](../library/gpu-perf-tune/plugins/profile-and-optimize/skills/inference-capacity-sizing/GUIDE.md)。将实测曲线、每副本卡数和目标利用率传给[随包脚本](../library/gpu-perf-tune/plugins/profile-and-optimize/server/tools/capacity_sizing.py)，参数为 `--tpm`、`--sla`、`--anchors`、`--gpus-per-pod` 和 `--util`。区分实测点、插值和 `latency-tier-infeasible`。单用户目标高于所有实测点时，脚本将副本数、GPU 数和费用留空。先补一组达到该单用户目标的测量，再估算总吞吐所需的卡数。KV 内存能放多少请求是另一项计算，见[显存与 KV 容量](profiling-memory.md#显存与-kv-容量)。
 
 ## 多轮优化的记录
 

@@ -191,8 +191,7 @@ Missing metric semantics:
   measurement. Do not write `0` as a placeholder for "no measurement"; leave the
   field out or set it to `null`.
 - If `metrics.request_throughput` or `metrics.output_token_throughput` is
-  missing, the row ranks below any candidate with a real measurement in those
-  keys. A failed candidate that still produced partial metrics should keep the
+  missing, the row remains in All Recorded Candidates and is excluded from ranking. A failed candidate that still produced partial metrics should keep the
   metrics it did produce.
 
 ## Final Report Tables
@@ -213,4 +212,6 @@ The markdown summary must include these sections:
 
 ## Adapted evidence validation
 
-Automatic ranking requires finite observed success_rate, explicit min_success_rate, finite nonnegative throughput, and each configured p50 limit backed by the corresponding observed p50. Contradictory failure counts or explicit normalization mismatches exclude a row. Recorded model/revision, workload and GPU metadata must match within a named scenario; otherwise automatic ranking is withheld and all records remain in the report. This intentionally stops treating legacy status/SLA booleans as sufficient evidence. Missing fields remain unknown, not zero; a capacity sweep across load settings needs separate analysis. Metadata equality does not verify raw artifacts or model quality.
+For automatic ranking, record the engine, model, GPU model and positive count, and the workload identity or load parameters. A scenario label alone does not describe the workload. Include known model/tokenizer revisions and fixed request inputs when comparing engines. Within a scenario the recorded model, workload, hardware and numerical SLA thresholds must agree. Report separate scenarios for different service targets.
+
+A row needs an observed success rate, the minimum success rate, and finite nonnegative request and output throughput. Each declared latency threshold requires its own observed percentile. The summarizer accepts normalized result fields such as `sla.max_p99_ttft_ms` against `metrics.p99_ttft_ms`, including TTFT, TPOT and E2E latency. An unsupported min/max condition, contradictory failure count or explicit normalization mismatch withholds ranking. Rows remain visible with the reason. CSV keeps the reported `sla_passed` and adds the checked `ranking_eligible` and `ranking_evidence`. Means can break ties when medians are missing. P50 table cells display observed medians only.
