@@ -18,6 +18,8 @@ vLLM 包内保存了 [模型接入](../library/vllm/docs/contributing/model/basi
 
 ## 选择有效验证
 
+若任务是为 SGLang 新模型准备首日支持，按 [Day-0 工作流](../library/bbuf/skills/model-optimization/sglang-model-day0-support/GUIDE.md)将架构差异、实现、验证矩阵和实际证据整理成材料包。`python "$SKILL_ROOT/scripts/offline_tools.py" day0-check BUNDLE --format json` 可以发现未填字段和材料问题。模型接入是否成功仍由对应版本的真实加载、推理输出及任务验收决定。
+
 先找当前项目可复用的接入/端到端用例和已验证结果。覆盖本次修改经过的启动、调度、执行、输出接线，必要时用隔离 CPU 用例定位契约；CPU 模拟与真实 GPU 生成分别报告。数值判断遵循 [numerical-validation.md](numerical-validation.md)。
 
 有状态微基准先确定重复调用是否从相同状态开始；reset 可能涉及 KV、循环状态、长度计数和临时池。只重置 KV 不一定构成对称对照，反复累积状态也可能测到不同工作量。性能计时与状态初始化的边界需与基线一致。

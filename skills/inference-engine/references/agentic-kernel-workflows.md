@@ -1,6 +1,6 @@
 # 五个 agent 工程如何用于推理引擎
 
-这些工程的价值不只是“计划→实验→总结”。下面按实际模块说明可复用机制、输入输出与接线。每个工程的完整 guides、reference、脚本和模块资料可从 [工程目录](repository-guides.md) 找到。宿主运行时和远端服务依赖仍属于相应工程，不能假装已经安装在本 skill 内。
+从交付物选择下面的工作流。已给参考和候选时可以直接运行评测器。有整图、已有调优目录或作业 ID 时从对应小节开始。原工程源码、安装包与宿主依赖的位置见[工程目录](repository-guides.md)和[服务器资料](server-data.md)。
 
 ## KDA：知识检索、候选记录、可交付 kernel
 
@@ -10,13 +10,29 @@ KernelWiki 提供硬件→技巧→kernel→症状→语言→迁移六类技术
 
 候选保存 parent、源摘要、基线、shape 集、每项正确性和性能证据、接受/拒绝原因。成功 kernel 最后要经过引擎 dispatch 与真实 wrapper，不能只交独立函数。KDA 的 export_huggingface.py 可以把已选 CuTe Python/JSON 候选转成 HF kernel 项目：支持嵌套入口、普通本地 import 改写、run/prepare，拒绝 symlink、动态本地 import 和不支持的源文件；输出目录不能覆盖输入或已有输出。打包副本不改原候选，模块 ID 绑定内容与发布配置。打包成功仍需验证安装后的 run、stream、重复调用和 graph capture，prepare 返回的 launch 时间不等于 run 总时间。原始测试含 fake builder，CPU 通过不证明 GPU 构建或性能。
 
+<a id="cuda-agent-evaluate"></a>
+
 ## CUDA-Agent：把验证器与候选分开
+
+把[CUDA-Agent 工作目录](../library/cuda-agent/agent_workdir/GUIDE.md)复制到独立任务目录。固定 `model.py` 的参考、输入和 `utils/` 的验证器，将候选接入 `model_new.py` 及 `kernels/`。在含 PyTorch、CUDA 编译工具和目标 GPU 的环境，从副本根目录执行下列命令。
+
+```bash
+python -m utils.compile
+python -m utils.verification
+python -m utils.profiling --iters 12
+```
+
+编译会重建副本中的 `build/forced_compile` 和扩展。验算通过后再计时。原生 profiler 输出 eager、`torch.compile` 与扩展各自的 GPU 事件耗时。若任务还要求字典键集合相同，单独比较键集合，原验证器只遍历参考中的键。
 
 固定 reference/harness，优化 candidate。输入生成、编译、正确性和计时分开；不要通过修改 evaluator、重用旧输出、识别 correctness/timing 阶段或跳过形状换取结果。它的 verify/profile/bench 习惯可用于单算子迭代，固定 1e-2 容差、5 次检查、5% 收益门槛则属于其任务，不能替代当前算子/模型标准。
 
 把 profiler 的 kernel 时间总和与实际调用 wall/event 时间分开。原位 kernel 在重复测量前恢复输入；buffer reuse、L2 状态、dtype、mask 和非连续视图与引擎一致。先通过 reference 对照，再看优化收益。保留失败样例与结果，不只留最快一次。
 
+<a id="kernelagent-compose"></a>
+
 ## KernelAgent：子图优化和组合验证
+
+给定 PyTorch 整图，从 [Fuser 工程入口](../library/kernelagent/GUIDE.md)确定子图的真实输入、输出、别名与状态。用同一输入把候选按真实边界组合，逐项对回原模型，再测整图。已有候选时，当前 agent 就能组织这组验证。要让原生 Fuser 自动提取、生成并组合候选，从[固定版本完整 checkout](https://github.com/meta-pytorch/KernelAgent/tree/e0647170da36ef9b059ac0bd3d60103aa4ed378b)运行 `python -m Fuser.pipeline --problem "$MODEL_PY" --target-platform cuda --verify --out-root "$RUN_DIR"`，并配置目标后端和生成候选所用的模型 provider。随包 runner 可单独执行候选。
 
 Fuser/pipeline.py 负责抽取子图、调度候选、汇总，再经 compose_end_to_end.py 拼成完整实现；kernel_perf_agent 提供 NCU、roofline 与历史示例，oink 保留 SM100 的真实算子和 benchmark。
 
@@ -24,7 +40,11 @@ Fuser/pipeline.py 负责抽取子图、调度候选、汇总，再经 compose_en
 
 **已核对的陷阱：** compose 的 verify 默认 False；代码把未验证的生成结果也设为 success=True。必须检查 verify_passed、validator 与日志，不能仅消费 success。该工程的 thread lock 也不是跨进程 GPU 隔离。SM100 特化实现按其 dtype、alignment、stride、in-place 和 fallback 条件使用，不推广为其他架构默认实现。
 
+<a id="hyperloom-resume"></a>
+
 ## Hyperloom：配置、源码、kernel 三条优化路径
+
+已有 Hyperloom 会话时，从[优化器恢复说明](../library/hyperloom/src/hyperloom/inference_optimizer/GUIDE.md)打开指定 `session_dir` 的 manifest、状态和事件。核对 `current_best` 对应的工作负载、有效参数、源码和已加载实现，再决定是否从该会话续跑。原生 `--resume-from` 用在已有对应运行时的环境。普通 SSH 实验可按原记录恢复被测配置，保留实测身份。
 
 实际 Coordinator 维护 session manifest/state/SQLite 事件、baseline、current_best、optimization_stack；FRAMEWORK_AGENT 内配置参数和源码 patch 是两条可独立推进的路径，KERNEL_AGENT 根据 trace 的 reusable_native_kernel_ids 接入 kernel 优化。不要从 README 推断旧版本已删除的 action 仍存在。
 
@@ -39,7 +59,11 @@ Fuser/pipeline.py 负责抽取子图、调度候选、汇总，再经 compose_en
 
 TraceLens/Magpie/GEAK/KernelForge、KB/PR Monitor 和模型 API 都是外部依赖；保留其安装与运行资料，但只有明确需要实际运行该工程时才配置它们。不会为了借鉴优化逻辑自动部署整套服务或启动多 agent。
 
+<a id="atrex-records"></a>
+
 ## Atrex：不可变测量与独立接受决定
+
+已有 job ID 想看进展时，在配置过 Gateway 的环境用 `agate get JOB_ID`，需要等待才加 `--wait`。查已保存的测量、对应 kernel 和 shape 走[结果记录](../library/atrex/src/aka/light/workspace/resources/skills/runtime-records/GUIDE.md)。已有证据要交接时走[报告模式](../library/atrex/src/aka/light/workspace/resources/skills/runtime-report/GUIDE.md)。`execute_job` 同时承担执行和恢复，等待到期时其重试分支可能再次提交。
 
 采用 light 路径的 Direction→Experiment→Gateway Record→exact Kernel 关系；legacy 单独保留，不混用两代 API。GPU runtime 在提交时快照源代码、用注入的 evaluator/private inputs 测量；任务 ID 和 kernel ID 用于去重和查询。记录重读成功只证明读到了记录，仍需检查 status、result.correct 和 diagnostics。
 

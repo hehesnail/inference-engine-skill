@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 6720,
-      "packaged_sha256": "09d7c67133e4bf1d256bb60ca33a8f71e1d6182edf6e33ce1bc59e9e1caa288a",
+      "bytes": 7569,
+      "packaged_sha256": "90463c19404fb407d36b729b6b3950a91307324b877bb77c048abc92f43f9aeb",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93151,8 +93151,8 @@
     },
     {
       "path": "references/agentic-kernel-workflows.md",
-      "bytes": 8997,
-      "packaged_sha256": "dfd84cf230a72399de1644f70d2c3940fdb29a2716fac800587a9daf67795960",
+      "bytes": 11380,
+      "packaged_sha256": "2f3d4e5ffdb92c6848363fa71a9d0f60ef39405fcd67ca77001fac08343e25c3",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93171,8 +93171,8 @@
     },
     {
       "path": "references/backend-kernel-development.md",
-      "bytes": 5622,
-      "packaged_sha256": "88970238005e8295d4b36b23f55ab5622b925f31e055bbbdff3d6dadfdfcc35d",
+      "bytes": 6181,
+      "packaged_sha256": "f9c7a5000be1d4ed83915d9178428304d46d9cb7b819906de819f16a792dd0eb",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93181,8 +93181,8 @@
     },
     {
       "path": "references/benchmarking.md",
-      "bytes": 7196,
-      "packaged_sha256": "df86b56d585edbe386f28487afccdc524949c2dce415f7991a0f8f1fc5ce57cf",
+      "bytes": 8468,
+      "packaged_sha256": "022639f675206e401b027e497d703ed032682c438cf9ff6fc433f8ac745c6ac3",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93241,8 +93241,8 @@
     },
     {
       "path": "references/fork-maintenance.md",
-      "bytes": 3828,
-      "packaged_sha256": "38b7eb6272993cff0c32bb801dbfc45671b512f28f1dec3bf5ce6978736bb217",
+      "bytes": 4268,
+      "packaged_sha256": "b0b195ef8443a9e4cb055b20389b5b44172b26bce473df35a629e55614c77a19",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93311,8 +93311,8 @@
     },
     {
       "path": "references/model-integration.md",
-      "bytes": 3597,
-      "packaged_sha256": "aed37fba4f3ee67478ea586de01300940c2be0a38bb812fc114011f29f33ed0f",
+      "bytes": 4044,
+      "packaged_sha256": "e44ea8bf9fa45491392cb9fe9a38089b0d5dd13ac5f0e3c76b5ba09ae32e5775",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93361,8 +93361,8 @@
     },
     {
       "path": "references/offline-evaluation.md",
-      "bytes": 3991,
-      "packaged_sha256": "5a2b01c6a2b981a149c986219dcc44997e6e265a276933e58203fa9448dbc810",
+      "bytes": 4456,
+      "packaged_sha256": "27a8024ae0c8b62884ac0f117764e274bdb903ba5a2cc9039663c8729ebf900b",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93371,8 +93371,8 @@
     },
     {
       "path": "references/optimization-workflow.md",
-      "bytes": 5789,
-      "packaged_sha256": "e6c75512bb202b16865cf0624653d24a1be6f3d7868d822b4c94567c078e072e",
+      "bytes": 6176,
+      "packaged_sha256": "97d5e7e276125cfa7fe324f3576ce6de6eef67e9628adb89f2092fd6a0707bcd",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93381,8 +93381,8 @@
     },
     {
       "path": "references/platforms-and-transport.md",
-      "bytes": 5926,
-      "packaged_sha256": "d3b7a5a8bc0fb99a2d6a9ade1d17a418159f6c803749d81fd7c0dc659da56299",
+      "bytes": 6453,
+      "packaged_sha256": "5834e953189ab799270c231176480e03c44c80f01bbc175a2b493c9215ae2b58",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,

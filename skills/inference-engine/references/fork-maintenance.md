@@ -2,6 +2,8 @@
 
 用于 rebase、上游升级、依赖升级、冲突处理和回归定位。吸收 Cohere 的 fork 四点对照，但用精确 commit 与当前运行环境，避免把最近 tag、最新 wheel 或一次安装模板当成真实基线。
 
+不知道 fork 从哪个上游提交分出时，按 [Cohere 基线定位](../library/cohere/skills/detect-upstream-base/GUIDE.md)结合 Git 关系核实。准备迁移已有定制时按[迁移与冲突处理](../library/cohere/skills/rebase-assistant/GUIDE.md)保留原意。已拿到失败的 Buildkite job 时，[本地 CI 复现](../library/cohere/skills/local-test-runner/GUIDE.md)可从该 job 提取实际命令、目录和环境。
+
 ## 四个状态
 
 - `U0`：旧 fork 实际基于的上游提交。

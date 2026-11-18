@@ -2,6 +2,8 @@
 
 根据任务、评测协议和现有结果识别目标是生成、loglikelihood/候选评分，还是整套评测耗时。仅在多种解释会改变验收指标且已有信息无法判断时补问。在线服务的 TTFT/TPOT、离线生成 tok/s、评分题/s 回答不同问题；共同的版本和缓存控制见 [benchmarking.md](benchmarking.md)。
 
+使用 lm-evaluation-harness 的任务，从[任务配置、后端与逐样本结果](../library/orchestra/11-evaluation/lm-evaluation-harness/GUIDE.md)选目标版本的执行入口。先核对任务请求的是生成、`loglikelihood` 还是 rolling loglikelihood，复用仓库既有协议并保留实际样本与分数。已有 NeMo Evaluator 端点或容器任务按[部署与评测作业](../library/orchestra/11-evaluation/nemo-evaluator/GUIDE.md)交接。
+
 ## 固定实际工作量
 
 - 复用指定请求计划或评测脚本，保留原始记录数、执行数、顺序、筛选理由和失败。文本、tokenizer、模板、输入 IDs、截断及 stop 条件会改变有效工作量。

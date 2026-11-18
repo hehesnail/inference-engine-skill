@@ -12,6 +12,8 @@
 
 容器环境检查要在目标容器/解释器内完成。host 可见设备、`torch.*.is_available()`、节点健康查询、模型能启动和真实推理正确，是不同级别的证据。检查工具缺失为 skipped/unknown，不能变成通过；复现问题时不因某个 skill 的默认命令改用 latest 镜像。
 
+移植已有 CUDA 路径到 Intel GPU 时，从[CUDA→XPU 迁移](../library/intel/plugins/intel-gpu-ai-skills/skills/cuda-to-xpu-migration/GUIDE.md)识别要替换的依赖和调用，在 XPU 环境用 [unitrace](../library/intel/plugins/intel-gpu-ai-skills/skills/xpu-profile-unitrace/GUIDE.md)查 SYCL/Level Zero 的提交和拷贝。已有 NVSHMEM 多进程通信错误时，用 [NVSHMEM 排障](../library/nvidia-skills/skills/nvshmem-troubleshoot-and-report-bugs/GUIDE.md)对齐各 PE 的首个错误和最小复现。
+
 ## 保留硬件细节，纠正硬件常量
 
 - H100/H200 的 Hopper 路径与 Blackwell 的 SM100/103 专用路径要分开；TMA/WGMMA 和 TMEM/`tcgen05` 的编译与 layout 约束并不相同。用目标后端与内核支持矩阵确认。

@@ -60,6 +60,13 @@ kernel 微基准先核对数值、shape 和真实调用路径，再计时。编�
 
 未经 profiling 的正式计时用于性能结论；trace 用于定位瓶颈。微基准、模型 forward 和在线服务结果分别报告。初始化、编译／预热、推理及 CPU 判分分列；两版本均预热后再解释稳定性能。整批输出吞吐使用实际输出 token 除以共同整批窗口，并说明是否包含 tokenize、prefill、decode 或排队；不能将它标作纯 decode 吞吐。套件总耗时比用可比任务的参考耗时之和除以候选耗时之和，不平均单项加速比。
 
+<a id="serving-selection"></a>
+
+## 从压测结果选配置或估算副本数
+
+- 已有匹配负载的结果，按 [BBuf 结果格式](../library/bbuf/skills/llm-serving-auto-benchmark/references/result-schema.md)保留失败请求、成功率、延迟分位数、GPU 和实际负载，运行 `python "$SKILL_ROOT/scripts/offline_tools.py" compare --input runs.jsonl --output comparison.md`。用户有 p99 门槛时另从原始数据验 p99。缺失的身份和质量字段要回原记录补。
+- 已有同一模型和配置的并发–单用户 tok/s 实测曲线，且目标给出总输出 TPM 与单用户 tok/s，使用 [cfregly 副本容量估算](../library/gpu-perf-tune/plugins/profile-and-optimize/skills/inference-capacity-sizing/GUIDE.md)。将实测曲线、每副本卡数和目标利用率传给[随包脚本](../library/gpu-perf-tune/plugins/profile-and-optimize/server/tools/capacity_sizing.py)，参数为 `--tpm`、`--sla`、`--anchors`、`--gpus-per-pod` 和 `--util`。区分实测点、插值和 `latency-tier-infeasible`。单用户目标高于所有实测点时，脚本仍可能打印副本数，此行不能证明目标可达。KV 内存能放多少请求是另一项计算，见[显存与 KV 容量](profiling-memory.md#显存与-kv-容量)。
+
 ## 多轮优化的记录
 
 需要比较多个实现或参数候选时，用 [优化工作流](optimization-workflow.md) 区分原始基线、当前最好版本、候选与最终生效配置。kernel 局部计时与端到端收益的接线见 [kernel-engine-integration.md](kernel-engine-integration.md)。

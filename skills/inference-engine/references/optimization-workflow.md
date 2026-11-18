@@ -2,6 +2,8 @@
 
 用于有目标耗时、吞吐预算或基线回退要解释的 kernel、runtime、serving 任务，也适用于只需一个对照就能区分原因的改动。从零设计 CUDA 算子或探索多种候选时，当前 coding agent 可直接执行 [KDA 完整工作流](../library/kda/docs/agent-flow.md)，用[任务模板](../library/kda/prompts/basic-flow.md)确定验收条件，从第一版实现迭代到有证据支持的选择。下面的对照方法也适用于单项改动，结合了 Atrex 的源码绑定、KernelAgent 的测量隔离和 Hyperloom 的配置记录。
 
+工作从既有产物继续时，带着原路径或 ID 进入对应流程。服务调优目录接[会话恢复](agentic-kernel-workflows.md#hyperloom-resume)，提交后回包超时接[原作业查询](agentic-kernel-workflows.md#atrex-records)。手上只有参考实现和一个待验证扩展时，可直接使用[固定验证器](agentic-kernel-workflows.md#cuda-agent-evaluate)。
+
 ## 基线和候选的关系
 
 区分原始基线（stock/original）、当前已验证最好版本（incumbent）与未验证候选（candidate）。原始基线回答总收益，incumbent 回答本次改动的增量收益。参考框架/理论上限可以帮助选择方向，但不能替换用户指定基线。

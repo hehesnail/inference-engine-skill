@@ -1,6 +1,6 @@
 # 后端、kernel 与通信的具体工作流
 
-本页把新增专项接回引擎开发。完整 NVIDIA 56 项、Intel 22 项、HF 5 项与 TRT kernel 指南见 [工程目录](repository-guides.md)，不是仅保留链接或一句摘要。
+按目标后端和交付形式选择实现资料。工程版本及 NVIDIA、Intel、Hugging Face、TensorRT-LLM 的专项目录见[工程目录](repository-guides.md)。
 
 ## CUDA / Triton / CuTe / cuTile
 
@@ -13,6 +13,8 @@ NVIDIA TileGym 的接线是公共 op→backend implementation→包初始化注�
 CuTe/Blackwell 重点读 TMEM、tcgen05、TMA、mbarrier、warp specialization、2-CTA、CLC 和 WGMMA 迁移；SM90/SM100/SM120 分开判适用性。精确例子与已发现错误见 [KernelWiki](kernel-knowledge.md)。没有这些指令的 GPU 使用对应后端路径，不因本轮机器不同删掉专项知识。
 
 ## Hugging Face kernel-builder
+
+将已验证实现交付为可安装的 kernel 时，按源语言和后端选择[五种构建指南](repositories/huggingface--kernels.md)。已有 CuTe-DSL Python/JSON 候选可按 [KDA 本地导出](../library/kda/docs/huggingface-export.md)提供入口、release 配置及独立输出目录，并在目标环境用 `kernels.get_local_kernel` 加载产物、以相同输入核对输出。含原生 CUDA/C++ 的扩展走 [CUDA 构建及 dispatcher 注册](../library/hf-kernels/kernel-builder/skills/cuda-kernels/GUIDE.md)。导出环境需要对应版本的 `kernel-builder`。
 
 五套 CPU/CUDA/ROCm/Triton/XPU guide 连同 references 与项目模板保留。它们解决可分发扩展的项目布局、构建变体、依赖、operator registration、测试和加载，不替代引擎的 custom op/fake/graph 接线。
 
