@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 5777,
-      "packaged_sha256": "82773e0052af45123642bba251f7d155175dae909cc4586a011ec97d9d653607",
+      "bytes": 6275,
+      "packaged_sha256": "0d242e62e4450633f2bfd9274efecd4ccf3646fd370ffc2bafa078eb91f069b5",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -71910,12 +71910,12 @@
     },
     {
       "path": "library/ncu-report/helpers/analyze_reports.py",
-      "bytes": 6037,
-      "packaged_sha256": "9367965a1e57a20c923feec8a54d94f68c978116dab74180de96154b2f74c100",
+      "bytes": 6460,
+      "packaged_sha256": "f07a1bacb22ba59a140713bc2ba92de8aba72597ffb7324412a4299c832ee657",
       "placement": "desktop-and-server",
       "repository": "mit-han-lab/ncu-report-skill",
       "source_path": "helpers/analyze_reports.py",
-      "adapted": false,
+      "adapted": true,
       "installed": true,
       "revision": "c7980a43cb88a8734d113b22b57ff66746cf5719",
       "upstream_sha256": "9367965a1e57a20c923feec8a54d94f68c978116dab74180de96154b2f74c100"
@@ -93331,8 +93331,8 @@
     },
     {
       "path": "references/nsight-compute.md",
-      "bytes": 6800,
-      "packaged_sha256": "d05de54ebb4b819a0575a6a5e90ffa9485da06a381976af8fb7aa987026139d2",
+      "bytes": 7034,
+      "packaged_sha256": "6cc8122a6397284ca2deae36faef905e4d4334d1b1f8d8913ab99742b2ec5552",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93391,8 +93391,8 @@
     },
     {
       "path": "references/profiling-memory.md",
-      "bytes": 6980,
-      "packaged_sha256": "7ec4ac218348b1be5f6106ce6248e53d5bd1e777c1a96313eb5a0d1842665b8f",
+      "bytes": 7468,
+      "packaged_sha256": "daa2c143a24b569b85fc60fc0c8ca0bda40786cf0f23671109c139c54832f601",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93701,8 +93701,8 @@
     },
     {
       "path": "references/tools.md",
-      "bytes": 5313,
-      "packaged_sha256": "cb1f7e28c831ceb01a540912f14bac454eede110318dafff14df69fcb642f273",
+      "bytes": 5417,
+      "packaged_sha256": "ab2ec34ada5c6970549535cf9dd333518fc614cca35a186c2ea9a5e6f07b9263",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,

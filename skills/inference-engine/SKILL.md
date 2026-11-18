@@ -1,11 +1,11 @@
 ---
 name: inference-engine
-description: Develop, deploy, and optimize LLM inference engines and GPU kernels. Diagnose latency, throughput, memory, or output regressions in kernels, serving, and offline evaluation, especially in vLLM and SGLang.
+description: Profile, validate, and optimize LLM inference and GPU kernels across LMDeploy, vLLM, and SGLang. Use for latency, throughput, memory, numerical regressions, and offline evaluation. Includes native vLLM and SGLang workflows.
 ---
 
 # 推理引擎工作台
 
-把推理引擎问题落实到实际版本、调用路径和可复现结果。LMDeploy 专属接口优先使用工作区相应 skill；共享的模型、状态、kernel 与测量知识可在这里查。纯文案、连接或传输任务直接按工作区处理。
+LMDeploy、vLLM 和 SGLang 都可以用下表做性能对照、数值排查、状态验证以及 GPU kernel 归因。把当前框架的真实输入、计时边界、有效配置和证据带进对照。例如，LMDeploy 先从响应确认前缀命中多少 token，再用同一组输入比较冷、热路径首次不同的 logits。
 
 ## 按问题取用
 
@@ -13,8 +13,6 @@ description: Develop, deploy, and optimize LLM inference engines and GPU kernels
 
 | 当前问题 | 入口 |
 |---|---|
-| vLLM 源码、模型或服务行为 | [vLLM](references/vllm.md) |
-| SGLang 源码、模型或服务行为 | [SGLang](references/sglang.md) |
 | 比较部署配置、并发、缓存命中的效果或整套评测耗时 | 从[性能对照](references/benchmarking.md)选基线。离线评测查[生成与评分口径](references/offline-evaluation.md)，多轮调优查[候选记录](references/optimization-workflow.md) |
 | 接入模型、改 KV/循环状态或在线更新权重，或定位只在分块、换请求、命中前缀后出现的错误 | [模型接入](references/model-integration.md)。涉及复用或恢复的状态，查[状态生命周期](references/stateful-inference.md) |
 | 换精度、量化或后端后分数变了，或要决定是否启用优化 | [数值验收](references/numerical-validation.md)。同一输入的首次差异查[数值漂移](references/numerical-drift-debugging.md)，权重格式与实际算子查[量化接线](references/quantization-engine-contracts.md) |
@@ -33,6 +31,11 @@ description: Develop, deploy, and optimize LLM inference engines and GPU kernels
 | 查专项、示例或运行离线工具 | [专题目录](references/catalog.md)；[工具](references/tools.md) |
 
 详细指南、模板和脚本保存在 `library/`，通过专题入口或关键词检索按需取用。源工程的固定预算、步骤和示例配置只适用于其场景；技术约束以目标实现及指南中的适用条件为准。按项目查[工程目录](references/repository-guides.md)。固定快照中的路径在本包找不到时，查[上游源码和生成文档的路径对照](references/source-paths.md)。来源与维护见[来源说明](references/sources.md)。
+
+## 框架专属入口
+
+- LMDeploy 的 Python 调用、HTTP 请求、proxy、分布式服务启动和采集参数查 `lmdeploy-pipeline`。排查 LMDeploy PyTorch 的调度、checkpoint 恢复、采样或实际 kernel 分发时查 `pytorch-refactor`。通用对照给出要观察的差异，具体字段和实现以当前 LMDeploy 版本为准。
+- [vLLM](references/vllm.md) 和 [SGLang](references/sglang.md) 分别给出各自的 CLI、注册接口、测试与源码路径。工具声明支持哪些框架，决定了它能解析哪些服务标记。
 
 ## 实现与证据
 

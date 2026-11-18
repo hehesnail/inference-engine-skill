@@ -14,7 +14,7 @@ python3 "$SKILL_ROOT/scripts/offline_tools.py" profile --help
 
 | 工具名 | 作用 | 完整说明 |
 |---|---|---|
-| `profile` | 单 trace 或 eager/graph 双 trace 的 kernel、overlap、fusion 分析 | [profiler](../library/bbuf/skills/llm-torch-profiler-analysis/GUIDE.md) |
+| `profile` | 支持 SGLang、vLLM、TensorRT-LLM 和 TokenSpeed 的服务 trace 分析。普通 PyTorch 或 LMDeploy trace 先按[真实事件与轨道](profiling-memory.md#分析已有-trace)读取 | [profiler](../library/bbuf/skills/llm-torch-profiler-analysis/GUIDE.md) |
 | `capacity` | 启动日志、KV 与显存分解 | [capacity](../library/bbuf/skills/llm-serving-capacity-planner/GUIDE.md) |
 | `compare` / `plan` | 比较归一化结果；校验 cookbook 并生成候选命令，不启动服务 | [benchmark](../library/bbuf/skills/llm-serving-auto-benchmark/GUIDE.md) |
 | `pipeline` / `layer-kernels` / `time-map` | forward/layer 边界、逐层 kernel 与 Perfetto 时间定位 | [pipeline](../library/bbuf/skills/llm-pipeline-analysis/GUIDE.md) |
@@ -43,7 +43,7 @@ python3 "$SKILL_ROOT/scripts/offline_tools.py" model-history \
 
 ## 可选 NCU 报告 helpers（依赖单独说明）
 
-新保存的 [NCU helpers](../library/ncu-report/helpers/README.md)可对已有报告抽取 metrics、PC/source stall 和 PM 时间线。调用、版本与输出完整性检查见 [nsight-compute.md](nsight-compute.md)。它们不通过 offline_tools.py 暴露；需要 Nsight Compute 自带 ncu_report，目前维护环境缺依赖，尚未验证真实报告运行。不得将语法检查或退出 0 当成完整分析通过。
+[NCU helpers](../library/ncu-report/helpers/README.md)使用 Nsight Compute 自带的 `ncu_report`，可单独读取已有报告。H200 的 NCU 2025.1.1 实际报告已验证配对指标导出和有采样时的 PC/source stall 解析。只收内存计数器的报告缺 PC 样本，该版本 Python API 也不暴露规则估算。命令、PM 时间线的版本要求和输出检查见 [NCU 专题](nsight-compute.md)。
 
 TRT Host 脚本在 [专题资料](../library/trtllm/host/GUIDE.md)中保留作实现参考，不能未经适配直接用于 vLLM/SGLang trace。原稳定离线工具及可用性判断不变。
 

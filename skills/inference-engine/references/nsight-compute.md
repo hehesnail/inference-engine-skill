@@ -64,6 +64,6 @@ python3 "$SKILL_DIR/library/ncu-report/helpers/extract_stall_hotspots.py" \
     --run-dir "$RUN_DIR" --report "$REPORT" --tag candidate --kernel "$KERNEL_REGEX"
 ```
 
-Python helpers 依赖 Nsight Compute 附带的 `ncu_report`（必要时把对应安装的 `extras/python` 加入 `PYTHONPATH`），不依赖 GPU 执行。当前包仅做过源码/语法检查，尚未用真实 NCU 报告验证这些新增 helpers；依赖缺失时用可用的 CLI 导出或保留待解析状态。
+Python helpers 使用 Nsight Compute 附带的 `ncu_report`，在 CPU 即可解析文件。必要时将该安装的 `extras/python` 加入 `PYTHONPATH`。在 H200 的 NCU 2025.1.1 报告上，配对导出能读取实际内存计数器。该版 Python API 缺少 `IAction.rule_results()`，规则文件会标注估算不可用。带 `SourceCounters` 和 PC 样本的报告可用 `extract_stall_hotspots.py` 定位源码行。仅采内存指标时应报告缺少 PC 样本。PM 时间线等其他功能仍按安装版本和实际采集内容核对。
 
 检查输出包含所有请求的 tag/action。上游 helper 遇到报告不存在或 kernel 不匹配会打印 `[skip]` 并继续，退出码 0 不能证明对照齐全。缺 metric 保留 null/unknown；明确是未采集、不支持还是读取错误。源行未知也保留在统计中。最后回到无 profiler 的同条件测试确认修改收益。

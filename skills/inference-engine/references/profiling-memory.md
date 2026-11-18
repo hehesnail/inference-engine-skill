@@ -10,6 +10,8 @@
 
 结合 shape、CPU 调用关联、模型层和真实 dispatch 映射 kernel；不能仅凭名字断言调用路径。看生产者/消费者依赖、通信尾部及 rank skew，再提出 overlap/fusion 候选。无法映射的项保留为未知。
 
+`offline_tools.py profile` 的服务框架识别只覆盖 SGLang、vLLM、TensorRT-LLM 和 TokenSpeed。分析普通 PyTorch 或 LMDeploy 的 Chrome trace 时，按真实 worker、时间窗、设备和 `cat` 查原始事件，可在 Perfetto 查看。CPU `user_annotation` 与 `gpu_user_annotation` 可以同名，分别计数。需要精简展示时，`offline_tools.py compact --trace INPUT --output VIEW` 可在服务器生成紧凑视图，原始 trace 用于分析 stream 依赖。
+
 通用解析器覆盖不到自定义模型标记时，可补小型适配器，用 `record_function`/NVTX 区间及 runtime correlation 关联 GPU 事件。说明嵌套区域采用包含子区域的总量还是最深区域归属，保留未匹配项与覆盖率；不要将同一 kernel 在父子区域重复相加。记录采样窗口及其请求阶段，不把短窗口当整轮统计。跨 rank 汇总需校准时间范围，不能直接拼接不同设备的本地时间戳或耗时占比。
 
 graph-off/eager trace 可以帮助定位调用点，graph-on 且充分预热的 trace 用于观察正式执行；只有模型、shape、阶段和 kernel 特征匹配时才转移归因，不把 eager 的计时转移给 graph。CPU `cudaGraphLaunch` 时长不等于 GPU 图执行时长。

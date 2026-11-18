@@ -61,7 +61,16 @@ def collect(action, source: str, tag: str, analysis_dir: Path) -> dict:
             f.write(f"{m:95s} = {v}\n")
     print(f"  -> metrics_key_{tag}.{{json,txt}}")
 
-    # NCU's rule engine
+    # Some older ncu_report bindings expose metrics but omit the rule API.
+    if not callable(getattr(action, "rule_results", None)):
+        rules_path = analysis_dir / f"rules_{tag}.txt"
+        rules_path.write_text(
+            f"Kernel: {name}\n"
+            "Rule estimates unavailable: this ncu_report binding does not expose rule_results().\n"
+        )
+        print(f"  -> {rules_path.name} (rule API unavailable)")
+        return key
+
     rules = rule_speedups(action)
     with open(analysis_dir / f"rules_{tag}.txt", "w") as f:
         f.write(f"===== NCU rules for {tag}, highest estimated speedup first =====\n")
