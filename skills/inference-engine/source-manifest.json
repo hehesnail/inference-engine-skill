@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 6275,
-      "packaged_sha256": "0d242e62e4450633f2bfd9274efecd4ccf3646fd370ffc2bafa078eb91f069b5",
+      "bytes": 6720,
+      "packaged_sha256": "09d7c67133e4bf1d256bb60ca33a8f71e1d6182edf6e33ce1bc59e9e1caa288a",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93371,8 +93371,8 @@
     },
     {
       "path": "references/optimization-workflow.md",
-      "bytes": 5576,
-      "packaged_sha256": "278f0d2651c9ec971266d6178dab998c7a72fa3f0a155e7c1bae644e52409ab3",
+      "bytes": 5789,
+      "packaged_sha256": "e6c75512bb202b16865cf0624653d24a1be6f3d7868d822b4c94567c078e072e",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,

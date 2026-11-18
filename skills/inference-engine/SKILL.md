@@ -1,6 +1,6 @@
 ---
 name: inference-engine
-description: Profile, validate, and optimize LLM inference and GPU kernels across LMDeploy, vLLM, and SGLang. Use for latency, throughput, memory, numerical regressions, and offline evaluation. Includes native vLLM and SGLang workflows.
+description: Profile, validate, and optimize LLM inference and GPU kernels across LMDeploy, vLLM, and SGLang. Design CUDA kernels and iterate on candidates with Kernel Design Agents (KDA). Use for latency, throughput, memory, numerical regressions, and offline evaluation. Includes native vLLM and SGLang workflows.
 ---
 
 # 推理引擎工作台
@@ -19,7 +19,8 @@ LMDeploy、vLLM 和 SGLang 都可以用下表做性能对照、数值排查、�
 | 首 token 变慢，kernel 之间有空档，或要用 Torch/Nsys 找请求中的等待 | [Host/GPU 时间线](references/host-device-analysis.md)定位请求关键路径。[Profiler](references/profiling-memory.md)覆盖采集与已有 trace 的解读 |
 | 长请求 OOM，或要估算可用显存、KV 容量 | [显存与 KV 容量](references/profiling-memory.md#显存与-kv-容量) |
 | 解读单次 launch 的寄存器、访存或 stall 指标 | [NCU 报告](references/nsight-compute.md)先核对计数器能区分哪些机制 |
-| 新增或改写 GPU 算子有延迟、吞吐目标，或要解释相对基线的回退 | 用[候选与对照](references/optimization-workflow.md)固定基线、正确性参考与计时边界。遇到 spill、流水线等待或访存异常，按硬件和症状查 [KDA / KernelWiki](references/kernel-knowledge.md)，选能区分源码改动的对照 |
+| 从零设计 CUDA 算子，或为已有算子尝试多种实现并选出可交付版本 | 用 [Kernel Design Agents（KDA）完整流程](library/kda/docs/agent-flow.md)组织迭代。从[任务模板](library/kda/prompts/basic-flow.md)确定输入、正确性参考和目标。逐个实现、验证和计时，记录每版改了什么、为什么保留或淘汰 |
+| 已有 GPU 算子要达到延迟、吞吐目标，或要解释相对基线的回退 | 用[候选与对照](references/optimization-workflow.md)固定基线、正确性参考与计时边界。遇到 spill、流水线等待或访存异常，按硬件和症状查 KDA 的 [KernelWiki](references/kernel-knowledge.md)，选能区分源码改动的对照 |
 | 新算子、fusion 已写好但模型没变快，或只有图重放出错 | 前者沿[实际引擎接线](references/kernel-engine-integration.md)确认 dispatch、fallback 和整层开销。后者查[图捕获与同步](references/cuda-graphs-and-sync.md) |
 | 加草稿模型后接受率提高却更慢，或部分拒绝后输出错误 | [推测解码的成本、已提交 token 和状态回滚](references/speculative-decoding-contracts.md) |
 | 相同文本进引擎后 token 不同、约束输出不合法，或流式与最终文本不一致 | [输入输出契约](references/tokenizer-and-structured-output.md) |
