@@ -16,7 +16,7 @@ graph-off/eager trace 可以帮助定位调用点，graph-on 且充分预热的 
 
 ## 采集新 trace
 
-先用现有证据判断需要补采什么。确需采集时，在已有 GPU 授权内复现慢场景的输入/输出长度、KV 长度、batch、并行与后端；不默认用 1-token 输入模拟长上下文 decode。
+先用现有证据判断需要补采什么。确需采集时，按工作区已有授权复现慢场景的输入/输出长度、KV 长度、batch、并行与后端。长上下文 decode 的复现须保留相应的 KV 长度。
 
 核对目标版本的 profiler 接口：vLLM 的 server profiler 配置、worker/frontend 区别及 start/stop；SGLang 的原生采集、分阶段参数、profiler 模式和 frontend 支持。客户端的 `num_steps` 未必等于服务端实际采集窗口。源文件、帮助和实际生成的 trace 共同确认。
 
@@ -42,7 +42,7 @@ token 容量除以每请求驻留 token 数只是理想化存储上界；还受 
 
 BBuf 的 trace、容量、逐层分析和图表辅助脚本已连同 import 依赖、参考表和配置一起装入本包。通过[稳定工具入口](tools.md)在选定环境运行；[完整 profiler 指南](../library/bbuf/skills/llm-torch-profiler-analysis/GUIDE.md)与[容量指南](../library/bbuf/skills/llm-serving-capacity-planner/GUIDE.md)提供参数、示例及边界条件。
 
-`offline_tools.py` 只暴露离线模式，拒绝 URL 采集参数并关闭子进程的 GPU 可见性。原生在线采集脚本仍作为完整参考保留，使用时另按当前任务的服务与 GPU 授权执行。旧日志匹配不到的字段保留未知，不填入历史默认值。
+`offline_tools.py` 只暴露离线模式，拒绝 URL 采集参数并关闭子进程的 GPU 可见性。原生在线采集脚本仍作为完整参考保留，实际调用时沿用工作区已获准的服务、设备与本次资源限制。旧日志匹配不到的字段保留未知，不填入历史默认值。
 
 ## 深入具体瓶颈
 

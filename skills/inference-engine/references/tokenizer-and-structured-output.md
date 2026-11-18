@@ -28,6 +28,8 @@ CFG 不能普遍等同有限状态机；递归结构需要相应 parser/automato
 
 后端的能力必须由实际 API 和实现确认。例如核对过的 SGLang `sg.gen` 签名有 `regex`、`json_schema`，不支持任意 `tools=` 或 `grammar=` 关键字；工具调用应走当前支持的接口。Guidance 的本地 token 控制能力不能直接推广到远程 OpenAI/Anthropic backend；其 `gen` 并无通用 `grammar="<tag>..."` 参数。Outlines 新旧 API 差异较大，按安装版本选择模型适配器、Generator 和 schema 类型，不把旧 `generate.json` 示例拼接到新 API。
 
+比较 OpenAI 与自托管兼容端点时，先记录服务、模型和实际请求。在 OpenAI 托管的 GPT‑6.2 Responses 中，跨轮复用的指令宜放在 `input` 首条 `developer` 消息中，单次顶层 `instructions` 排在 `input` 后。兼容服务的消息顺序要查其适配器和模板。排查前缀命中时，还应核对引擎实际收到的 token IDs 和缓存初态。[OpenAI GPT‑6.2 指南](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra)
+
 ## 请求状态与终止
 
 grammar 编译可以复用，但每个请求的解析位置、工具状态与输出 buffer 必须隔离；speculative accept/reject 需要提交/回滚相同状态。cancel、timeout、max_tokens、stop、EOS、服务错误都可能造成不完整 JSON，不能宣称“100% 有效输出”而只统计完成样本。

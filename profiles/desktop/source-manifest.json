@@ -1542,8 +1542,8 @@
   "files": [
     {
       "path": "SKILL.md",
-      "bytes": 3619,
-      "packaged_sha256": "718dc239994409acdaa8732e7d858901ce877153666fd6f00652c2f8ae96b034",
+      "bytes": 3791,
+      "packaged_sha256": "29a2bfc0ae8ac019dd410b651e7a28963a72893cec8727c11824d8b370364499",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93221,8 +93221,8 @@
     },
     {
       "path": "references/debugging-review.md",
-      "bytes": 5166,
-      "packaged_sha256": "37fdcd4d4a136fcd4603b5bce426125342aaa7eaef5aa8228882bcaffc0899b6",
+      "bytes": 5230,
+      "packaged_sha256": "65c1f33c361ffd52ced858da6482e93ebe9eef43ad005c97810c2aa927b15658",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93331,8 +93331,8 @@
     },
     {
       "path": "references/nsight-compute.md",
-      "bytes": 6278,
-      "packaged_sha256": "9e6f4dcbe7e048b48543b512ddc6b1d42ae69c779f09cb6ac59237f011f2583c",
+      "bytes": 6331,
+      "packaged_sha256": "bddf74926f276386797c3c3be43b933b09841fc3ef0a7f00120a2e80bca406d0",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93351,8 +93351,8 @@
     },
     {
       "path": "references/numerical-validation.md",
-      "bytes": 3890,
-      "packaged_sha256": "a6039f8d744c022fc925c4ffe4c2ecdfbea1b66df5257fae7eca0a9d3c841c27",
+      "bytes": 3946,
+      "packaged_sha256": "dffa85606fa20248cb2154cb9a48ff4d5e12340b91e45f1defe0be9d6c38dae4",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93391,8 +93391,8 @@
     },
     {
       "path": "references/profiling-memory.md",
-      "bytes": 6952,
-      "packaged_sha256": "2c82b4ef68106b5553beae3a9e343842dd3b10b5785af132ae65c1ac81596970",
+      "bytes": 6980,
+      "packaged_sha256": "7ec4ac218348b1be5f6106ce6248e53d5bd1e777c1a96313eb5a0d1842665b8f",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93661,8 +93661,8 @@
     },
     {
       "path": "references/sources.md",
-      "bytes": 3391,
-      "packaged_sha256": "4c78ff8b0325d0eaea82ee03c62066813f724571bd5bb8026dd3f867b01d40b6",
+      "bytes": 3573,
+      "packaged_sha256": "057880b498c7952fffb673d19a65944f7d3790a033ec87916ff57d25083ba930",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93691,8 +93691,8 @@
     },
     {
       "path": "references/tokenizer-and-structured-output.md",
-      "bytes": 6794,
-      "packaged_sha256": "0f43e0364f5e5fe1c77fb1bf66914845fd1d91947468ee3170521c08b136150c",
+      "bytes": 7296,
+      "packaged_sha256": "39570e253eb59c4bc2cac36d19042ae6b9770d1c1615791c96f67168d23dc58e",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
