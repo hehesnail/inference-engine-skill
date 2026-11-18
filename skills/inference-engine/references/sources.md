@@ -16,4 +16,4 @@ KDA 的 KernelWiki 与 NCU 子模块分别固定为 76d27b56f804e7e7295d4c570e1e
 
 完整工程、知识语料和原始证据以工作区的服务器存储为准；桌面保留所有选中的修订 GUIDE 及按需细节、相关技术说明和轻量工具。两种安装的范围由 manifest 标记，见 [存储与恢复](server-data.md)。上游明确引用但未随快照提供的文件保留为带说明的路径，不伪造本地文件。
 
-维护时更新受影响专项及其依赖，记录 revision 并验证变化路径；不在日常任务中自动切换 main，也不覆盖复现实验的版本。入口保留简短路由，专项知识按任务加载。[OpenAI 的技能设计建议](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra)。2026-11-18 对照 GPT‑6.2 Astra 指南复查了任务完成条件、验证入口及可复用授权。技术约束仍以目标引擎为准。[GPT‑6.2 Astra 指南](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra#prompting-best-practices)
+维护时更新受影响专项及其依赖，记录 revision 并验证变化路径；不在日常任务中自动切换 main，也不覆盖复现实验的版本。入口保留简短路由，专项知识按任务加载。[OpenAI 的技能设计建议](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra)。2026-11-18 调整了 Codex 在推理引擎任务中的完成条件、测试选择与资源使用说明。

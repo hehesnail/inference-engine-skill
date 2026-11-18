@@ -93661,8 +93661,8 @@
     },
     {
       "path": "references/sources.md",
-      "bytes": 3573,
-      "packaged_sha256": "057880b498c7952fffb673d19a65944f7d3790a033ec87916ff57d25083ba930",
+      "bytes": 3407,
+      "packaged_sha256": "bcced3d68af17ad1d80bb278c1d470f79a68db5c962eb1f783cb596d22c50c1c",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93691,8 +93691,8 @@
     },
     {
       "path": "references/tokenizer-and-structured-output.md",
-      "bytes": 7296,
-      "packaged_sha256": "39570e253eb59c4bc2cac36d19042ae6b9770d1c1615791c96f67168d23dc58e",
+      "bytes": 6794,
+      "packaged_sha256": "0f43e0364f5e5fe1c77fb1bf66914845fd1d91947468ee3170521c08b136150c",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
