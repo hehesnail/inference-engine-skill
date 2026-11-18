@@ -18,7 +18,7 @@
 - 同一架构的卡也可能有不同 SM 数、HBM、L2、功耗与频率约束。实际 launch、tile/stage、split 数量应结合当前设备，不能把一台 H200 的测量固化成所有 Hopper 的规则。
 - MI355X 是 CDNA4/gfx950，8 个 XCD、每个 32 个 active CU；全卡 L2 与 256 MB Infinity Cache 是不同层。某份上游 skill 写成 CDNA3+ / 32 XCD，不能据此硬编码 swizzle。以 [AMD 官方微架构资料](https://rocm.docs.amd.com/en/docs-10.0.0/reference/gpu-arch/mi350.html)和当前 partition 查询为准。
 - ROCm 上核对 FP8 格式（例如 fn / fnuz）、scale 布局、wave size、LDS 和分片；不要只把 CUDA device 字符串替换成 HIP 就宣布迁移完成。
-- XPU 的设备选择变量、trace schema 和 backend fallbacks 以版本为准，不能假定 CUDA_VISIBLE_DEVICES 或 CUPTI 配置适用。unitrace 示例是 `unitrace --chrome-call-logging --chrome-kernel-logging python3 workload.py`；先查看该安装的 help、device/metric list，采集仍需任务授权。
+- XPU 的设备选择变量、trace schema 和 backend fallbacks 以版本为准，不能假定 CUDA_VISIBLE_DEVICES 或 CUPTI 配置适用。unitrace 示例是 `unitrace --chrome-call-logging --chrome-kernel-logging python3 workload.py`；先查看该安装的 help 和 device/metric list。采集沿用工作区已有的设备授权，并遵守当前任务指定的设备和时段。
 - 自动工具的“Memory stall”分类还需结合流量、吞吐和依赖，不能把所有 memory stall 都称为带宽瓶颈。
 
 ## TP / EP 慢与 hang 的分解

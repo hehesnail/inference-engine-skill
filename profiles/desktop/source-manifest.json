@@ -93181,8 +93181,8 @@
     },
     {
       "path": "references/benchmarking.md",
-      "bytes": 7012,
-      "packaged_sha256": "9e46a6b38bda1c6736b98b35ceb80c7d047b8ddc328fd9ae41674d3bbea2777f",
+      "bytes": 7196,
+      "packaged_sha256": "df86b56d585edbe386f28487afccdc524949c2dce415f7991a0f8f1fc5ce57cf",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93361,8 +93361,8 @@
     },
     {
       "path": "references/offline-evaluation.md",
-      "bytes": 3880,
-      "packaged_sha256": "617ac658bbe9fbc65d5cadfb381a26d3c64833770a373fe9933098fd98940f6d",
+      "bytes": 3991,
+      "packaged_sha256": "5a2b01c6a2b981a149c986219dcc44997e6e265a276933e58203fa9448dbc810",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93371,8 +93371,8 @@
     },
     {
       "path": "references/optimization-workflow.md",
-      "bytes": 4815,
-      "packaged_sha256": "2fd7fe947c44bcdbbda17a4453f8efad07a756183e66b3ec68b5d593f6da847d",
+      "bytes": 4950,
+      "packaged_sha256": "d95f7e4625510405f077f2a307fb4589806bec8c68b3c09db62a03535f757579",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,
@@ -93381,8 +93381,8 @@
     },
     {
       "path": "references/platforms-and-transport.md",
-      "bytes": 5858,
-      "packaged_sha256": "a941efc959fb26314e8a7ea53c1dc138162977ca0f426dfbb62afd09f97ffd3d",
+      "bytes": 5926,
+      "packaged_sha256": "d3b7a5a8bc0fb99a2d6a9ade1d17a418159f6c803749d81fd7c0dc659da56299",
       "placement": "desktop-and-server",
       "repository": "local",
       "source_path": null,

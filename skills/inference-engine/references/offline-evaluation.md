@@ -1,6 +1,6 @@
 # 离线批量评测与吞吐
 
-先确认用户要比较生成、loglikelihood/候选评分，还是整套评测耗时。在线服务的 TTFT/TPOT、离线生成 tok/s、评分题/s 回答不同问题；共同的版本和缓存控制见 [benchmarking.md](benchmarking.md)。
+根据任务、评测协议和现有结果识别目标是生成、loglikelihood/候选评分，还是整套评测耗时。仅在多种解释会改变验收指标且已有信息无法判断时补问。在线服务的 TTFT/TPOT、离线生成 tok/s、评分题/s 回答不同问题；共同的版本和缓存控制见 [benchmarking.md](benchmarking.md)。
 
 ## 固定实际工作量
 
