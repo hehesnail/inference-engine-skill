@@ -28,6 +28,13 @@ Python 在 Windows 上若以 `py -3` 提供，可将命令里的 `python` 替换
 
 > 从我的私有仓库 hehesnail/inference-engine-skill 安装 inference-engine。请读取 README，运行仓库安装器，默认桌面版；已有版本先备份再更新。
 
+## LMDeploy 专项技能
+
+- [lmdeploy-pipeline](skills/lmdeploy-pipeline/SKILL.md) 用于 Python pipeline、自托管服务和客户端验证。
+- [pytorch-refactor](skills/pytorch-refactor/SKILL.md) 用于 LMDeploy PyTorch 引擎的模型接入、算子分派和运行时排障。
+
+上面的一行安装命令用于 `inference-engine`。在新机器安装这两个专项技能时，从仓库的 `skills/` 将所需的整个同名目录复制到 `$CODEX_HOME/skills/`，未设置 `CODEX_HOME` 时使用 `~/.codex/skills/`。
+
 ## 完整版、已有 checkout 和回退
 
 完整版包含服务器使用的较大知识语料、代码证据和历史资料，推荐装在服务器。给上面命令末尾加 `--edition complete` 即可。初始桌面版约 38 MiB / 3026 个文件；完整版约 132 MiB / 7139 个文件。具体数量以 `distribution.json` 为准。
@@ -55,7 +62,7 @@ python3 inference-engine-skill/install.py --update
 
 ## 如何维护
 
-完整技能的唯一维护源是 `skills/inference-engine/`。`profiles/desktop/` 只保留桌面版需要替换的少量文件，例如远端资源链接、安装状态；不是另一份独立技能。
+通用技能 `inference-engine` 的完整维护源是 `skills/inference-engine/`。`profiles/desktop/` 只保留桌面版需要替换的少量文件，例如远端资源链接、安装状态；不是另一份独立技能。
 
 1. 在服务器克隆仓库、修改完整技能；保持入口短，细节放 references/library。
 2. 新增文件默认进入两种安装版本；只应在服务器保留的大文件，在 source-manifest 对应记录中设置 `placement: server-only`。
