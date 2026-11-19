@@ -15,7 +15,7 @@ jobs:
           sparse-checkout: |
             /install.py
             /tests/
-            /skills/inference-engine/library/ncu-report/helpers/analyze_reports.py
+            /skills/inference-engine/library/ncu-report/helpers/
           sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v5
         with:
