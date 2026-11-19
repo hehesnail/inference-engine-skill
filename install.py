@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install/update the inference-engine Codex skill. Python 3.9+, stdlib only."""
+"""Install/update the inference-engine, lmdeploy-pipeline and pytorch-refactor Codex skills. Python 3.9+, stdlib only."""
 import argparse
 import contextlib
 import datetime
@@ -17,6 +17,7 @@ import uuid
 sys.dont_write_bytecode = True
 REPOSITORY = "hehesnail/inference-engine-skill"
 NAME = "inference-engine"
+COMPANIONS = ("lmdeploy-pipeline", "pytorch-refactor")
 
 
 def native_path(value):
@@ -44,22 +45,33 @@ def digest(path):
 
 def read_plan(root, edition):
     data = json.loads((root / "distribution.json").read_text(encoding="utf-8"))
-    if data["schema"] != 1 or data["skill_name"] != NAME:
+    if data["schema"] not in (1, 2) or data["skill_name"] != NAME:
         raise ValueError("Unsupported distribution format")
-    rows = data["editions"][edition]["files"]
+    plans = {NAME: data["editions"][edition]["files"]}
+    if data["schema"] == 2:
+        companions = data["companions"]
+        if set(companions) != set(COMPANIONS):
+            raise ValueError("Incomplete or unexpected companion skill set")
+        for name in COMPANIONS:
+            plans[name] = companions[name]
+    for rows in plans.values():
+        validate_rows(rows)
+    return plans
+
+
+def validate_rows(rows):
     seen = set()
     for row in rows:
         safe_relative(row["path"])
         safe_relative(row["source"])
         key = row["path"].casefold()
-        if key in seen:
+        if key == ".installation.json" or key in seen:
             raise ValueError("Duplicate/case-colliding package path: " + row["path"])
         seen.add(key)
         if not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
             raise ValueError("Invalid SHA256: " + row["path"])
     if "skill.md" not in seen:
         raise ValueError("Package is missing SKILL.md")
-    return data, rows
 
 
 def checked_source(root, row):
@@ -84,67 +96,110 @@ def matches(destination, rows):
             return False
     # A complete installation is not silently downgraded to desktop.
     receipt = destination / ".installation.json"
+    if receipt.is_symlink():
+        return False
     if receipt.exists():
-        data = json.loads(receipt.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(receipt.read_text(encoding="utf-8"))
+        except (UnicodeError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
         if data.get("file_count") != len(rows):
             return False
     return True
 
 
-def install(root, edition, skills_dir, update=False, check=False):
-    data, rows = read_plan(root, edition)
-    skills_dir = native_path(skills_dir)
-    dest = skills_dir / NAME
-    if dest.is_symlink():
-        raise ValueError("Destination is a symlink; choose its intended real parent with --dest")
+@contextlib.contextmanager
+def install_lock(skills_dir):
+    # Keep the lock outside discovery. The OS releases it when the process exits.
+    lock_path = skills_dir.parent / ("." + skills_dir.name + "-inference-install.lock")
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def stage_files(root, rows, staged):
+    staged.mkdir()
     for row in rows:
-        checked_source(root, row)
-    if matches(dest, rows):
-        print("Already current: " + str(dest))
-        return dest
-    if check:
-        raise ValueError("Installed skill differs from " + edition + " package, or is absent")
-    if dest.exists() and not update:
-        raise ValueError("Skill exists. Re-run with --update to back it up and replace it.")
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    backup = None
-    # Stage outside skills/ so Codex never discovers a partial or duplicate skill.
-    with tempfile.TemporaryDirectory(prefix=".inference-engine-stage-", dir=str(skills_dir.parent)) as temp:
-        staged = native_path(temp) / NAME
-        staged.mkdir()
+        target = staged.joinpath(*safe_relative(row["path"]).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(checked_source(root, row), target)
+        target.chmod(row.get("mode", 0o644))
+        if digest(target) != row["sha256"]:
+            raise ValueError("Copy verification failed: " + row["path"])
+
+
+def install(root, edition, skills_dir, update=False, check=False):
+    plans = read_plan(root, edition)
+    skills_dir = native_path(skills_dir)
+    for name, rows in plans.items():
+        if (skills_dir / name).is_symlink():
+            raise ValueError("Skill destination is a symlink: " + name)
         for row in rows:
-            source = checked_source(root, row)
-            target = staged.joinpath(*safe_relative(row["path"]).parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
-            target.chmod(row.get("mode", 0o644))
-            if digest(target) != row["sha256"]:
-                raise ValueError("Copy verification failed: " + row["path"])
-        receipt = {
-            "repository": REPOSITORY, "edition": edition, "file_count": len(rows),
-            "distribution_sha256": digest(root / "distribution.json"),
-            "installed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        (staged / ".installation.json").write_text(
-            json.dumps(receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        if dest.exists():
-            backup_root = skills_dir.parent / "skill-backups"
-            backup_root.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            backup = backup_root / (NAME + "-" + stamp + "-" + uuid.uuid4().hex[:8])
-            dest.rename(backup)
-        try:
-            staged.rename(dest)
-        except BaseException:
-            if backup is not None and not dest.exists():
-                backup.rename(dest)
-            raise
-    print("Installed %s: %d files, %.1f MiB at %s" % (
-        edition, len(rows), sum(x["bytes"] for x in rows) / 1024**2, dest))
-    if backup is not None:
+            checked_source(root, row)
+    if check:
+        for name, rows in plans.items():
+            if not matches(skills_dir / name, rows):
+                raise ValueError("Installed skill differs from package or is absent: " + name)
+        print("Verified: " + ", ".join(plans))
+        return skills_dir / NAME
+
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    with install_lock(skills_dir), tempfile.TemporaryDirectory(
+            prefix=".inference-engine-stage-", dir=str(skills_dir.parent)) as temp:
+        stage = native_path(temp)
+        changes = []
+        backups = []
+        distribution_hash = digest(root / "distribution.json")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stamp = now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+        for name, rows in plans.items():
+            dest = skills_dir / name
+            current = matches(dest, rows)
+            receipt = dest / ".installation.json"
+            if current:
+                old = json.loads(receipt.read_text(encoding="utf-8")) if receipt.exists() else {}
+                if old.get("distribution_sha256") == distribution_hash and old.get("edition") == edition:
+                    continue
+                # Adopt identical manual installs and refresh old metadata without copying payloads.
+                staged_receipt = stage / (name + ".json")
+                changes.append((staged_receipt, receipt, stage / (name + ".old") if receipt.exists() else None))
+            else:
+                if dest.exists() and not update:
+                    raise ValueError("Skill exists: " + name + ". Re-run with --update to back it up and replace it.")
+                staged = stage / name
+                stage_files(root, rows, staged)
+                staged_receipt = staged / ".installation.json"
+                backup = None
+                if dest.exists():
+                    backup = skills_dir.parent / "skill-backups" / (name + "-" + stamp)
+                    backups.append(backup)
+                changes.append((staged, dest, backup))
+            staged_receipt.write_text(json.dumps({
+                "repository": REPOSITORY, "edition": edition, "file_count": len(rows),
+                "distribution_sha256": distribution_hash, "installed_at": now.isoformat(),
+            }, indent=2) + "\n", encoding="utf-8")
+        if backups:
+            backups[0].parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.ExitStack() as rollback:
+            for staged, dest, backup in changes:
+                if backup is not None:
+                    dest.rename(backup)
+                    rollback.callback(backup.rename, dest)
+                staged.rename(dest)
+                rollback.callback(dest.rename, staged)
+            rollback.pop_all()
+    for backup in backups:
         print("Previous version preserved at: " + str(backup))
-    print("The skill is available to Codex on the next turn.")
-    return dest
+    print(("Installed or updated: " if changes else "Already current: ") + ", ".join(plans))
+    return skills_dir / NAME
 
 
 def git(args, cwd=None, input_text=None):
@@ -181,8 +236,10 @@ def checkout(repository, ref, edition):
         git(["sparse-checkout", "set", "--no-cone", "--stdin"], cwd=root,
             input_text="/distribution.json\n")
         git(["checkout", "--force"], cwd=root)
-        _, rows = read_plan(root, edition)
-        patterns = ["/distribution.json"] + [sparse_pattern(x["source"]) for x in rows]
+        plans = read_plan(root, edition)
+        patterns = ["/distribution.json"]
+        for rows in plans.values():
+            patterns.extend(sparse_pattern(row["source"]) for row in rows)
         git(["sparse-checkout", "set", "--no-cone", "--stdin"], cwd=root,
             input_text="\n".join(sorted(set(patterns))) + "\n")
         yield root

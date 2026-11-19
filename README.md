@@ -20,24 +20,20 @@ Linux / macOS：
 gh api -H 'Accept: application/vnd.github.raw+json' repos/hehesnail/inference-engine-skill/contents/install.py | python3 - --update
 ```
 
-重复同一条命令即可更新。默认桌面版；安装器使用当前 GitHub CLI 登录读取私有仓库。Git 按文件下载所选版本，临时 checkout 用完即清理。默认目录为 `$CODEX_HOME/skills/inference-engine`，未设置 CODEX_HOME 时为 `~/.codex/skills/inference-engine`。已有修改的旧目录会整体备份到同一 Codex home 下的 `skill-backups/`，不会放在 skills 里造成重复发现。相同内容重复安装不生成备份。
+同一条命令会安装或更新 `inference-engine`、`lmdeploy-pipeline` 和 `pytorch-refactor`。三个同名目录都位于 `$CODEX_HOME/skills/`，未设置 `CODEX_HOME` 时使用 `~/.codex/skills/`。安装器用当前 GitHub CLI 登录读取私有仓库，默认下载通用技能的桌面版及两个完整的 LMDeploy 专项技能。
 
-Python 在 Windows 上若以 `py -3` 提供，可将命令里的 `python` 替换成 `py -3`。不改变系统执行策略，不需要管理员权限。安装后下一轮对话即可使用 `$inference-engine`。
+只有旧版 `inference-engine` 的机器重跑命令，就会补装两个专项技能。安装器复用内容相同的技能目录，更新有差异的目录前会将旧目录整体移到同一父目录下的 `skill-backups/`。重复安装相同版本不会增加备份。用 `--check` 可以只校验三个技能的安装内容。
 
-也可以直接告诉 Codex：
-
-> 从我的私有仓库 hehesnail/inference-engine-skill 安装 inference-engine。请读取 README，运行仓库安装器，默认桌面版；已有版本先备份再更新。
+Windows 上若通过 `py -3` 启动 Python，将命令里的 `python` 换成 `py -3`。安装后可在 Codex 下一轮对话中使用三个技能。
 
 ## LMDeploy 专项技能
 
 - [lmdeploy-pipeline](skills/lmdeploy-pipeline/SKILL.md) 用于 Python pipeline、自托管服务和客户端验证。
 - [pytorch-refactor](skills/pytorch-refactor/SKILL.md) 用于 LMDeploy PyTorch 引擎的模型接入、算子分派和运行时排障。
 
-上面的一行安装命令用于 `inference-engine`。在新机器安装这两个专项技能时，从仓库的 `skills/` 将所需的整个同名目录复制到 `$CODEX_HOME/skills/`，未设置 `CODEX_HOME` 时使用 `~/.codex/skills/`。
-
 ## 完整版、已有 checkout 和回退
 
-完整版包含服务器使用的较大知识语料、代码证据和历史资料，推荐装在服务器。给上面命令末尾加 `--edition complete` 即可。初始桌面版约 38 MiB / 3026 个文件；完整版约 132 MiB / 7139 个文件。具体数量以 `distribution.json` 为准。
+完整版包含服务器使用的较大知识语料、代码证据和历史资料，推荐装在服务器。给上面命令末尾加 `--edition complete` 即可。`--edition` 选择通用技能的版本。两个专项技能在两种版本中使用同一组文件。具体数量以 `distribution.json` 为准。
 
 已有 Git checkout 或使用 SSH 凭据时：
 
@@ -48,7 +44,7 @@ python3 inference-engine-skill/install.py --update
 
 这会克隆完整维护仓库，适合服务器维护；日常笔记本优先使用前面按需下载的一行命令。安装器可通过 `--repo git@github.com:hehesnail/inference-engine-skill.git` 使用已有 SSH 身份；默认 HTTPS + gh 登录。可用 `--dest /path/to/skills` 指定安装父目录，`--ref <tag>` 固定远端版本。通过 stdin 运行安装器时才需要 --repo/--ref；从 checkout 运行时安装当前 checkout 内容。
 
-回退可安装旧 tag（配合 `--update`），或先将当前技能目录移出 skills，再把 `skill-backups/` 中所需旧版本移回 `skills/inference-engine`。备份不自动删除；确认不需要时自行清理。
+回退可安装旧 tag（配合 `--update`），或先将当前技能目录移出 skills，再把 `skill-backups/` 中所需旧版本移回 `skills/` 下对应的同名目录。备份不自动删除；确认不需要时自行清理。
 
 ## 内容
 
@@ -64,7 +60,7 @@ python3 inference-engine-skill/install.py --update
 
 通用技能 `inference-engine` 的完整维护源是 `skills/inference-engine/`。`profiles/desktop/` 只保留桌面版需要替换的少量文件，例如远端资源链接、安装状态；不是另一份独立技能。
 
-1. 在服务器克隆仓库、修改完整技能；保持入口短，细节放 references/library。
+1. 在服务器 checkout 中修改对应的 `skills/<技能名>/` 目录。两个专项技能的入口、参考和样例也会由下方脚本生成文件清单与校验值。
 2. 新增文件默认进入两种安装版本；只应在服务器保留的大文件，在 source-manifest 对应记录中设置 `placement: server-only`。
 3. 修改有桌面覆盖的文件时同步检查 `profiles/desktop/`，工具会阻止忽略这个步骤；检查后使用 `--accept-overrides` 刷新。
 4. 运行：

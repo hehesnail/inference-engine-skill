@@ -68,7 +68,7 @@ def refresh(check=False, accept_overrides=False):
         OVERLAYS / "source-manifest.json": encoded(desktop),
         base_file: encoded({p: sha(FULL / p) for p in sorted(overrides)}),
     }
-    distribution = {"schema": 1, "skill_name": "inference-engine",
+    distribution = {"schema": 2, "skill_name": "inference-engine",
                     "repository": "hehesnail/inference-engine-skill", "editions": {}}
     for edition, manifest in (("complete", full), ("desktop", desktop)):
         plan = []
@@ -85,6 +85,22 @@ def refresh(check=False, accept_overrides=False):
                      "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "mode": 0o644})
         plan.sort(key=lambda x: x["path"])
         distribution["editions"][edition] = {"files": plan}
+    companions = {}
+    for name in ("lmdeploy-pipeline", "pytorch-refactor"):
+        directory = ROOT / "skills" / name
+        if not (directory / "SKILL.md").is_file():
+            raise ValueError("Missing companion skill: " + name)
+        files = []
+        for path in sorted(directory.rglob("*")):
+            if path.is_symlink() or path.name in {".git", "__pycache__", ".installation.json"}:
+                raise ValueError("Unexpected package entry: " + str(path))
+            if path.is_file():
+                files.append({"path": path.relative_to(directory).as_posix(),
+                              "source": path.relative_to(ROOT).as_posix(),
+                              "bytes": path.stat().st_size, "sha256": sha(path),
+                              "mode": 0o755 if path.stat().st_mode & stat.S_IXUSR else 0o644})
+        companions[name] = files
+    distribution["companions"] = companions
     products[ROOT / "distribution.json"] = encoded(distribution, compact=True)
     differences = []
     for path, text in products.items():

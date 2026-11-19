@@ -15,6 +15,7 @@ jobs:
           sparse-checkout: |
             /install.py
             /tests/
+            /skills/inference-engine/library/ncu-report/helpers/analyze_reports.py
           sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v5
         with:
@@ -31,7 +32,14 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           CODEX_HOME: ${{ runner.temp }}/bootstrap-codex
-        run: python -c "import os,pathlib,subprocess,sys; p=pathlib.Path(os.environ['CODEX_HOME'])/'skills/inference-engine'; assert (p/'SKILL.md').is_file() and (p/'.installation.json').is_file(); subprocess.run([sys.executable,str(p/'scripts/offline_tools.py'),'--help'],check=True)"
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys
+          root = pathlib.Path(os.environ["CODEX_HOME"]) / "skills"
+          for name in ("inference-engine", "lmdeploy-pipeline", "pytorch-refactor"):
+              assert (root / name / "SKILL.md").is_file(), name
+              assert (root / name / ".installation.json").is_file(), name
+          subprocess.run([sys.executable, str(root / "inference-engine/scripts/offline_tools.py"), "--help"], check=True)
   payload:
     runs-on: ubuntu-latest
     steps:

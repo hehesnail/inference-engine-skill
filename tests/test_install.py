@@ -43,6 +43,15 @@ class InstallTests(unittest.TestCase):
         plan = {"schema": 1, "skill_name": "inference-engine", "editions": {
             "complete": {"files": entries},
             "desktop": {"files": [x for x in entries if not x["path"].startswith("corpus/")]}}}
+        plan["schema"] = 2
+        plan["companions"] = {}
+        for name in installer.COMPANIONS:
+            source = self.repo / "skills" / name / "SKILL.md"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            data = ("---\\nname: " + name + "\\n---\\n").encode()
+            source.write_bytes(data)
+            plan["companions"][name] = [{"path": "SKILL.md", "source": source.relative_to(self.repo).as_posix(),
+                                         "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}]
         (self.repo / "distribution.json").write_text(json.dumps(plan), encoding="utf-8")
         return plan
 
@@ -50,6 +59,10 @@ class InstallTests(unittest.TestCase):
         dest = installer.install(self.repo, "desktop", self.dest)
         self.assertTrue((dest / "references/notes [1].md").is_file())
         self.assertFalse((dest / "corpus").exists())
+        for name in installer.COMPANIONS:
+            self.assertEqual((self.dest / name / "SKILL.md").read_bytes(),
+                             (self.repo / "skills" / name / "SKILL.md").read_bytes())
+            self.assertTrue((self.dest / name / ".installation.json").is_file())
         installer.install(self.repo, "desktop", self.dest, update=True)
         self.assertFalse((self.dest.parent / "skill-backups").exists())
 
@@ -89,6 +102,51 @@ class InstallTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "simulated"):
                 installer.install(self.repo, "desktop", self.dest, update=True)
         self.assertEqual((dest / "SKILL.md").read_bytes(), before)
+
+    def test_update_from_single_skill_and_manual_companion(self):
+        path = self.repo / "distribution.json"
+        plan = json.loads(path.read_bytes())
+        plan["schema"] = 1
+        del plan["companions"]
+        path.write_text(json.dumps(plan))
+        original = installer.install(self.repo, "desktop", self.dest)
+        self.make_plan()
+        name, missing = installer.COMPANIONS
+        shutil.copytree(self.repo / "skills" / name, self.dest / name)
+        with self.assertRaisesRegex(ValueError, missing):
+            installer.install(self.repo, "desktop", self.dest, check=True)
+        self.assertFalse((self.dest / missing).exists())
+        installer.install(self.repo, "desktop", self.dest, update=True)
+        self.assertFalse((self.dest.parent / "skill-backups").exists())
+        for skill in [original, self.dest / name, self.dest / missing]:
+            receipt = json.loads((skill / ".installation.json").read_bytes())
+            self.assertEqual(receipt["distribution_sha256"], installer.digest(path))
+
+    def test_corrupt_companion_stops_the_whole_bundle(self):
+        (self.repo / "skills/pytorch-refactor/SKILL.md").write_bytes(b"truncated")
+        with self.assertRaisesRegex(ValueError, "Integrity"):
+            installer.install(self.repo, "desktop", self.dest, update=True)
+        self.assertFalse(self.dest.exists())
+
+    def test_late_failure_rolls_back_replacement_and_receipt_adoption(self):
+        first = installer.install(self.repo, "desktop", self.dest)
+        second, third = (self.dest / name for name in installer.COMPANIONS)
+        (first / "SKILL.md").write_bytes(b"my edit")
+        (second / ".installation.json").unlink()
+        shutil.rmtree(third)
+        original = Path.rename
+
+        def fail_last(path, target):
+            if target == third and ".inference-engine-stage-" in str(path):
+                raise OSError("last skill failed")
+            return original(path, target)
+
+        with patch.object(Path, "rename", fail_last), self.assertRaisesRegex(OSError, "last skill"):
+            installer.install(self.repo, "desktop", self.dest, update=True)
+        self.assertEqual((first / "SKILL.md").read_bytes(), b"my edit")
+        self.assertFalse((second / ".installation.json").exists())
+        self.assertFalse(third.exists())
+        self.assertFalse(list((self.dest.parent / "skill-backups").iterdir()))
 
     def test_traversal_rejected(self):
         plan = json.loads((self.repo / "distribution.json").read_text())
